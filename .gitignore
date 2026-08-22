@@ -1,0 +1,23 @@
+# ---- 行情数据缓存（体积大、可重新拉取，不入库）----
+data_cache/
+*.parquet
+
+# ---- 运行产物 ----
+out*.json
+*.png
+*.svg
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
