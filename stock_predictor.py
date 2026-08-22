@@ -102,6 +102,13 @@ try:
 except ImportError:
     HAS_AKSHARE = False
 
+# baostock：国内稳定的免费行情源（免注册），作为 akshare(东方财富) 失败时的自动备用数据源
+try:
+    import baostock as bs
+    HAS_BAOSTOCK = True
+except ImportError:
+    HAS_BAOSTOCK = False
+
 # ---- 1.3.2 三大主流 Boosting 库 ----
 try:
     import xgboost as xgb
@@ -247,47 +254,78 @@ class StockDataFetcher:
         df = fetcher.fetch("600519", "20200101", "20241231")   # 贵州茅台
     """
 
-    # ---------- 3.1 拉取真实历史行情 ----------
+    # ---------- 3.1 拉取真实历史行情（多源自动容错）----------
     def fetch(self, code: str, start_date: str, end_date: str,
               adjust: str = "qfq", use_cache: bool = True,
-              bypass_proxy: bool = True) -> pd.DataFrame:
+              bypass_proxy: bool = True, source: str = "auto",
+              retries: int = 2) -> pd.DataFrame:
         """
         拉取指定股票代码在 [start_date, end_date] 区间的日线行情。
 
         参数：
-            code       : 股票代码，如 "600519"（贵州茅台，不带市场前缀，akshare 自动识别）
+            code       : 股票代码，如 "600519"（贵州茅台，不带市场前缀）
             start_date : 起始日期，格式 "YYYYMMDD"
             end_date   : 结束日期，格式 "YYYYMMDD"
             adjust     : 复权方式，"qfq"=前复权（推荐，训练用），"hfq"=后复权，""=不复权
             use_cache  : 是否优先读取本地缓存（避免重复请求，加快调试速度）
+            bypass_proxy: 拉取时是否临时绕过系统代理（默认开，解决 VPN 导致的 ProxyError）
+            source     : "auto"(先东方财富后 baostock) / "akshare" / "baostock"
+            retries    : 单个数据源的重试次数（应对 RemoteDisconnected 等瞬时网络抖动）
 
         返回：
-            DataFrame，列为 [date, open, close, high, low, volume, amount, ...]
+            统一格式的 DataFrame，至少包含列 [date, open, close, high, low, volume]。
         """
         cache_path = self._cache_path(code, start_date, end_date, adjust)
 
         # ---- 3.1.1 优先读取本地缓存 ----
         if use_cache and os.path.exists(cache_path):
-            df = pd.read_parquet(cache_path)
-            return df
+            return pd.read_parquet(cache_path)
 
-        # ---- 3.1.2 缺少 akshare 时，给出清晰的报错提示，而不是静默失败 ----
-        if not HAS_AKSHARE:
-            raise RuntimeError(
-                "未检测到 akshare 库，无法获取真实 A 股数据。\n"
-                "请先执行: pip install akshare\n"
-                "（若暂时无法安装，可调用 generate_synthetic_data() 使用合成数据先跑通流程）"
-            )
+        # ---- 3.1.2 按顺序尝试各数据源，任一成功即返回；全失败则汇总错误 ----
+        if source == "akshare":
+            providers = [("akshare(东方财富)", self._fetch_akshare)]
+        elif source == "baostock":
+            providers = [("baostock", self._fetch_baostock)]
+        else:                       # auto：东方财富优先，失败自动切 baostock
+            providers = [("akshare(东方财富)", self._fetch_akshare),
+                         ("baostock", self._fetch_baostock)]
 
-        # ---- 3.1.3 调用 akshare 接口拉取数据（默认自动绕过系统代理，避免 VPN 干扰）----
-        proxy_ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
-        with proxy_ctx:
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=start_date, end_date=end_date, adjust=adjust
-            )
+        errors = []
+        for name, fn in providers:
+            available = (name.startswith("akshare") and HAS_AKSHARE) or \
+                        (name == "baostock" and HAS_BAOSTOCK)
+            if not available:
+                errors.append(f"{name}: 未安装对应库")
+                continue
+            for attempt in range(1, retries + 1):
+                try:
+                    proxy_ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+                    with proxy_ctx:
+                        df = fn(code, start_date, end_date, adjust)
+                    if df is None or len(df) == 0:
+                        raise RuntimeError("返回空数据（代码/日期可能有误）")
+                    df.to_parquet(cache_path, index=False)     # 成功即缓存
+                    return df
+                except Exception as e:
+                    errors.append(f"{name}(第{attempt}次): {e}")
 
-        # ---- 3.1.4 统一列名为英文，方便后续代码引用 ----
+        # ---- 3.1.3 全部数据源失败：给出清晰、可操作的报错 ----
+        hint = ""
+        if not HAS_BAOSTOCK:
+            hint = ("\n建议加装更稳定的国内备用源:  pip install baostock"
+                    "\n（免费免注册，东方财富拉不到时会自动切换到它）")
+        raise RuntimeError(
+            "获取真实行情失败，已尝试以下数据源：\n  - " + "\n  - ".join(errors) +
+            hint +
+            "\n若网络必须走代理才能出网，可在代码里以 bypass_proxy=False 调用；"
+            "\n或先用「合成数据」跑通流程。"
+        )
+
+    # ---------- 3.1a 数据源实现：akshare（东方财富）----------
+    @staticmethod
+    def _fetch_akshare(code, start_date, end_date, adjust):
+        df = ak.stock_zh_a_hist(symbol=code, period="daily",
+                                start_date=start_date, end_date=end_date, adjust=adjust)
         df = df.rename(columns={
             "日期": "date", "开盘": "open", "收盘": "close",
             "最高": "high", "最低": "low", "成交量": "volume",
@@ -295,11 +333,47 @@ class StockDataFetcher:
             "涨跌额": "change", "换手率": "turnover"
         })
         df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
+        return df.sort_values("date").reset_index(drop=True)
 
-        # ---- 3.1.5 写入本地缓存 ----
-        df.to_parquet(cache_path, index=False)
-        return df
+    # ---------- 3.1b 数据源实现：baostock（国内稳定备用源）----------
+    @staticmethod
+    def _fetch_baostock(code, start_date, end_date, adjust):
+        # 代码转 baostock 格式：sh.600519 / sz.000001 / bj.830799
+        c = code.strip()
+        if c.startswith("6"):
+            bs_code = f"sh.{c}"
+        elif c.startswith(("4", "8")):
+            bs_code = f"bj.{c}"
+        else:
+            bs_code = f"sz.{c}"
+        # 日期转 YYYY-MM-DD；复权标志：qfq=2 前复权 / hfq=1 后复权 / ""=3 不复权
+        def _dash(d): return f"{d[0:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
+        adjustflag = {"qfq": "2", "hfq": "1", "": "3"}.get(adjust, "2")
+
+        lg = bs.login()
+        try:
+            if getattr(lg, "error_code", "0") != "0":
+                raise RuntimeError(f"baostock 登录失败: {getattr(lg, 'error_msg', '')}")
+            rs = bs.query_history_k_data_plus(
+                bs_code, "date,open,high,low,close,volume,amount",
+                start_date=_dash(start_date), end_date=_dash(end_date),
+                frequency="d", adjustflag=adjustflag)
+            if rs.error_code != "0":
+                raise RuntimeError(f"baostock 查询失败: {rs.error_msg}")
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            df = pd.DataFrame(rows, columns=rs.fields)
+        finally:
+            bs.logout()
+
+        if len(df) == 0:
+            return df
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["date"] = pd.to_datetime(df["date"])
+        return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
     # ---------- 3.2 缓存文件路径 ----------
     def _cache_path(self, code: str, start_date: str, end_date: str, adjust: str) -> str:
@@ -2032,11 +2106,19 @@ if HAS_PYSIDE6:
 
             layout.addWidget(QLabel("数据源:"), 3, 0)
             self.data_source_combo = QComboBox()
-            src_options = ["真实数据 (akshare)" if HAS_AKSHARE else "真实数据 (未安装akshare，不可用)",
-                           "合成数据 (离线演示/测试用)"]
-            self.data_source_combo.addItems(src_options)
-            if not HAS_AKSHARE:
-                self.data_source_combo.setCurrentIndex(1)   # 没装 akshare 时默认选合成数据，避免点击就报错
+            has_real = HAS_AKSHARE or HAS_BAOSTOCK          # 有任一真实源即可用
+            if has_real:
+                srcs = []
+                if HAS_AKSHARE:
+                    srcs.append("东方财富")
+                if HAS_BAOSTOCK:
+                    srcs.append("baostock")
+                real_label = "真实数据 (自动: " + "/".join(srcs) + ")"
+            else:
+                real_label = "真实数据 (未装 akshare/baostock，不可用)"
+            self.data_source_combo.addItems([real_label, "合成数据 (离线演示/测试用)"])
+            if not has_real:
+                self.data_source_combo.setCurrentIndex(1)   # 没有真实源时默认合成数据，避免点击就报错
             layout.addWidget(self.data_source_combo, 3, 1)
 
             return box
@@ -2276,14 +2358,15 @@ def run_experiment(code: str = "600519",
     metrics = metrics or ["R2", "MAE", "RMSE", "DA"]
     end = end or dt.date.today().strftime("%Y%m%d")
 
-    # ---- 1) 取数据：真实(akshare) 或 合成 ----
-    if synthetic or not HAS_AKSHARE:
+    # ---- 1) 取数据：真实(东方财富/baostock 自动容错) 或 合成 ----
+    if synthetic or not (HAS_AKSHARE or HAS_BAOSTOCK):
         if not synthetic:
-            log("[提示] 未安装 akshare，自动改用合成数据。要用真实数据请先 pip install akshare 并去掉 --synthetic。")
+            log("[提示] 未安装 akshare/baostock，自动改用合成数据。"
+                "要用真实数据请先 pip install akshare baostock 并去掉 --synthetic。")
         raw_df = StockDataFetcher.generate_synthetic_data()
         data_source = "synthetic"
     else:
-        log(f"正在用 akshare 拉取 {code} [{start}~{end}] ...")
+        log(f"正在拉取真实行情 {code} [{start}~{end}]（东方财富优先，失败自动切 baostock）...")
         raw_df = StockDataFetcher().fetch(code, start, end)
         data_source = f"akshare:{code}"
 
