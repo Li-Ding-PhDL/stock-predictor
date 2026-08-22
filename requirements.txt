@@ -28,3 +28,4 @@ baostock>=0.8.9          # 国内稳定备用源（免注册）；东方财富�
 # pytorch-tabnet>=4.0    # TabNet（缺失则用 DNN 近似替代）
 # gplearn>=0.4           # 符号回归 SR / GEP / MEP 近似
 # optuna>=3.0            # 贝叶斯超参数优化 BO（缺失则退化为随机搜索）
+# statsmodels>=0.14      # ARIMA 经典统计时序模型

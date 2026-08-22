@@ -159,6 +159,13 @@ try:
 except ImportError:
     HAS_OPTUNA = False
 
+# ---- 1.3.6b 经典统计时序模型 ARIMA ----
+try:
+    from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
 # ---- 1.3.7 GUI 框架 ----
 try:
     from PySide6.QtWidgets import (
@@ -198,12 +205,15 @@ class TrainConfig:
     """
     window_size: int = 20            # 用过去多少天的数据作为一个输入样本（滑动窗口长度）
     horizon: int = 1                 # 预测未来第几天的收盘价（1 = 预测下一天）
+    target_mode: str = "return"      # "price"=预测收盘价水平 / "return"=预测涨跌幅（默认，更诚实）
+    #  ↑ 默认改为预测"涨跌幅"：股价水平自相关极强，预测价格会得到虚高的 R²；预测涨跌幅更平稳、
+    #    也更贴近"判断涨跌"的真实目标。无论哪种模式，评估与画图都会统一还原成"价格"来比较。
     train_ratio: float = 0.7         # 训练集比例，默认 7:3（对应截图默认选中项）
     use_cv: bool = False             # 是否启用 5 折交叉验证
     cv_folds: int = 5
     hpo_method: str = "BO"           # 超参数优化方式："PSO"/"GA"/"FA"/"SOA"/"BO"/"关闭"
     hpo_trials: int = 20             # 寻优迭代/试验次数
-    metrics: List[str] = field(default_factory=lambda: ["R2", "MAE", "RMSE", "DA"])
+    metrics: List[str] = field(default_factory=lambda: ["R2", "MAE", "RMSE", "DA", "UP_P"])
     add_naive_baseline: bool = True  # 是否自动加入"前值持有"朴素基准（强烈建议开启，见下方说明）
     #  ↑↑↑【股票预测最重要的诚实性开关】↑↑↑
     #  股价是强自相关序列，"用今天收盘价当作明天预测值"这种什么都不学的朴素基准，
@@ -417,11 +427,15 @@ class FeatureEngineer:
     整体流程： 原始行情 -> 计算技术指标 -> 标准化 -> 滑动窗口切片 -> 训练/测试切分
     """
 
-    def __init__(self, window_size: int = 20, horizon: int = 1):
+    def __init__(self, window_size: int = 20, horizon: int = 1, target_mode: str = "price"):
         self.window_size = window_size      # 滑动窗口长度（用过去多少天预测未来）
         self.horizon = horizon              # 预测未来第几天
+        self.target_mode = target_mode      # "price"=预测收盘价水平 / "return"=预测涨跌幅(更诚实)
         self.scaler_x: Optional[StandardScaler] = None
         self.scaler_y: Optional[StandardScaler] = None
+        # build_supervised_samples 会顺便填充下面两个数组（与 X 对齐），供还原价格/朴素基准/方向评估使用
+        self.prev_close_: Optional[np.ndarray] = None    # 每个样本的"基准日"(窗口最后一天)收盘价
+        self.close_target_: Optional[np.ndarray] = None  # 每个样本的"真实未来"收盘价(价格空间)
 
     # ---------- 4.1 技术指标计算 ----------
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -472,6 +486,26 @@ class FeatureEngineer:
         df["return_1d"] = df["close"].pct_change()
         df["volatility_10d"] = df["return_1d"].rolling(10).std()
 
+        # ---- 4.1.8 市场情绪代理特征 ----
+        # 说明：这些都是从"行情本身"就能算出、当天即可获得的**情绪代理**指标（不引入未来信息）。
+        # 真正的"舆情情绪"(新闻/股吧/研报文本) 需要接外部数据源做 NLP，属于扩展项(见 README/AGENTS)，
+        # 这里不臆造，只用可得的量价情绪。
+        # 量比：当日成交量 / 过去5日均量（>1 放量、<1 缩量，反映资金热度）
+        df["vol_ratio"] = df["volume"] / (df["volume"].rolling(5).mean() + 1e-9)
+        # 换手率：若数据源自带则直接用（baostock/东方财富的 turnover）
+        if "turnover" in df.columns:
+            df["turnover_feat"] = pd.to_numeric(df["turnover"], errors="coerce")
+        # 日内振幅：(最高-最低)/前收盘，反映多空博弈激烈程度
+        df["amplitude_feat"] = (df["high"] - df["low"]) / (df["close"].shift(1) + 1e-9)
+        # 连涨/连跌天数（带符号：+3=连涨3天，-2=连跌2天），刻画情绪惯性
+        sign = np.sign(df["close"].diff().fillna(0.0))
+        streak = sign.groupby((sign != sign.shift()).cumsum()).cumcount() + 1
+        df["updown_streak"] = sign * streak
+        # 收盘价在近20日高低区间中的相对位置（0=贴近区间低点，1=贴近高点/情绪亢奋）
+        roll_hi = df["high"].rolling(20).max()
+        roll_lo = df["low"].rolling(20).min()
+        df["pos_in_range20"] = (df["close"] - roll_lo) / (roll_hi - roll_lo + 1e-9)
+
         return df
 
     # ---------- 4.2 构造监督学习样本（滑动窗口）----------
@@ -500,15 +534,24 @@ class FeatureEngineer:
         close = df["close"].values
         dates = df["date"]
 
-        X, y, sample_dates = [], [], []
+        X, y, sample_dates, prev_close, close_target = [], [], [], [], []
         n = len(df)
         for i in range(self.window_size, n - self.horizon + 1):
-            window = values[i - self.window_size: i]         # 过去 window_size 天
-            target = close[i + self.horizon - 1]              # 未来第 horizon 天的收盘价
+            window = values[i - self.window_size: i]          # 过去 window_size 天
+            target = close[i + self.horizon - 1]              # 未来第 horizon 天的真实收盘价
+            base = close[i - 1]                                # 基准日(窗口最后一天)的收盘价
             X.append(window.flatten())
-            y.append(target)
+            prev_close.append(base)
+            close_target.append(target)
+            # 目标：预测"价格水平" 或 "相对基准日的涨跌幅"（后者更平稳、更诚实）
+            if self.target_mode == "return":
+                y.append(target / (base + 1e-12) - 1.0)
+            else:
+                y.append(target)
             sample_dates.append(dates.iloc[i + self.horizon - 1])
 
+        self.prev_close_ = np.array(prev_close)
+        self.close_target_ = np.array(close_target)
         return np.array(X), np.array(y), pd.Series(sample_dates).reset_index(drop=True)
 
     # ---------- 4.3 标准化（在训练集上 fit，训练集/测试集上 transform，避免数据泄漏）----------
@@ -664,12 +707,30 @@ class Metrics:
         pred_dir = np.sign(yp[1:] - prev)
         return float(np.mean(true_dir == pred_dir) * 100)
 
+    @staticmethod
+    def up_p(y_true, y_pred):
+        """
+        上涨精确率 Up-Precision（单位：%）：在模型**预测会涨**的那些天里，实际真的涨了的比例。
+        这比总体方向准确率更贴近实盘——你只会在"模型说涨"时买入，所以最该关心"它说涨时到底准不准"。
+        若模型从不预测上涨，则返回 0（无从谈起）。同样假设 horizon=1、y 按时间升序。
+        """
+        yt = np.asarray(y_true, dtype=float).ravel()
+        yp = np.asarray(y_pred, dtype=float).ravel()
+        if len(yt) < 2:
+            return 0.0
+        prev = yt[:-1]
+        pred_up = yp[1:] > prev
+        true_up = yt[1:] > prev
+        if pred_up.sum() == 0:
+            return 0.0
+        return float(np.mean(true_up[pred_up]) * 100)
+
     # ---------- 5.1 统一入口：按指标名称列表批量计算 ----------
     _FUNC_MAP = {
         "R2": r2.__func__, "MAE": mae.__func__, "MSE": mse.__func__, "RMSE": rmse.__func__,
         "MAPE": mape.__func__, "SMAPE": smape.__func__, "R": r_corr.__func__,
         "NSE": nse.__func__, "CE": ce.__func__, "KGE": kge.__func__,
-        "WI": wi.__func__, "SI": si.__func__, "DA": da.__func__,
+        "WI": wi.__func__, "SI": si.__func__, "DA": da.__func__, "UP_P": up_p.__func__,
     }
 
     @classmethod
@@ -1483,7 +1544,46 @@ class MEPModel(SRModel):
 
 
 # ------------------------------------------------------------------------------
-# 6.4 模型注册表 —— 34 个算法的统一入口
+# 6.3b 经典统计时序模型：ARIMA
+# ------------------------------------------------------------------------------
+class ARIMAModel(BaseModel):
+    """
+    ARIMA —— 差分自回归移动平均，统计意义上"真正的时序模型"（不依赖滑窗特征）。
+
+    在本框架里的定位与做法：
+      - fit()   : 只用训练段的**目标序列** y 本身来拟合 ARIMA(p,d,q)，忽略窗口特征 X。
+      - predict(): 对测试段做**多步向前预测**(forecast)，一次性给出整段测试期的预测。
+    这是"纯时序模型"的经典对照。要提醒的是：在股票这种近乎随机游走的序列上，ARIMA 的多步预测
+    往往会迅速收敛到均值（价格模式下≈一条平线，收益率模式下≈常数），因此它常常**跑不赢朴素基准**——
+    这恰恰印证了"复杂/经典时序模型≠更准"。把它放进来，是为了让对照更诚实、更完整。
+
+    依赖 statsmodels：  pip install statsmodels
+    """
+    name, category = "ARIMA", "经典时序模型"
+
+    def __init__(self, p: int = 5, d: int = 1, q: int = 0, **kwargs):
+        super().__init__(p=p, d=d, q=q, **kwargs)
+        if not HAS_STATSMODELS:
+            raise ImportError("未安装 statsmodels，请执行: pip install statsmodels")
+        self._fitted = None
+
+    def fit(self, X, y):
+        order = (int(self.params.get("p", 5)), int(self.params.get("d", 1)),
+                 int(self.params.get("q", 0)))
+        self._fitted = _ARIMA(np.asarray(y, dtype=float), order=order).fit()
+        return self
+
+    def predict(self, X):
+        n = len(X)
+        fc = np.asarray(self._fitted.forecast(steps=n), dtype=float)
+        # 极端参数下 statsmodels 偶尔返回 NaN，兜底为最后一次拟合的均值，避免整条结果变 NaN
+        if np.any(~np.isfinite(fc)):
+            fc = np.nan_to_num(fc, nan=float(np.nanmean(self._fitted.fittedvalues)))
+        return fc
+
+
+# ------------------------------------------------------------------------------
+# 6.4 模型注册表 —— 算法的统一入口
 # 新增算法时只需要：1) 实现一个 BaseModel 子类  2) 在这里加一行注册，GUI 会自动出现对应勾选框
 # ------------------------------------------------------------------------------
 ALGO_REGISTRY: Dict[str, Callable[..., BaseModel]] = {
@@ -1501,6 +1601,8 @@ ALGO_REGISTRY: Dict[str, Callable[..., BaseModel]] = {
     "ResNet": ResNetModel, "BPNet": BPNetModel, "RBFNet": RBFNetModel,
     # ---- 公式拟合/演化计算 (3) ----
     "SR": SRModel, "GEP": GEPModel, "MEP": MEPModel,
+    # ---- 经典时序模型 (1) ----
+    "ARIMA": ARIMAModel,
 }
 
 # 各算法所需的可选依赖是否满足，GUI 里据此把不可用的算法勾选框置灰
@@ -1509,6 +1611,7 @@ ALGO_AVAILABILITY: Dict[str, bool] = {
     "LSTM": HAS_TORCH, "GRU": HAS_TORCH, "Transformer": HAS_TORCH, "CNN": HAS_TORCH,
     "DNN": HAS_TORCH, "ResNet": HAS_TORCH, "BPNet": HAS_TORCH, "TabNet": True,  # TabNet 有 DNN 降级方案，永远可用
     "SR": HAS_GPLEARN, "GEP": HAS_GPLEARN, "MEP": HAS_GPLEARN,
+    "ARIMA": HAS_STATSMODELS,
 }
 for _name in ALGO_REGISTRY:
     ALGO_AVAILABILITY.setdefault(_name, True)     # 其余算法只依赖 sklearn，始终可用
@@ -1738,6 +1841,22 @@ class ModelResult:
     error: Optional[str] = None            # 若训练失败，记录错误信息，不让一个算法出错影响其它算法
 
 
+@dataclass
+class PreparedData:
+    """一次数据准备的产物。y 处于"目标空间"(price 或 return)，未缩放；
+    评估/画图统一用价格空间：真实值=close_*，预测值由各模型输出还原得到。"""
+    X_train: np.ndarray
+    X_test: np.ndarray
+    y_train: np.ndarray                # 目标空间(price 或 return)，未缩放
+    y_test: np.ndarray
+    d_train: pd.Series
+    d_test: pd.Series
+    prev_close_train: np.ndarray       # 每个样本"基准日"收盘价
+    prev_close_test: np.ndarray
+    close_train: np.ndarray            # 每个样本"真实未来"收盘价(价格空间)
+    close_test: np.ndarray
+
+
 class TrainingPipeline:
     """
     训练总调度器：给定一批算法名字 + 一份数据 + 一份配置，依次训练、评估、（可选）交叉验证，
@@ -1746,32 +1865,46 @@ class TrainingPipeline:
 
     def __init__(self, config: TrainConfig):
         self.config = config
-        self.fe = FeatureEngineer(window_size=config.window_size, horizon=config.horizon)
+        self.fe = FeatureEngineer(window_size=config.window_size, horizon=config.horizon,
+                                  target_mode=config.target_mode)
+
+    def _to_price(self, pred_target: np.ndarray, prev_close: np.ndarray) -> np.ndarray:
+        """把模型在"目标空间"的预测统一还原成"价格"：
+        return 模式: 预测价 = 基准日收盘 × (1 + 预测涨跌幅)；price 模式: 预测价 = 预测值本身。"""
+        if self.config.target_mode == "return":
+            return prev_close * (1.0 + pred_target)
+        return pred_target
 
     # ---------- 8.1 数据准备：技术指标 -> 样本 -> 标准化 -> 时间序列切分 ----------
-    def prepare_data(self, raw_df: pd.DataFrame):
+    def prepare_data(self, raw_df: pd.DataFrame) -> PreparedData:
         X, y, dates = self.fe.build_supervised_samples(raw_df)
-        X_train, X_test, y_train, y_test, d_train, d_test = FeatureEngineer.time_series_split(
-            X, y, dates, self.config.train_ratio
+        pc, ct = self.fe.prev_close_, self.fe.close_target_
+        n = len(X)
+        split = int(n * self.config.train_ratio)
+        self.fe.fit_scale(X[:split], y[:split])                  # 只在训练集上 fit，防止数据泄漏
+        return PreparedData(
+            X_train=self.fe.transform(X[:split]), X_test=self.fe.transform(X[split:]),
+            y_train=y[:split], y_test=y[split:],
+            d_train=dates[:split], d_test=dates[split:].reset_index(drop=True),
+            prev_close_train=pc[:split], prev_close_test=pc[split:],
+            close_train=ct[:split], close_test=ct[split:],
         )
-        self.fe.fit_scale(X_train, y_train)                      # 只在训练集上 fit，防止数据泄漏
-        X_train_s, y_train_s = self.fe.transform(X_train, y_train)
-        X_test_s = self.fe.transform(X_test)
-        return X_train_s, X_test_s, y_train, y_test, d_train, d_test
 
     # ---------- 8.2 单个模型：训练 + 测试评估（+可选HPO +可选CV）----------
-    def run_single(self, algo_name: str, X_train, X_test, y_train, y_test, d_test,
+    def run_single(self, algo_name: str, pdata: PreparedData,
                     progress_cb: Optional[Callable[[str], None]] = None) -> ModelResult:
         log = progress_cb or (lambda msg: None)
         model_cls = ALGO_REGISTRY[algo_name]
         # 深度学习模型需要知道窗口长度才能把展平的 X 还原成 (样本, 时间步, 特征)；
         # 其余模型的 __init__ 都带 **kwargs，多传一个 window_size 会被安全忽略。
         mk = {"window_size": self.config.window_size}
+        X_train, X_test = pdata.X_train, pdata.X_test
+        y_train = pdata.y_train
+        close_test = pdata.close_test                # 价格空间的真实值（统一评估口径）
 
         try:
-            # ---- 8.2.1 标准化空间中的 y（训练更稳定），预测后再逆标准化回真实价格 ----
+            # ---- 8.2.1 目标值缩放（训练更稳定），预测后再逆缩放回目标空间 ----
             y_train_s = self.fe.scaler_y.transform(y_train.reshape(-1, 1)).ravel()
-            y_test_s = self.fe.scaler_y.transform(y_test.reshape(-1, 1)).ravel()
 
             best_params = {}
             # ---- 8.2.2 超参数优化（若启用） ----
@@ -1788,32 +1921,35 @@ class TrainingPipeline:
             model = model_cls(**{**mk, **best_params})
             model.fit(X_train, y_train_s)
 
-            # ---- 8.2.4 测试集预测并逆标准化回真实价格量纲 ----
-            pred_s = model.predict(X_test)
-            pred = self.fe.scaler_y.inverse_transform(pred_s.reshape(-1, 1)).ravel()
+            # ---- 8.2.4 测试集预测 -> 逆缩放回目标空间 -> 统一还原成价格 ----
+            pred_target = self.fe.inverse_y(model.predict(X_test))
+            pred_price = self._to_price(pred_target, pdata.prev_close_test)
+            metrics = Metrics.calc_all(close_test, pred_price, self.config.metrics)
 
-            metrics = Metrics.calc_all(y_test, pred, self.config.metrics)
-
-            # ---- 8.2.5 可选：5折交叉验证（在训练集内部滚动评估，衡量模型稳定性） ----
+            # ---- 8.2.5 可选：5折交叉验证（衡量稳定性；仅算非方向类指标，方向类需价格还原故略）----
             cv_metrics = None
             if self.config.use_cv:
                 log(f"[{algo_name}] 正在做 {self.config.cv_folds} 折交叉验证 ...")
-                cv_metrics = self._cross_validate(model_cls, best_params, X_train, y_train_s, y_train, mk)
+                cv_metrics = self._cross_validate(model_cls, best_params, X_train, y_train_s,
+                                                  y_train, mk)
 
             formula = model.get_formula() if hasattr(model, "get_formula") else None
 
-            return ModelResult(algo_name=algo_name, metrics=metrics, y_test_true=y_test,
-                                y_test_pred=pred, test_dates=d_test, cv_metrics=cv_metrics, formula=formula)
+            return ModelResult(algo_name=algo_name, metrics=metrics, y_test_true=close_test,
+                                y_test_pred=pred_price, test_dates=pdata.d_test,
+                                cv_metrics=cv_metrics, formula=formula)
         except Exception as e:
             log(f"[{algo_name}] 训练失败：{e}")
-            return ModelResult(algo_name=algo_name, metrics={}, y_test_true=y_test,
-                                y_test_pred=np.full_like(y_test, np.nan, dtype=float),
-                                test_dates=d_test, error=str(e))
+            return ModelResult(algo_name=algo_name, metrics={}, y_test_true=close_test,
+                                y_test_pred=np.full_like(close_test, np.nan, dtype=float),
+                                test_dates=pdata.d_test, error=str(e))
 
     # ---------- 8.3 K 折交叉验证（时间序列友好版：仍然按时间顺序滚动切分，不随机打乱）----------
     def _cross_validate(self, model_cls, best_params, X, y_scaled, y_raw,
                         model_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
         model_kwargs = model_kwargs or {}
+        # 方向类指标(DA/UP_P)需要"价格还原"才有意义，而 CV 在目标空间(price/return)内评估，故此处略去
+        cv_metric_names = [m for m in self.config.metrics if m not in ("DA", "UP_P")]
         n = len(X)
         fold_size = n // self.config.cv_folds
         fold_metrics = []
@@ -1827,9 +1963,8 @@ class TrainingPipeline:
             try:
                 m = model_cls(**{**model_kwargs, **best_params})
                 m.fit(X_tr, y_tr)
-                pred_s = m.predict(X_va)
-                pred = self.fe.scaler_y.inverse_transform(pred_s.reshape(-1, 1)).ravel()
-                fold_metrics.append(Metrics.calc_all(y_va_raw, pred, self.config.metrics))
+                pred = self.fe.inverse_y(m.predict(X_va))
+                fold_metrics.append(Metrics.calc_all(y_va_raw, pred, cv_metric_names))
             except Exception:
                 continue
         if not fold_metrics:
@@ -1840,31 +1975,45 @@ class TrainingPipeline:
             avg[key] = round(float(np.mean([f[key] for f in fold_metrics if key in f])), 6)
         return avg
 
-    # ---------- 8.4 朴素基准："用今天的收盘价直接当作明天的预测值"（前值持有）----------
-    def _naive_baseline(self, y_train, y_test, d_test) -> ModelResult:
+    # ---------- 8.4 诚实性参照基准（价格空间）----------
+    def _naive_baseline(self, pdata: PreparedData) -> ModelResult:
         """
-        构造"前值持有"朴素基准的评估结果，作为所有模型的诚实参照系（详见 TrainConfig 里的说明）。
-        测试集第 t 天的预测值 = 第 t-1 天的真实收盘价；第 0 天用训练集最后一天的真实收盘价补齐。
-        仅在 horizon=1 时严格成立，这也是本软件的默认与最常见用法。
+        "前值持有"朴素基准：预测明天收盘价 = 今天(基准日)收盘价（即预测涨跌幅为 0）。
+        它在"价格水平"上往往 R² 很高，却毫无方向判别力(DA≈0)——用来揭穿"R² 虚高"。
         """
-        naive_pred = np.empty_like(y_test, dtype=float)
-        naive_pred[0] = y_train[-1]
-        naive_pred[1:] = y_test[:-1]
-        metrics = Metrics.calc_all(y_test, naive_pred, self.config.metrics)
-        return ModelResult(algo_name="Naive(前值)", metrics=metrics, y_test_true=y_test,
-                           y_test_pred=naive_pred, test_dates=d_test)
+        naive_price = pdata.prev_close_test.astype(float)
+        metrics = Metrics.calc_all(pdata.close_test, naive_price, self.config.metrics)
+        return ModelResult(algo_name="Naive(前值)", metrics=metrics, y_test_true=pdata.close_test,
+                           y_test_pred=naive_price, test_dates=pdata.d_test)
+
+    def _alwaysup_baseline(self, pdata: PreparedData) -> ModelResult:
+        """
+        "总是猜涨"方向基准：每天都预测上涨。它的方向准确率(DA)与上涨精确率(UP_P) 就等于
+        测试集里"上涨日占比"。**任何模型的 DA/UP_P 只有明显高于这一行，才算真的有涨跌判别力。**
+        （价格类指标对本行无意义，请只看 DA / UP_P。）
+        """
+        up_price = pdata.prev_close_test.astype(float) * 1.001    # 恒定"涨一点"，方向恒为涨
+        metrics = Metrics.calc_all(pdata.close_test, up_price, self.config.metrics)
+        return ModelResult(algo_name="总是涨(方向基准)", metrics=metrics,
+                           y_test_true=pdata.close_test, y_test_pred=up_price,
+                           test_dates=pdata.d_test)
 
     # ---------- 8.5 批量运行多个算法 ----------
     def run_batch(self, algo_names: List[str], raw_df: pd.DataFrame,
                   progress_cb: Optional[Callable[[str], None]] = None) -> List[ModelResult]:
-        X_train, X_test, y_train, y_test, d_train, d_test = self.prepare_data(raw_df)
+        log = progress_cb or (lambda msg: None)
+        pdata = self.prepare_data(raw_df)
         results = []
-        # 朴素基准放在最前面，方便一眼对照：任何模型都应当明显优于它才算真的有用。
-        if self.config.add_naive_baseline and self.config.horizon == 1 and len(y_test) >= 2:
-            results.append(self._naive_baseline(y_train, y_test, d_test))
+        # 两个诚实性基准放最前面，一眼对照：模型须在"价格误差"上赢过 Naive、在"方向"上赢过"总是涨"。
+        if self.config.add_naive_baseline and self.config.horizon == 1 and len(pdata.close_test) >= 2:
+            results.append(self._naive_baseline(pdata))
+            results.append(self._alwaysup_baseline(pdata))
+            ct = pdata.close_test
+            up_rate = float(np.mean(ct[1:] > ct[:-1]) * 100)
+            log(f"[诚实性提示] 测试集共 {len(ct)} 天，其中上涨日占比 {up_rate:.1f}%。"
+                f"模型方向准确率(DA) 必须明显 > {up_rate:.1f}% 才算真的有涨跌判别力。")
         for algo_name in algo_names:
-            result = self.run_single(algo_name, X_train, X_test, y_train, y_test, d_test, progress_cb)
-            results.append(result)
+            results.append(self.run_single(algo_name, pdata, progress_cb))
         return results
 
     # ---------- 8.6 向前预测：用最新的窗口预测"数据之后"的收盘价（真正的"预测未来"）----------
@@ -1899,9 +2048,12 @@ class TrainingPipeline:
         df_ind = self.fe.add_technical_indicators(raw_df).dropna().reset_index(drop=True)
         last_window = df_ind[self.fe.feature_cols].values[-self.config.window_size:]
         x_new = self.fe.scaler_x.transform(last_window.flatten().reshape(1, -1))
-        pred_close = float(self.fe.inverse_y(model.predict(x_new))[0])
+        pred_target = float(self.fe.inverse_y(model.predict(x_new))[0])
 
         last_close = float(df_ind["close"].iloc[-1])
+        # 按目标模式统一还原成"预测收盘价"
+        pred_close = float(last_close * (1.0 + pred_target)) \
+            if self.config.target_mode == "return" else pred_target
         last_date = pd.to_datetime(df_ind["date"].iloc[-1]).strftime("%Y-%m-%d") \
             if "date" in df_ind.columns else ""
         return {
@@ -2123,6 +2275,13 @@ if HAS_PYSIDE6:
                 self.data_source_combo.setCurrentIndex(1)   # 没有真实源时默认合成数据，避免点击就报错
             layout.addWidget(self.data_source_combo, 3, 1)
 
+            layout.addWidget(QLabel("预测目标:"), 4, 0)
+            self.target_combo = QComboBox()
+            self.target_combo.addItems(["涨跌幅 return (推荐,更诚实)", "价格水平 price"])
+            self.target_combo.setToolTip("预测涨跌幅更平稳、可避免价格自相关导致的 R² 虚高；"
+                                         "无论哪种，评估都会统一还原成价格并给出方向准确率。")
+            layout.addWidget(self.target_combo, 4, 1)
+
             return box
 
         # ---- 9.2.3 算法多选区（对应截图 B-1.1，按 3 类分组）----
@@ -2134,7 +2293,7 @@ if HAS_PYSIDE6:
             select_all_btn.clicked.connect(self._toggle_all_algos)
             outer.addWidget(select_all_btn)
 
-            categories = ["基础与传统模型", "先进与前沿模型", "公式拟合/演化计算"]
+            categories = ["基础与传统模型", "先进与前沿模型", "公式拟合/演化计算", "经典时序模型"]
             for cat in categories:
                 cat_box = QGroupBox(cat)
                 grid = QGridLayout(cat_box)
@@ -2182,8 +2341,8 @@ if HAS_PYSIDE6:
         def _build_metric_group(self) -> QGroupBox:
             box = QGroupBox("评价指标核心配置 (系统推荐勾选 R², MAE, RMSE, DA方向准确率)")
             grid = QGridLayout(box)
-            metric_names = ["R2", "MAE", "RMSE", "DA", "MAPE", "MSE", "CE", "NSE", "R", "KGE", "SMAPE", "WI", "SI"]
-            default_on = {"R2", "MAE", "RMSE", "DA"}
+            metric_names = ["R2", "MAE", "RMSE", "DA", "UP_P", "MAPE", "MSE", "CE", "NSE", "R", "KGE", "SMAPE", "WI", "SI"]
+            default_on = {"R2", "MAE", "RMSE", "DA", "UP_P"}
             for i, name in enumerate(metric_names):
                 cb = QCheckBox(name)
                 cb.setChecked(name in default_on)
@@ -2247,8 +2406,9 @@ if HAS_PYSIDE6:
             hpo_method = next(m for m, rb in self.hpo_radios.items() if rb.isChecked())
             metrics = [name for name, cb in self.metric_checkboxes.items() if cb.isChecked()] or ["R2", "MAE", "RMSE"]
 
+            target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
             config = TrainConfig(
-                window_size=20, horizon=1, train_ratio=train_ratio,
+                window_size=20, horizon=1, train_ratio=train_ratio, target_mode=target_mode,
                 use_cv=self.cv_checkbox.isChecked(), cv_folds=5,
                 hpo_method=hpo_method, hpo_trials=15, metrics=metrics
             )
@@ -2333,6 +2493,7 @@ def run_experiment(code: str = "600519",
                    train_ratio: float = 0.7,
                    window: int = 20,
                    horizon: int = 1,
+                   target_mode: str = "return",
                    use_cv: bool = False,
                    metrics: Optional[List[str]] = None,
                    add_naive_baseline: bool = True,
@@ -2357,7 +2518,7 @@ def run_experiment(code: str = "600519",
     """
     log = progress_cb or (lambda msg: None)
     algos = algos or ["RF", "SVR", "GBRT"]
-    metrics = metrics or ["R2", "MAE", "RMSE", "DA"]
+    metrics = metrics or ["R2", "MAE", "RMSE", "DA", "UP_P"]
     end = end or dt.date.today().strftime("%Y%m%d")
 
     # ---- 1) 取数据：真实(东方财富/baostock 自动容错) 或 合成 ----
@@ -2374,8 +2535,9 @@ def run_experiment(code: str = "600519",
 
     # ---- 2) 组装配置并训练 ----
     config = TrainConfig(window_size=window, horizon=horizon, train_ratio=train_ratio,
-                         use_cv=use_cv, hpo_method=hpo, hpo_trials=hpo_trials,
-                         metrics=metrics, add_naive_baseline=add_naive_baseline)
+                         target_mode=target_mode, use_cv=use_cv, hpo_method=hpo,
+                         hpo_trials=hpo_trials, metrics=metrics,
+                         add_naive_baseline=add_naive_baseline)
     pipeline = TrainingPipeline(config)
     results = pipeline.run_batch(algos, raw_df, progress_cb=log)
 
@@ -2400,8 +2562,8 @@ def run_experiment(code: str = "600519",
         "config": {
             "code": code, "start": start, "end": end, "algos": algos,
             "hpo": hpo, "hpo_trials": hpo_trials, "train_ratio": train_ratio,
-            "window": window, "horizon": horizon, "use_cv": use_cv,
-            "metrics": metrics, "add_naive_baseline": add_naive_baseline,
+            "window": window, "horizon": horizon, "target_mode": target_mode,
+            "use_cv": use_cv, "metrics": metrics, "add_naive_baseline": add_naive_baseline,
         },
         "n_samples": {"test": n_test},
         "results": [
@@ -2430,8 +2592,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ratio", type=float, default=0.7, help="训练集比例，默认 0.7")
     p.add_argument("--window", type=int, default=20, help="滑动窗口天数")
     p.add_argument("--horizon", type=int, default=1, help="预测未来第几天(方向准确率/朴素基准要求为 1)")
+    p.add_argument("--target", default="return", choices=["return", "price"],
+                   help="预测目标: return=涨跌幅(推荐,更诚实) / price=价格水平")
     p.add_argument("--cv", action="store_true", help="启用 5 折交叉验证")
-    p.add_argument("--metrics", default="R2,MAE,RMSE,DA", help="逗号分隔的评价指标")
+    p.add_argument("--metrics", default="R2,MAE,RMSE,DA,UP_P", help="逗号分隔的评价指标")
     p.add_argument("--no-naive", action="store_true", help="不加入朴素基准(不建议)")
     p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的下一交易日收盘价")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
@@ -2445,6 +2609,7 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         algos=[a.strip() for a in args.algos.split(",") if a.strip()],
         synthetic=args.synthetic, hpo=args.hpo, hpo_trials=args.hpo_trials,
         train_ratio=args.ratio, window=args.window, horizon=args.horizon,
+        target_mode=args.target,
         use_cv=args.cv, metrics=[m.strip() for m in args.metrics.split(",") if m.strip()],
         add_naive_baseline=not args.no_naive, forecast=args.forecast,
         progress_cb=print,
