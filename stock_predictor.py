@@ -51,6 +51,7 @@ import json                    # 配置/缓存的序列化
 import argparse                # 命令行/无界面模式参数解析（方便脚本或其它 AI 程序化调用）
 import time                    # 计时、生成随机种子
 import warnings                # 屏蔽第三方库的冗余警告信息
+import contextlib              # 临时忽略系统代理时用到的上下文管理器
 import datetime as dt          # 日期处理（股票行情按日期索引）
 from abc import ABC, abstractmethod            # 定义模型统一接口的抽象基类
 from dataclasses import dataclass, field       # 简化配置类的书写
@@ -66,6 +67,10 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+# 让 matplotlib 正常显示中文标签与负号（否则图里的中文会变成方框、负号会缺失）
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei",
+                                          "Arial Unicode MS", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
 # 注意：FigureCanvasQTAgg 依赖 PySide6/PyQt 才能导入，放到"可选依赖"区域（1.3.7）里按需导入，
 # 这样在没装 GUI 库、只想用本文件做命令行训练/批量实验的场景下，导入本文件不会直接报错。
 
@@ -201,6 +206,37 @@ class TrainConfig:
 
 
 # ==================== 第三部分：数据获取层 ====================
+@contextlib.contextmanager
+def _no_proxy():
+    """
+    临时"忽略系统代理"的上下文管理器。
+
+    背景：东方财富/新浪等 A 股行情接口都是**国内**站点，直连即可访问。但如果电脑上开着
+    VPN / 科学上网 / 代理软件，它们往往会设置 HTTP_PROXY/HTTPS_PROXY 环境变量，导致
+    akshare(底层 requests) 把对国内站点的请求也硬走代理，从而报
+    "ProxyError: Unable to connect to proxy"。
+    进入本上下文时清空这些代理变量并把 NO_PROXY 设为通配 "*"，退出时原样恢复，
+    这样拉行情时自动直连、绕过代理，用户开着 VPN 也不受影响。
+    """
+    proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                  "http_proxy", "https_proxy", "all_proxy"]
+    saved = {k: os.environ.pop(k, None) for k in proxy_keys}
+    saved_no = {k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+        for k, v in saved_no.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 class StockDataFetcher:
     """
     A 股历史行情数据获取器。
@@ -213,7 +249,8 @@ class StockDataFetcher:
 
     # ---------- 3.1 拉取真实历史行情 ----------
     def fetch(self, code: str, start_date: str, end_date: str,
-              adjust: str = "qfq", use_cache: bool = True) -> pd.DataFrame:
+              adjust: str = "qfq", use_cache: bool = True,
+              bypass_proxy: bool = True) -> pd.DataFrame:
         """
         拉取指定股票代码在 [start_date, end_date] 区间的日线行情。
 
@@ -242,11 +279,13 @@ class StockDataFetcher:
                 "（若暂时无法安装，可调用 generate_synthetic_data() 使用合成数据先跑通流程）"
             )
 
-        # ---- 3.1.3 调用 akshare 接口拉取数据 ----
-        df = ak.stock_zh_a_hist(
-            symbol=code, period="daily",
-            start_date=start_date, end_date=end_date, adjust=adjust
-        )
+        # ---- 3.1.3 调用 akshare 接口拉取数据（默认自动绕过系统代理，避免 VPN 干扰）----
+        proxy_ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with proxy_ctx:
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust=adjust
+            )
 
         # ---- 3.1.4 统一列名为英文，方便后续代码引用 ----
         df = df.rename(columns={
@@ -1862,8 +1901,12 @@ if HAS_PYSIDE6:
             scroll.setWidget(config_panel)
             main_layout.addWidget(scroll)
 
-            # 右：结果展示区（Tab：图表 / 表格 / 日志）
+            # 右：结果展示区（Tab：行情K线 / 预测图 / 表格 / 日志）
             self.tabs = QTabWidget()
+
+            # 第 1 个标签页：真实行情 K 线图（点按钮即可先预览数据，不必先跑模型）
+            self.tabs.addTab(self._build_kline_tab(), "行情K线图")
+
             self.figure = Figure(figsize=(8, 5))
             self.canvas = FigureCanvas(self.figure)
             self.tabs.addTab(self.canvas, "预测结果对比图")
@@ -1875,6 +1918,100 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self.log_box, "运行日志")
 
             main_layout.addWidget(self.tabs, stretch=1)
+
+        # ---- 9.2.1b 行情 K 线图标签页 ----
+        def _build_kline_tab(self) -> QWidget:
+            """
+            一个独立的 K 线预览页：点"获取/刷新 K 线图"按钮，就按上方数据配置里的
+            股票代码/日期/数据源拉一次行情并画出蜡烛图(含 MA5/10/20 与成交量)，
+            方便先"看下情况"确认数据没问题，再去跑模型。
+            """
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+
+            top = QHBoxLayout()
+            self.kline_btn = QPushButton("📈 获取/刷新 K 线图")
+            self.kline_btn.setStyleSheet("font-weight:bold; padding:6px;")
+            self.kline_btn.clicked.connect(self._on_fetch_kline)
+            top.addWidget(self.kline_btn)
+            self.kline_hint = QLabel("提示：先在左上角填好股票代码/日期/数据源，再点这里。红涨绿跌。")
+            self.kline_hint.setStyleSheet("color:#666;")
+            top.addWidget(self.kline_hint, stretch=1)
+            layout.addLayout(top)
+
+            self.kline_figure = Figure(figsize=(8, 5))
+            self.kline_canvas = FigureCanvas(self.kline_figure)
+            layout.addWidget(self.kline_canvas, stretch=1)
+            return panel
+
+        # ---- 9.2.1c 点击"获取 K 线"后：拉数据并画图 ----
+        def _on_fetch_kline(self):
+            try:
+                use_synthetic = self.data_source_combo.currentIndex() == 1
+                if use_synthetic:
+                    df = StockDataFetcher.generate_synthetic_data()
+                    title = "合成数据 K 线（离线演示）"
+                else:
+                    code = self.code_edit.text().strip()
+                    start = self.start_date.date().toString("yyyyMMdd")
+                    end = self.end_date.date().toString("yyyyMMdd")
+                    self.kline_hint.setText(f"正在拉取 {code} 的行情 ...")
+                    QApplication.processEvents()
+                    df = StockDataFetcher().fetch(code, start, end)   # 已自动绕过系统代理
+                    title = f"{code}  日线 K 线  [{start} ~ {end}]"
+                if df is None or len(df) == 0:
+                    QMessageBox.warning(self, "提示", "没有取到任何行情数据，请检查代码/日期。")
+                    return
+                self._draw_kline(df, title)
+                self.kline_hint.setText(f"共 {len(df)} 个交易日。红涨绿跌，含 MA5/10/20 与成交量。")
+            except Exception as e:
+                QMessageBox.critical(self, "K 线获取失败", str(e))
+                self.kline_hint.setText("获取失败，详见弹窗。若是代理/网络问题，可先用合成数据。")
+
+        # ---- 9.2.1d 画蜡烛图（价格 + 均线 + 成交量）----
+        def _draw_kline(self, df: pd.DataFrame, title: str):
+            self.kline_figure.clear()
+            gs = self.kline_figure.add_gridspec(4, 1, hspace=0.08)
+            ax_p = self.kline_figure.add_subplot(gs[0:3, 0])
+            ax_v = self.kline_figure.add_subplot(gs[3, 0], sharex=ax_p)
+
+            x = np.arange(len(df))
+            o = df["open"].to_numpy(float); c = df["close"].to_numpy(float)
+            h = df["high"].to_numpy(float); l = df["low"].to_numpy(float)
+            up = c >= o
+            red, green = "#e0334b", "#1a9d5a"          # A 股习惯：红涨绿跌
+            colors = np.where(up, red, green)
+
+            # 影线(最高-最低) + 实体(开盘-收盘)
+            ax_p.vlines(x, l, h, color=colors, linewidth=0.8, zorder=2)
+            body = np.where(np.abs(c - o) < 1e-9, 1e-9, c - o)   # 十字星给个极小高度以可见
+            ax_p.bar(x, body, bottom=o, width=0.62, color=colors, edgecolor=colors, zorder=3)
+
+            # 均线
+            close_s = pd.Series(c)
+            for w, col in [(5, "#f2a900"), (10, "#3b7dd8"), (20, "#9270CA")]:
+                if len(df) >= w:
+                    ax_p.plot(x, close_s.rolling(w).mean(), linewidth=1.0, label=f"MA{w}", color=col)
+            ax_p.legend(loc="best", fontsize=8)
+            ax_p.set_ylabel("价格")
+            ax_p.set_title(title)
+            ax_p.grid(True, alpha=0.25)
+
+            # 成交量
+            if "volume" in df.columns:
+                ax_v.bar(x, df["volume"].to_numpy(float), width=0.62, color=colors)
+            ax_v.set_ylabel("成交量")
+            ax_v.grid(True, alpha=0.25)
+
+            # x 轴用日期标签（挑约 8 个刻度，避免拥挤）
+            n = len(df)
+            idx = np.linspace(0, n - 1, min(8, n)).astype(int)
+            ax_v.set_xticks(x[idx])
+            ax_v.set_xticklabels(
+                [pd.to_datetime(df["date"].iloc[i]).strftime("%y-%m-%d") for i in idx],
+                rotation=30, fontsize=8)
+            plt.setp(ax_p.get_xticklabels(), visible=False)
+            self.kline_canvas.draw()
 
         # ---- 9.2.2 数据配置区 ----
         def _build_data_group(self) -> QGroupBox:
