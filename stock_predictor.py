@@ -308,6 +308,8 @@ class StockDataFetcher:
                     return df
                 except Exception as e:
                     errors.append(f"{name}(第{attempt}次): {e}")
+                    if attempt < retries:
+                        time.sleep(1.0 * attempt)     # 递增退避，缓解服务器瞬时限流/掐连
 
         # ---- 3.1.3 全部数据源失败：给出清晰、可操作的报错 ----
         hint = ""
