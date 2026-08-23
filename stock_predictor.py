@@ -523,7 +523,9 @@ class FeatureEngineer:
             sample_dates : 每个样本对应的"预测目标日期"，用于后续画图对齐横轴
         """
         df = self.add_technical_indicators(df)
-        df = df.dropna().reset_index(drop=True)      # 技术指标开头会有 NaN（如 MA60 需要60天），直接丢弃
+        # 停牌日成交量可能为 0，使得"环比/量比"等特征出现 inf；dropna 删不掉 inf，需先转成 NaN 再删。
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna().reset_index(drop=True)      # 技术指标开头会有 NaN（如 MA60 需要60天），一并丢弃
 
         if feature_cols is None:
             # 默认使用除日期外的全部数值列作为特征
@@ -2045,7 +2047,8 @@ class TrainingPipeline:
         model.fit(X_s, y_s)
 
         # 2) 取"最新的一整个窗口"（含最后一个交易日），构造一条待预测样本
-        df_ind = self.fe.add_technical_indicators(raw_df).dropna().reset_index(drop=True)
+        df_ind = self.fe.add_technical_indicators(raw_df)
+        df_ind = df_ind.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
         last_window = df_ind[self.fe.feature_cols].values[-self.config.window_size:]
         x_new = self.fe.scaler_x.transform(last_window.flatten().reshape(1, -1))
         pred_target = float(self.fe.inverse_y(model.predict(x_new))[0])
