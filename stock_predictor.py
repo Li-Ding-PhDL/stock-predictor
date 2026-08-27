@@ -458,30 +458,78 @@ class StockDataFetcher:
     @staticmethod
     def _fetch_fundflow(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
         """
-        真实主力资金流向(日频)：akshare stock_individual_fund_flow，数据源=东方财富。
+        真实主力资金流向(日频)，数据源=东方财富(公开资金流 API)。
         这是"主力/大单是买是卖"的**历史可回测**版本，也是"买卖手力量"的历史等价物
         （实时盘口委买委卖是快照、无免费历史，不能用于回测）。
         取：主力净流入净额/净占比、超大单/大单/中单/小单净额。
+
+        策略：先用"带浏览器请求头的直连"调东财 API(往往能绕过 akshare 遇到的反爬掐连 RemoteDisconnected)，
+        直连失败再回退到 akshare。两条路都是同一份真实公开数据，只是取法不同。
         """
-        market = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8")) else "sz")
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
-        # 东财资金流接口最容易 RemoteDisconnected：用更耐心的重试(5次、更长退避)
-        with ctx:
-            f = StockDataFetcher._retry(
-                lambda: ak.stock_individual_fund_flow(stock=code, market=market),
-                tries=5, delay=1.5)
-        ren = {"日期": "date",
-               "主力净流入-净额": "mf_main_net", "主力净流入-净占比": "mf_main_pct",
-               "超大单净流入-净额": "mf_xl_net", "大单净流入-净额": "mf_l_net",
-               "中单净流入-净额": "mf_m_net", "小单净流入-净额": "mf_s_net"}
-        f = f.rename(columns=ren)
-        keep = ["date"] + [c for c in ren.values() if c != "date" and c in f.columns]
-        f = f[keep]
-        f["date"] = pd.to_datetime(f["date"]).astype("datetime64[ns]")
-        for c in keep:
+        errors = []
+        # ---- 路径 A：带浏览器 UA 的直连东财资金流 API ----
+        try:
+            with ctx:
+                return StockDataFetcher._fetch_fundflow_direct(code)
+        except Exception as e:
+            errors.append(f"直连: {e}")
+        # ---- 路径 B：回退到 akshare(更耐心的重试) ----
+        market = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8")) else "sz")
+        try:
+            ctx2 = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx2:
+                f = StockDataFetcher._retry(
+                    lambda: ak.stock_individual_fund_flow(stock=code, market=market),
+                    tries=4, delay=1.5)
+            ren = {"日期": "date",
+                   "主力净流入-净额": "mf_main_net", "主力净流入-净占比": "mf_main_pct",
+                   "超大单净流入-净额": "mf_xl_net", "大单净流入-净额": "mf_l_net",
+                   "中单净流入-净额": "mf_m_net", "小单净流入-净额": "mf_s_net"}
+            f = f.rename(columns=ren)
+            keep = ["date"] + [c for c in ren.values() if c != "date" and c in f.columns]
+            f = f[keep]
+            f["date"] = pd.to_datetime(f["date"]).astype("datetime64[ns]")
+            for c in keep:
+                if c != "date":
+                    f[c] = pd.to_numeric(f[c], errors="coerce")
+            return f.dropna(subset=["date"]).sort_values("date")
+        except Exception as e:
+            errors.append(f"akshare: {e}")
+        raise RuntimeError("；".join(errors))
+
+    @staticmethod
+    def _fetch_fundflow_direct(code: str) -> pd.DataFrame:
+        """带浏览器请求头直连东财公开资金流 API(push2his.eastmoney.com)。真实数据，非爬虫破解。"""
+        import requests
+        secid = f"1.{code}" if code.startswith("6") else f"0.{code}"   # 1=沪 0=深/北
+        url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+        params = {
+            "lmt": "0", "klt": "101", "secid": secid,
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        }
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            "Referer": "https://data.eastmoney.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
+        r = StockDataFetcher._retry(
+            lambda: requests.get(url, params=params, headers=headers, timeout=12), tries=4, delay=1.2)
+        klines = (r.json().get("data") or {}).get("klines") or []
+        if not klines:
+            raise RuntimeError("直连返回空(可能代码/市场不对)")
+        rows = [k.split(",") for k in klines]
+        df = pd.DataFrame([row[:7] for row in rows],
+                          columns=["date", "mf_main_net", "mf_s_net", "mf_m_net",
+                                   "mf_l_net", "mf_xl_net", "mf_main_pct"])
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
+        for c in df.columns:
             if c != "date":
-                f[c] = pd.to_numeric(f[c], errors="coerce")
-        return f.dropna(subset=["date"]).sort_values("date")
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
     @staticmethod
     def _fetch_valuation(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
