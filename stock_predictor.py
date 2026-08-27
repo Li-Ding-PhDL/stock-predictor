@@ -604,6 +604,22 @@ class StockDataFetcher:
         cols = [c for c in ["time", "title", "source", "url"] if c in nd.columns]
         return nd[cols].head(limit)
 
+    @staticmethod
+    def fetch_stock_name(code: str, bypass_proxy: bool = True) -> str:
+        """获取股票简称(用于识别 ST/*ST 退市风险)。真实来源=东方财富 stock_individual_info_em。失败返回空串。"""
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx:
+                info = StockDataFetcher._retry(lambda: ak.stock_individual_info_em(symbol=code), tries=2)
+            # info 为两列(item/value)的表；找"股票简称"
+            m = info.set_index(info.columns[0])[info.columns[1]].to_dict()
+            for k, v in m.items():
+                if "简称" in str(k):
+                    return str(v)
+        except Exception:
+            pass
+        return ""
+
     # ---------- 3.2 缓存文件路径 ----------
     def _cache_path(self, code: str, start_date: str, end_date: str, adjust: str) -> str:
         fname = f"{code}_{start_date}_{end_date}_{adjust}.parquet"
@@ -2455,6 +2471,71 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
 
 
 # ==================== 第八部分补充2：未来走势预测（多周期直接预测，不递归、不造假） ====================
+# ==================== 第八部分补充3：风险提示（全部基于真实数据，绝不臆造） ====================
+# 风险关键词表：命中真实新闻标题时提示。只做"关键词命中提醒"，不做情绪打分、不下结论。
+RISK_KEYWORDS = {
+    "退市风险": ["退市", "面值退", "终止上市", "*ST", "ST股", "强制退市"],
+    "监管/立案风险": ["立案", "问询", "被查", "违规", "处罚", "风险警示", "关注函", "警示函", "调查", "诉讼", "仲裁"],
+    "财务风险": ["亏损", "预亏", "商誉减值", "资不抵债", "债务逾期", "计提", "债务危机", "爆雷"],
+    "股东/资金风险": ["减持", "质押", "爆仓", "冻结", "资金占用", "违规担保", "清仓"],
+    "停牌": ["停牌", "停复牌"],
+}
+
+
+def assess_risks(code: str, name: str, df: pd.DataFrame,
+                 news: Optional[pd.DataFrame] = None) -> List[Dict[str, str]]:
+    """
+    基于真实数据的风险自动筛查(非投资建议、非预测)。每条提示都注明**真实依据来源**。
+    返回 [{level, category, msg, source, url}]，level ∈ {高,中,低}。
+    """
+    warns: List[Dict[str, str]] = []
+    close = pd.to_numeric(df["close"], errors="coerce").dropna() if "close" in df.columns else pd.Series([], dtype=float)
+    lc = float(close.iloc[-1]) if len(close) else None
+
+    # 1) ST/*ST 退市风险（依据：真实股票简称）
+    up = (name or "").upper()
+    if name and ("ST" in up):
+        warns.append({"level": "高", "category": "退市风险",
+                      "msg": f"股票简称为「{name}」，含 ST/*ST——已被交易所实施风险警示，存在退市风险，请高度谨慎。",
+                      "source": "东方财富·股票简称", "url": ""})
+    # 2) 面值/低价退市风险（依据：真实收盘价）
+    if lc is not None:
+        if lc < 1.0:
+            warns.append({"level": "高", "category": "面值退市风险",
+                          "msg": f"最新收盘 {lc:.2f} 元 < 1 元，若连续 20 个交易日低于面值将触及面值退市。",
+                          "source": "东方财富·行情", "url": ""})
+        elif lc < 2.0:
+            warns.append({"level": "中", "category": "低价股风险",
+                          "msg": f"最新收盘 {lc:.2f} 元，属低价股，波动与不确定性较大。",
+                          "source": "东方财富·行情", "url": ""})
+    # 3) 亏损（依据：真实估值 PE(TTM)）
+    if "val_pe_ttm" in df.columns:
+        pe_s = pd.to_numeric(df["val_pe_ttm"], errors="coerce").replace(0, np.nan).dropna()
+        if len(pe_s) and pe_s.iloc[-1] <= 0:
+            warns.append({"level": "中", "category": "盈利风险",
+                          "msg": f"最新市盈率(TTM) {pe_s.iloc[-1]:.1f} ≤ 0，公司当前处于亏损状态。",
+                          "source": "乐咕乐股/百度·估值", "url": ""})
+    # 4) 近期暴跌（依据：真实价格）
+    if len(close) > 21:
+        r20 = lc / float(close.iloc[-21]) - 1
+        if r20 < -0.25:
+            warns.append({"level": "中", "category": "近期大跌",
+                          "msg": f"近 1 个月跌幅 {r20*100:.1f}%，短期跌幅较大，注意风险。",
+                          "source": "东方财富·行情", "url": ""})
+    # 5) 真实新闻命中风险关键词（展示原文标题+链接，不下结论）
+    if news is not None and len(news) > 0:
+        for _, r in news.iterrows():
+            title = str(r.get("title", "")); url = str(r.get("url", ""))
+            for cat, kws in RISK_KEYWORDS.items():
+                hit = next((k for k in kws if k in title), None)
+                if hit:
+                    warns.append({"level": "中", "category": f"新闻·{cat}",
+                                  "msg": f"近期新闻命中「{hit}」：{title}",
+                                  "source": "东方财富·新闻", "url": url})
+                    break
+    return warns
+
+
 def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "return",
                    horizons=(1, 5, 10, 20, 40, 60), window: int = 20,
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
@@ -2738,6 +2819,7 @@ if HAS_PYSIDE6:
                             news = StockDataFetcher.fetch_news(code)
                         except Exception as e:
                             enrich_status["news"] = f"跳过(取数失败: {e})"
+                    self._mldata_name = StockDataFetcher.fetch_stock_name(code)   # 供ST退市风险判断
 
                 target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
                 horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
@@ -2752,7 +2834,10 @@ if HAS_PYSIDE6:
                 self._draw_mldata_trend(code, sample_dates, fe.close_target_, a, b, target_mode)
                 self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, None,
                                          code if not use_synthetic else "")
-                self._fill_mldata_analysis(df, code if not use_synthetic else "", enrich_status, news)
+                name = getattr(self, "_mldata_name", "") if not use_synthetic else ""
+                warns = assess_risks(code, name, df, news) if not use_synthetic else []
+                self._fill_mldata_analysis(df, code if not use_synthetic else "", enrich_status, news,
+                                           name, warns)
                 self._fill_mldata_table(fe, y, sample_dates, a, b, target_mode)
                 self.mldata_hint.setText(
                     f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本 = 训练 {a} / 验证 {b-a} / 测试 {len(X)-b}。"
@@ -2880,9 +2965,28 @@ if HAS_PYSIDE6:
             """
             self.mldata_srcbox.setHtml(html)
 
-        def _fill_mldata_analysis(self, df, code, enrich_status=None, news=None):
-            """各来源"分析后的信息"：从真实数据里算出每个来源的最新值/近况(不预测、不臆造)。"""
+        def _fill_mldata_analysis(self, df, code, enrich_status=None, news=None, name="", warns=None):
+            """各来源"分析后的信息"：从真实数据里算出每个来源的最新值/近况(不预测、不臆造)。
+            顶部为风险提示(退市/亏损/暴跌/负面新闻)，全部基于真实数据+真实新闻关键词命中。"""
             enrich_status = enrich_status or {}
+            warns = warns or []
+
+            # ---- 顶部：风险提示（红色，最醒目）----
+            if warns:
+                color = {"高": "#c0392b", "中": "#e67e22", "低": "#888"}
+                items = []
+                for wn in warns:
+                    c = color.get(wn["level"], "#888")
+                    link = f" <a href='{wn['url']}'>[原文]</a>" if wn.get("url") else ""
+                    items.append(f"<li><b style='color:{c}'>【{wn['level']}·{wn['category']}】</b>"
+                                 f"{wn['msg']}<span style='color:#888'>（来源：{wn['source']}）</span>{link}</li>")
+                risk_html = ("<div style='background:#fff4f4;border:1px solid #f0b0b0;padding:6px'>"
+                             f"<b style='color:#c0392b'>⚠️ 风险提示（{len(warns)} 条，均基于真实数据/新闻自动筛查，非投资建议）</b>"
+                             f"<ul>{''.join(items)}</ul></div>")
+            else:
+                risk_html = ("<div style='background:#f2fbf2;border:1px solid #b7e0b7;padding:6px'>"
+                             "<b style='color:#1e8449'>✅ 未发现明显风险信号</b>"
+                             "（基于名称ST/价格/亏损/近期跌幅/新闻关键词的自动筛查；不代表无风险，非投资建议）</div>")
 
             def _money(v):
                 try:
@@ -2956,10 +3060,16 @@ if HAS_PYSIDE6:
             elif enrich_status.get("news"):
                 secs.append(f"<b>📰 新闻：</b>{enrich_status['news']}")
 
-            head = (f"<h3>各来源数据分析速览（{code or '合成数据'}）</h3>"
-                    "<p style='color:#888'>以下均为<b>真实数据的最新值/近况</b>，不是预测、不臆造；"
-                    "点新闻链接可看原文。</p>")
-            self.mldata_analysis.setHtml(head + "".join(f"<p>{s}</p>" for s in secs))
+            title = f"{name}（{code}）" if (name and code) else (code or "合成数据")
+            head = (f"<h3>各来源数据分析速览 · {title}</h3>"
+                    "<p style='color:#888'>以下均为<b>真实数据的最新值/近况</b>，每项都注明来源，不是预测、不臆造。</p>")
+            # ---- 底部：诚实的"分析依据"说明（避免被误当成因果归因）----
+            foot = ("<hr><p style='color:#2c6fbb'><b>关于「为什么这样分析」（诚实说明）：</b>"
+                    "上面是模型可参考的<b>真实因素现状</b>——估值高低、主力资金近期流入/流出、大盘强弱、"
+                    "近期涨跌、以及是否命中风险新闻。模型据此学习，但<b>股价由多因素共同驱动</b>，"
+                    "本软件<b>不会</b>替你断言「这次涨跌是机构/主力/散户/某条新闻造成的」——那种单一因果归因"
+                    "免费数据无法可靠判定，谁那么说谁在误导你。请把以上当作客观事实参考，自行判断。</p>")
+            self.mldata_analysis.setHtml(risk_html + head + "".join(f"<p>{s}</p>" for s in secs) + foot)
 
         def _fill_mldata_table(self, fe, y, sample_dates, a, b, target_mode):
             n = len(y)
