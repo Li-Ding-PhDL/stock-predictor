@@ -208,7 +208,9 @@ class TrainConfig:
     target_mode: str = "return"      # "price"=预测收盘价水平 / "return"=预测涨跌幅（默认，更诚实）
     #  ↑ 默认改为预测"涨跌幅"：股价水平自相关极强，预测价格会得到虚高的 R²；预测涨跌幅更平稳、
     #    也更贴近"判断涨跌"的真实目标。无论哪种模式，评估与画图都会统一还原成"价格"来比较。
-    train_ratio: float = 0.7         # 训练集比例，默认 7:3（对应截图默认选中项）
+    train_ratio: float = 0.7         # 训练集比例，默认 7:3（对应界面比例控件）
+    val_ratio: float = 0.0           # 验证集比例(占全体)。0=自动取"剩余部分的一半"作独立验证集
+    #  ↑ 三分：训练集在前(拟合模型) / 验证集居中(独立留出，只报误差，不参与训练/测试/寻优) / 测试集在后(最终留出)
     use_cv: bool = False             # 是否启用 5 折交叉验证
     cv_folds: int = 5
     hpo_method: str = "BO"           # 超参数优化方式："PSO"/"GA"/"FA"/"SOA"/"BO"/"关闭"
@@ -436,6 +438,19 @@ class StockDataFetcher:
         return df.reset_index(drop=True), status
 
     @staticmethod
+    def _retry(fn, tries: int = 3, delay: float = 1.0):
+        """对外部网络接口做几次重试，缓解 RemoteDisconnected 等瞬时抖动；最后一次失败则抛出。"""
+        last = None
+        for i in range(tries):
+            try:
+                return fn()
+            except Exception as e:
+                last = e
+                if i < tries - 1:
+                    time.sleep(delay * (i + 1))
+        raise last
+
+    @staticmethod
     def _fetch_fundflow(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
         """
         真实主力资金流向(日频)：akshare stock_individual_fund_flow，数据源=东方财富。
@@ -446,7 +461,8 @@ class StockDataFetcher:
         market = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8")) else "sz")
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            f = ak.stock_individual_fund_flow(stock=code, market=market)
+            f = StockDataFetcher._retry(
+                lambda: ak.stock_individual_fund_flow(stock=code, market=market))
         ren = {"日期": "date",
                "主力净流入-净额": "mf_main_net", "主力净流入-净占比": "mf_main_pct",
                "超大单净流入-净额": "mf_xl_net", "大单净流入-净额": "mf_l_net",
@@ -463,10 +479,14 @@ class StockDataFetcher:
     @staticmethod
     def _fetch_valuation(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
         """真实财报估值(日频)：akshare stock_a_indicator_lg，数据源=乐咕乐股 legulegu.com。
-        字段：pe/pe_ttm/pb/ps/ps_ttm/dv_ratio/dv_ttm/total_mv。取其中有代表性的几项。"""
+        字段：pe/pe_ttm/pb/ps/ps_ttm/dv_ratio/dv_ttm/total_mv。取其中有代表性的几项。
+        兼容不同 akshare 版本的函数名(stock_a_indicator_lg / stock_a_lg_indicator)。"""
+        fn = getattr(ak, "stock_a_indicator_lg", None) or getattr(ak, "stock_a_lg_indicator", None)
+        if fn is None:
+            raise RuntimeError("当前 akshare 版本无估值接口(stock_a_indicator_lg)，请升级: pip install -U akshare")
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            v = ak.stock_a_indicator_lg(symbol=code)
+            v = StockDataFetcher._retry(lambda: fn(symbol=code))
         v = v.rename(columns={"trade_date": "date"})
         v["date"] = pd.to_datetime(v["date"]).astype("datetime64[ns]")
         keep = {"date": "date", "pe_ttm": "val_pe_ttm", "pb": "val_pb", "ps_ttm": "val_ps_ttm",
@@ -483,7 +503,7 @@ class StockDataFetcher:
         """真实大盘环境：akshare stock_zh_index_daily(沪深300)。产出当日涨跌与相对20日均线偏离。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            ix = ak.stock_zh_index_daily(symbol=symbol)
+            ix = StockDataFetcher._retry(lambda: ak.stock_zh_index_daily(symbol=symbol))
         ix["date"] = pd.to_datetime(ix["date"]).astype("datetime64[ns]")
         ix = ix.sort_values("date")
         ix["idx_ret_1d"] = ix["close"].pct_change()
@@ -497,7 +517,7 @@ class StockDataFetcher:
         本软件**不**把新闻情绪当作历史训练特征，只在界面展示真实标题与链接。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            nd = ak.stock_news_em(symbol=code)
+            nd = StockDataFetcher._retry(lambda: ak.stock_news_em(symbol=code))
         nd = nd.rename(columns={"新闻标题": "title", "发布时间": "time",
                                 "文章来源": "source", "新闻链接": "url"})
         cols = [c for c in ["time", "title", "source", "url"] if c in nd.columns]
@@ -1982,21 +2002,29 @@ class ModelResult:
     formula: Optional[str] = None          # 仅 SR/GEP/MEP 有意义
     error: Optional[str] = None            # 若训练失败，记录错误信息，不让一个算法出错影响其它算法
     prev_close: Optional[np.ndarray] = None  # 每个测试样本的"基准日收盘价"，供方向性收益回测使用
+    metrics_train: Optional[Dict[str, float]] = None  # 训练集误差（看是否过拟合）
+    metrics_val: Optional[Dict[str, float]] = None    # 独立验证集误差（不参与训练/测试/寻优）
 
 
 @dataclass
 class PreparedData:
     """一次数据准备的产物。y 处于"目标空间"(price 或 return)，未缩放；
-    评估/画图统一用价格空间：真实值=close_*，预测值由各模型输出还原得到。"""
+    评估/画图统一用价格空间：真实值=close_*，预测值由各模型输出还原得到。
+    按时间顺序三分：训练集(train) / 验证集(val，独立留出) / 测试集(test，最终留出)。"""
     X_train: np.ndarray
+    X_val: np.ndarray
     X_test: np.ndarray
     y_train: np.ndarray                # 目标空间(price 或 return)，未缩放
+    y_val: np.ndarray
     y_test: np.ndarray
     d_train: pd.Series
+    d_val: pd.Series
     d_test: pd.Series
     prev_close_train: np.ndarray       # 每个样本"基准日"收盘价
+    prev_close_val: np.ndarray
     prev_close_test: np.ndarray
     close_train: np.ndarray            # 每个样本"真实未来"收盘价(价格空间)
+    close_val: np.ndarray
     close_test: np.ndarray
 
 
@@ -2041,20 +2069,38 @@ class TrainingPipeline:
                 metrics[k] = dm[k]
         return metrics
 
-    # ---------- 8.1 数据准备：技术指标 -> 样本 -> 标准化 -> 时间序列切分 ----------
+    # ---------- 8.1 数据准备：技术指标 -> 样本 -> 标准化 -> 训练/验证/测试三分 ----------
     def prepare_data(self, raw_df: pd.DataFrame) -> PreparedData:
         X, y, dates = self.fe.build_supervised_samples(raw_df)
         pc, ct = self.fe.prev_close_, self.fe.close_target_
         n = len(X)
-        split = int(n * self.config.train_ratio)
-        self.fe.fit_scale(X[:split], y[:split])                  # 只在训练集上 fit，防止数据泄漏
+        # 三分切点（严格按时间顺序，绝不打乱）：
+        #   训练 [0, a) / 验证 [a, b) / 测试 [b, n)
+        a = int(n * self.config.train_ratio)
+        rest = n - a
+        n_val = int(n * self.config.val_ratio) if self.config.val_ratio > 0 else rest // 2
+        n_val = max(0, min(n_val, rest))
+        b = a + n_val
+        self.fe.fit_scale(X[:a], y[:a])                          # 只在训练集上 fit，防止数据泄漏
+        d = dates.reset_index(drop=True)
         return PreparedData(
-            X_train=self.fe.transform(X[:split]), X_test=self.fe.transform(X[split:]),
-            y_train=y[:split], y_test=y[split:],
-            d_train=dates[:split], d_test=dates[split:].reset_index(drop=True),
-            prev_close_train=pc[:split], prev_close_test=pc[split:],
-            close_train=ct[:split], close_test=ct[split:],
+            X_train=self.fe.transform(X[:a]), X_val=self.fe.transform(X[a:b]),
+            X_test=self.fe.transform(X[b:]),
+            y_train=y[:a], y_val=y[a:b], y_test=y[b:],
+            d_train=d[:a].reset_index(drop=True), d_val=d[a:b].reset_index(drop=True),
+            d_test=d[b:].reset_index(drop=True),
+            prev_close_train=pc[:a], prev_close_val=pc[a:b], prev_close_test=pc[b:],
+            close_train=ct[:a], close_val=ct[a:b], close_test=ct[b:],
         )
+
+    def _eval(self, model, X, prev_close, close_true) -> Dict[str, float]:
+        """在给定数据集上评估模型：预测→还原价格→算价格类+方向类指标(统一价格口径)。"""
+        if X is None or len(X) == 0:
+            return {}
+        pred_price = self._to_price(self.fe.inverse_y(model.predict(X)), prev_close)
+        m = Metrics.calc_all(close_true, pred_price, self.config.metrics)
+        self._apply_dir(m, close_true, pred_price, prev_close)
+        return m
 
     # ---------- 8.2 单个模型：训练 + 测试评估（+可选HPO +可选CV）----------
     def run_single(self, algo_name: str, pdata: PreparedData,
@@ -2087,11 +2133,16 @@ class TrainingPipeline:
             model = model_cls(**{**mk, **best_params})
             model.fit(X_train, y_train_s)
 
-            # ---- 8.2.4 测试集预测 -> 逆缩放回目标空间 -> 统一还原成价格 ----
-            pred_target = self.fe.inverse_y(model.predict(X_test))
-            pred_price = self._to_price(pred_target, pdata.prev_close_test)
+            # ---- 8.2.4 训练/验证/测试三集分别评估（统一还原成价格口径）----
+            pred_price = self._to_price(self.fe.inverse_y(model.predict(X_test)),
+                                        pdata.prev_close_test)
             metrics = Metrics.calc_all(close_test, pred_price, self.config.metrics)
             self._apply_dir(metrics, close_test, pred_price, pdata.prev_close_test)
+            metrics_train = self._eval(model, X_train, pdata.prev_close_train, pdata.close_train)
+            metrics_val = self._eval(model, pdata.X_val, pdata.prev_close_val, pdata.close_val)
+            m_te = metrics.get("RMSE", "?"); m_tr = metrics_train.get("RMSE", "?")
+            log(f"[{algo_name}] 完成：训练RMSE={m_tr} / 验证RMSE={metrics_val.get('RMSE','-')} "
+                f"/ 测试RMSE={m_te}，测试DA={metrics.get('DA','-')}%")
 
             # ---- 8.2.5 可选：5折交叉验证（衡量稳定性；仅算非方向类指标，方向类需价格还原故略）----
             cv_metrics = None
@@ -2105,7 +2156,8 @@ class TrainingPipeline:
             return ModelResult(algo_name=algo_name, metrics=metrics, y_test_true=close_test,
                                 y_test_pred=pred_price, test_dates=pdata.d_test,
                                 cv_metrics=cv_metrics, formula=formula,
-                                prev_close=pdata.prev_close_test)
+                                prev_close=pdata.prev_close_test,
+                                metrics_train=metrics_train, metrics_val=metrics_val)
         except Exception as e:
             log(f"[{algo_name}] 训练失败：{e}")
             return ModelResult(algo_name=algo_name, metrics={}, y_test_true=close_test,
@@ -2149,12 +2201,19 @@ class TrainingPipeline:
         "前值持有"朴素基准：预测明天收盘价 = 今天(基准日)收盘价（即预测涨跌幅为 0）。
         它在"价格水平"上往往 R² 很高，却毫无方向判别力(DA≈0)——用来揭穿"R² 虚高"。
         """
-        naive_price = pdata.prev_close_test.astype(float)
-        metrics = Metrics.calc_all(pdata.close_test, naive_price, self.config.metrics)
-        self._apply_dir(metrics, pdata.close_test, naive_price, pdata.prev_close_test)
+        def _naive_m(prev, close):
+            if prev is None or len(prev) == 0:
+                return {}
+            p = prev.astype(float)
+            m = Metrics.calc_all(close, p, self.config.metrics)
+            self._apply_dir(m, close, p, prev)
+            return m
+        metrics = _naive_m(pdata.prev_close_test, pdata.close_test)
         return ModelResult(algo_name="Naive(前值)", metrics=metrics, y_test_true=pdata.close_test,
-                           y_test_pred=naive_price, test_dates=pdata.d_test,
-                           prev_close=pdata.prev_close_test)
+                           y_test_pred=pdata.prev_close_test.astype(float), test_dates=pdata.d_test,
+                           prev_close=pdata.prev_close_test,
+                           metrics_train=_naive_m(pdata.prev_close_train, pdata.close_train),
+                           metrics_val=_naive_m(pdata.prev_close_val, pdata.close_val))
 
     def _alwaysup_baseline(self, pdata: PreparedData) -> ModelResult:
         """
@@ -2162,18 +2221,33 @@ class TrainingPipeline:
         测试集里"上涨日占比"。**任何模型的 DA/UP_P 只有明显高于这一行，才算真的有涨跌判别力。**
         （价格类指标对本行无意义，请只看 DA / UP_P。）
         """
-        up_price = pdata.prev_close_test.astype(float) * 1.001    # 恒定"涨一点"，方向恒为涨
-        metrics = Metrics.calc_all(pdata.close_test, up_price, self.config.metrics)
-        self._apply_dir(metrics, pdata.close_test, up_price, pdata.prev_close_test)
-        return ModelResult(algo_name="总是涨(方向基准)", metrics=metrics,
+        def _up_m(prev, close):
+            if prev is None or len(prev) == 0:
+                return {}
+            p = prev.astype(float) * 1.001
+            m = Metrics.calc_all(close, p, self.config.metrics)
+            self._apply_dir(m, close, p, prev)
+            return m
+        up_price = pdata.prev_close_test.astype(float) * 1.001
+        return ModelResult(algo_name="总是涨(方向基准)", metrics=_up_m(pdata.prev_close_test, pdata.close_test),
                            y_test_true=pdata.close_test, y_test_pred=up_price,
-                           test_dates=pdata.d_test, prev_close=pdata.prev_close_test)
+                           test_dates=pdata.d_test, prev_close=pdata.prev_close_test,
+                           metrics_train=_up_m(pdata.prev_close_train, pdata.close_train),
+                           metrics_val=_up_m(pdata.prev_close_val, pdata.close_val))
 
     # ---------- 8.5 批量运行多个算法 ----------
     def run_batch(self, algo_names: List[str], raw_df: pd.DataFrame,
                   progress_cb: Optional[Callable[[str], None]] = None) -> List[ModelResult]:
         log = progress_cb or (lambda msg: None)
         pdata = self.prepare_data(raw_df)
+        def _span(dseries):
+            if dseries is None or len(dseries) == 0:
+                return "空"
+            return (f"{pd.to_datetime(dseries.iloc[0]).strftime('%Y-%m-%d')}~"
+                    f"{pd.to_datetime(dseries.iloc[-1]).strftime('%Y-%m-%d')}")
+        log(f"[数据集三分] 训练 {len(pdata.y_train)}条({_span(pdata.d_train)}) | "
+            f"验证 {len(pdata.y_val)}条({_span(pdata.d_val)}) | 测试 {len(pdata.y_test)}条({_span(pdata.d_test)})")
+        log(f"[无泄露] 标准化器只在训练集上 fit；验证集为独立留出(不参与训练/测试/寻优)；测试集最终留出。")
         results = []
         # 两个诚实性基准放最前面，一眼对照：模型须在"价格误差"上赢过 Naive、在"方向"上赢过"总是涨"。
         # 对任意预测周期都成立：用每个样本的"基准日收盘价"判断这段周期到底涨没涨。
@@ -2333,6 +2407,7 @@ if HAS_PYSIDE6:
             self.metric_checkboxes: Dict[str, QCheckBox] = {}
 
             self._build_ui()
+            self._oplog("软件启动。已就绪。")
 
         # ---- 9.2.1 整体布局搭建 ----
         def _build_ui(self):
@@ -2373,6 +2448,10 @@ if HAS_PYSIDE6:
 
             self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
             self.tabs.addTab(self.log_box, "运行日志")
+
+            # 操作日志：记录用户的每一步操作（点了什么、选了什么、拉了什么数据），带时间戳
+            self.oplog_box = QTextEdit(); self.oplog_box.setReadOnly(True)
+            self.tabs.addTab(self.oplog_box, "操作日志")
 
             # 最后一个标签页：机器学习内部（真实趋势 + 输入来源 + 训练/测试数据集，透明可查）
             self.tabs.addTab(self._build_mldata_tab(), "机器学习内部")
@@ -2424,6 +2503,7 @@ if HAS_PYSIDE6:
                     return
                 self._draw_kline(df, title)
                 self.kline_hint.setText(f"共 {len(df)} 个交易日。红涨绿跌，含 MA5/10/20 与成交量。")
+                self._oplog(f"获取K线：{code if not use_synthetic else '合成数据'}，{len(df)} 个交易日。")
             except Exception as e:
                 QMessageBox.critical(self, "K 线获取失败", str(e))
                 self.kline_hint.setText("获取失败，详见弹窗。若是代理/网络问题，可先用合成数据。")
@@ -2539,42 +2619,47 @@ if HAS_PYSIDE6:
                 if len(X) < 10:
                     QMessageBox.warning(self, "提示", "样本太少，无法透视，请拉长日期区间。")
                     return
-                split_idx = int(len(X) * train_ratio)
-
-                self._draw_mldata_trend(code, sample_dates, fe.close_target_, split_idx, target_mode)
-                self._fill_mldata_source(fe, target_mode, len(X), split_idx, enrich_status, news)
-                self._fill_mldata_table(fe, y, sample_dates, split_idx, target_mode)
+                a = int(len(X) * train_ratio)              # 训练/验证/测试三分切点，与真实训练一致
+                b = a + (len(X) - a) // 2
+                self._draw_mldata_trend(code, sample_dates, fe.close_target_, a, b, target_mode)
+                self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, news)
+                self._fill_mldata_table(fe, y, sample_dates, a, b, target_mode)
                 self.mldata_hint.setText(
-                    f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本，训练 {split_idx} / 测试 {len(X)-split_idx}，"
-                    f"分界日期 {pd.to_datetime(sample_dates.iloc[split_idx]).strftime('%Y-%m-%d')}。")
+                    f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本 = 训练 {a} / 验证 {b-a} / 测试 {len(X)-b}。"
+                    f"验证集为独立留出，不参与训练/测试/寻优。")
+                self._oplog(f"数据透视：{code}，周期{horizon}日，特征{len(fe.feature_cols)}个，"
+                            f"训练{a}/验证{b-a}/测试{len(X)-b}。")
             except Exception as e:
                 QMessageBox.critical(self, "数据透视失败", str(e))
                 self.mldata_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
 
-        def _draw_mldata_trend(self, code, sample_dates, close_target, split_idx, target_mode):
+        def _draw_mldata_trend(self, code, sample_dates, close_target, a, b, target_mode):
             self.mldata_figure.clear()
             ax = self.mldata_figure.add_subplot(111)
             x = np.arange(len(close_target))
             ax.plot(x, close_target, color="#333", linewidth=1.0, label="真实收盘价")
-            # 训练区(蓝)/测试区(橙)背景，直观证明"训练在前、测试在后，不泄露"
-            ax.axvspan(0, split_idx, color="#4a90d9", alpha=0.10)
-            ax.axvspan(split_idx, len(x), color="#e08a2c", alpha=0.12)
-            ax.axvline(split_idx, color="#c0392b", linestyle="--", linewidth=1.2)
-            ax.text(split_idx / 2, ax.get_ylim()[1], "训练集", ha="center", va="top",
-                    color="#2c6fbb", fontsize=10)
-            ax.text((split_idx + len(x)) / 2, ax.get_ylim()[1], "测试集", ha="center", va="top",
-                    color="#d35400", fontsize=10)
-            idx = np.linspace(0, len(x) - 1, min(8, len(x))).astype(int)
+            n = len(x)
+            # 训练(蓝)/验证(绿)/测试(橙)三区背景，直观证明"按时间顺序切分、不泄露"
+            ax.axvspan(0, a, color="#4a90d9", alpha=0.10)
+            ax.axvspan(a, b, color="#2ecc71", alpha=0.12)
+            ax.axvspan(b, n, color="#e08a2c", alpha=0.12)
+            for xline in (a, b):
+                ax.axvline(xline, color="#c0392b", linestyle="--", linewidth=1.0)
+            top = ax.get_ylim()[1]
+            ax.text(a / 2, top, "训练集", ha="center", va="top", color="#2c6fbb", fontsize=9)
+            ax.text((a + b) / 2, top, "验证集", ha="center", va="top", color="#1e8449", fontsize=9)
+            ax.text((b + n) / 2, top, "测试集", ha="center", va="top", color="#d35400", fontsize=9)
+            idx = np.linspace(0, n - 1, min(8, n)).astype(int)
             ax.set_xticks(x[idx])
             ax.set_xticklabels([pd.to_datetime(sample_dates.iloc[i]).strftime("%y-%m-%d") for i in idx],
                                rotation=30, fontsize=8)
             ax.set_ylabel("收盘价")
-            ax.set_title(f"{code} 真实趋势与训练/测试划分（预测目标：{'涨跌幅' if target_mode=='return' else '价格'}）")
+            ax.set_title(f"{code} 真实趋势与训练/验证/测试三分（预测目标：{'涨跌幅' if target_mode=='return' else '价格'}）")
             ax.grid(True, alpha=0.25)
             self.mldata_figure.tight_layout()
             self.mldata_canvas.draw()
 
-        def _fill_mldata_source(self, fe, target_mode, n_samples, split_idx,
+        def _fill_mldata_source(self, fe, target_mode, n_samples, a, b,
                                 enrich_status=None, news=None):
             cols = list(getattr(fe, "feature_cols", []))
             n_feat = len(cols)
@@ -2635,22 +2720,26 @@ if HAS_PYSIDE6:
             因此用可回测的"每日主力/大单净额"作为其历史等价物。</p>
             <p style="color:#2c6fbb"><b>为什么不会泄露未来数据：</b>
             ① 所有特征(含估值/大盘)都按日期"向后对齐"，只用当天及以前的已知值；
-            ② 严格按时间顺序切分——训练集在前 {split_idx} 条、测试集在后 {n_samples-split_idx} 条，绝不打乱；
-            ③ 标准化器只在训练集上 fit，再套用到测试集。</p>
+            ② 严格按时间顺序三分——训练 {a} 条 / 验证 {b-a} 条 / 测试 {n_samples-b} 条，绝不打乱；
+            ③ 验证集为<b>独立留出</b>(不参与训练/测试/寻优)；标准化器只在训练集上 fit，再套用到验证/测试集。</p>
             """
             self.mldata_srcbox.setHtml(html)
 
-        def _fill_mldata_table(self, fe, y, sample_dates, split_idx, target_mode):
+        def _fill_mldata_table(self, fe, y, sample_dates, a, b, target_mode):
             n = len(y)
             tgt_label = "目标(涨跌幅%)" if target_mode == "return" else "目标(收盘价)"
             headers = ["序号", "目标日期", "基准日收盘", tgt_label, "所属集合"]
             self.mldata_table.setColumnCount(len(headers))
             self.mldata_table.setHorizontalHeaderLabels(headers)
-            # 样本可能上千条：为流畅只展示前 60 + 后 60，并在中间放一行省略提示
-            if n <= 130:
+            # 样本可能上千条：为流畅只展示各集合的头尾片段(含验证集)，中间用省略行占位
+            if n <= 150:
                 show_idx = list(range(n))
             else:
-                show_idx = list(range(60)) + [-1] + list(range(n - 60, n))
+                def _seg(lo, hi, k=12):        # 取某区间的前 k 与后 k
+                    lo, hi = max(0, lo), min(n, hi)
+                    r = list(range(lo, hi))
+                    return r if len(r) <= 2 * k else r[:k] + [-1] + r[-k:]
+                show_idx = _seg(0, a) + [-1] + _seg(a, b) + [-1] + _seg(b, n)
             self.mldata_table.setRowCount(len(show_idx))
             for row, i in enumerate(show_idx):
                 if i == -1:
@@ -2661,7 +2750,7 @@ if HAS_PYSIDE6:
                 d = pd.to_datetime(sample_dates.iloc[i]).strftime("%Y-%m-%d")
                 pc = fe.prev_close_[i]
                 tv = (y[i] * 100) if target_mode == "return" else y[i]
-                grp = "训练集" if i < split_idx else "测试集"
+                grp = "训练集" if i < a else ("验证集" if i < b else "测试集")
                 vals = [str(i), d, f"{pc:.2f}", f"{tv:.3f}", grp]
                 for c, v in enumerate(vals):
                     self.mldata_table.setItem(row, c, QTableWidgetItem(v))
@@ -2717,6 +2806,8 @@ if HAS_PYSIDE6:
             if "error" in bt:
                 QMessageBox.warning(self, "提示", bt["error"]); return
             self._draw_backtest(r.algo_name, bt)
+            self._oplog(f"回测：{r.algo_name}，成本{cost}%，策略{bt['total_return_pct']}% vs "
+                        f"买入持有{bt['buyhold_return_pct']}%，超额{bt['excess_vs_buyhold_pct']}%。")
 
         def _draw_backtest(self, algo, bt):
             verdict = "✅ 跑赢买入持有" if bt["excess_vs_buyhold_pct"] > 0 else "❌ 没跑赢买入持有"
@@ -2821,6 +2912,8 @@ if HAS_PYSIDE6:
             select_all_btn.clicked.connect(self._toggle_all_algos)
             outer.addWidget(select_all_btn)
 
+            # 默认自动勾选几个"快且稳"的算法，开箱即用（含一个线性、一个树、一个梯度提升作对照）
+            default_on = {"Lasso", "RF", "GBRT"}
             categories = ["基础与传统模型", "先进与前沿模型", "公式拟合/演化计算", "经典时序模型"]
             for cat in categories:
                 cat_box = QGroupBox(cat)
@@ -2831,6 +2924,8 @@ if HAS_PYSIDE6:
                     if not ALGO_AVAILABILITY.get(name, True):
                         cb.setEnabled(False)
                         cb.setToolTip("缺少对应依赖库，暂不可用（详见文件顶部依赖说明）")
+                    elif name in default_on:
+                        cb.setChecked(True)               # 默认勾选，无需用户从零开始
                     self.algo_checkboxes[name] = cb
                     grid.addWidget(cb, i // 4, i % 4)
                 outer.addWidget(cat_box)
@@ -2880,7 +2975,7 @@ if HAS_PYSIDE6:
 
         # ---- 9.2.6 训练测试比例选择区（对应截图 B-1.4）----
         def _build_split_group(self) -> QGroupBox:
-            box = QGroupBox("训练集与测试集比例选择 (默认 7:3)")
+            box = QGroupBox("训练集比例 (剩余部分平分为 验证集/测试集，默认 7 : 1.5 : 1.5)")
             layout = QHBoxLayout(box)
             self.split_group = QButtonGroup(box)
             self.split_radios = {}
@@ -2951,6 +3046,12 @@ if HAS_PYSIDE6:
             )
 
             # ---- 9.3.3 后台线程跑训练，避免界面卡死 ----
+            src = "合成数据" if use_synthetic else f"真实数据 {self.code_edit.text().strip()}"
+            ext = [n for n, cb in [("财报估值", self.chk_val), ("大盘", self.chk_idx),
+                                   ("主力资金", self.chk_mf)] if cb.isChecked()]
+            self._oplog(f"点击【运行】：数据={src}；预测目标={target_mode}；预测周期={horizon}日；"
+                        f"训练比例={train_ratio}；HPO={hpo_method}；外部数据={'+'.join(ext) or '无'}；"
+                        f"算法({len(selected_algos)})={', '.join(selected_algos)}")
             self.progress_bar.show()
             self._log(f"开始训练，共 {len(selected_algos)} 个模型：{', '.join(selected_algos)}")
             self.worker = TrainingWorker(config, self.raw_df, selected_algos)
@@ -2969,7 +3070,9 @@ if HAS_PYSIDE6:
             # 用成功训练的模型填充"策略回测"页的模型下拉（基准行也可回测，作为对照）
             self.bt_model_combo.clear()
             self.bt_model_combo.addItems([r.algo_name for r in results if not r.error])
-            self.tabs.setCurrentIndex(0)
+            ok = sum(1 for r in results if not r.error)
+            self._oplog(f"训练完成：{ok} 个模型成功；结果见「指标结果表格」(每格=训练/验证/测试)。")
+            self.tabs.setCurrentIndex(2)          # 直接跳到「指标结果表格」看误差对比
 
         def _on_training_error(self, msg: str):
             self.progress_bar.hide()
@@ -2980,9 +3083,17 @@ if HAS_PYSIDE6:
             valid_results = [r for r in self.results if not r.error]
             metric_names = list(valid_results[0].metrics.keys()) if valid_results else []
 
+            # 每个指标一列，单元格里显示"训练/验证/测试"三个值，直观看出是否过拟合
             self.result_table.setColumnCount(1 + len(metric_names))
-            self.result_table.setHorizontalHeaderLabels(["算法"] + metric_names)
+            self.result_table.setHorizontalHeaderLabels(
+                ["算法"] + [f"{m}(训/验/测)" for m in metric_names])
             self.result_table.setRowCount(len(self.results))
+
+            def _fmt(d, k):
+                if not d or k not in d:
+                    return "-"
+                v = d[k]
+                return f"{v:.3f}" if isinstance(v, float) else str(v)
 
             for row, r in enumerate(self.results):
                 self.result_table.setItem(row, 0, QTableWidgetItem(r.algo_name))
@@ -2990,7 +3101,8 @@ if HAS_PYSIDE6:
                     self.result_table.setItem(row, 1, QTableWidgetItem(f"失败: {r.error}"))
                     continue
                 for col, m in enumerate(metric_names, start=1):
-                    self.result_table.setItem(row, col, QTableWidgetItem(str(r.metrics.get(m, ""))))
+                    cell = f"{_fmt(r.metrics_train, m)} / {_fmt(r.metrics_val, m)} / {_fmt(r.metrics, m)}"
+                    self.result_table.setItem(row, col, QTableWidgetItem(cell))
             self.result_table.resizeColumnsToContents()
 
         # ---- 9.6 预测对比图：把所有成功的模型画在同一张图上，横轴是日期，纵轴是收盘价 ----
@@ -3020,6 +3132,11 @@ if HAS_PYSIDE6:
         # ---- 9.7 日志输出 ----
         def _log(self, msg: str):
             self.log_box.append(msg)
+
+        def _oplog(self, msg: str):
+            """记录用户操作到"操作日志"页，带时间戳。"""
+            ts = dt.datetime.now().strftime("%H:%M:%S")
+            self.oplog_box.append(f"[{ts}] {msg}")
 
 
 # ==================== 第十部分：可编程 API（供脚本 / 其它 AI 调用） ====================
@@ -3124,8 +3241,10 @@ def run_experiment(code: str = "600519",
         },
         "n_samples": {"test": n_test},
         "results": [
-            {"algo": r.algo_name, "metrics": r.metrics, "formula": r.formula,
-             "cv_metrics": r.cv_metrics, "error": r.error, "backtest": _bt(r)}
+            {"algo": r.algo_name, "metrics": r.metrics,
+             "metrics_train": r.metrics_train, "metrics_val": r.metrics_val,
+             "formula": r.formula, "cv_metrics": r.cv_metrics,
+             "error": r.error, "backtest": _bt(r)}
             for r in results
         ],
         "forecast": forecasts,
