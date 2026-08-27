@@ -465,9 +465,11 @@ class StockDataFetcher:
         """
         market = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8")) else "sz")
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        # 东财资金流接口最容易 RemoteDisconnected：用更耐心的重试(5次、更长退避)
         with ctx:
             f = StockDataFetcher._retry(
-                lambda: ak.stock_individual_fund_flow(stock=code, market=market))
+                lambda: ak.stock_individual_fund_flow(stock=code, market=market),
+                tries=5, delay=1.5)
         ren = {"日期": "date",
                "主力净流入-净额": "mf_main_net", "主力净流入-净占比": "mf_main_pct",
                "超大单净流入-净额": "mf_xl_net", "大单净流入-净额": "mf_l_net",
