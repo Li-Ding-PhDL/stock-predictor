@@ -50,6 +50,8 @@
 # ------------------------------------------------------------------------------
 import os                      # 文件路径处理
 import sys                     # 系统相关（GUI 程序入口需要）
+import io                      # 综合报告：把图表存成内存字节流再转 base64
+import base64                  # 综合报告：图表转 base64 内嵌进 HTML（导出自包含网页）
 import json                    # 配置/缓存的序列化
 import argparse                # 命令行/无界面模式参数解析（方便脚本或其它 AI 程序化调用）
 import time                    # 计时、生成随机种子
@@ -175,7 +177,8 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QGroupBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton, QLabel,
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
-        QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser
+        QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
+        QFileDialog
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate
     from PySide6.QtGui import QFont
@@ -2655,8 +2658,11 @@ if HAS_PYSIDE6:
             self.oplog_box = QTextEdit(); self.oplog_box.setReadOnly(True)
             self.tabs.addTab(self.oplog_box, "操作日志")
 
-            # 最后一个标签页：机器学习内部（真实趋势 + 输入来源 + 训练/测试数据集，透明可查）
+            # 机器学习内部（真实趋势 + 输入来源 + 训练/测试数据集，透明可查）
             self.tabs.addTab(self._build_mldata_tab(), "机器学习内部")
+
+            # 综合报告：把前面所有图表+数据汇总，可预览、可导出自包含 HTML 报告
+            self.tabs.addTab(self._build_report_tab(), "综合报告")
 
             main_layout.addWidget(self.tabs, stretch=1)
 
@@ -2963,6 +2969,7 @@ if HAS_PYSIDE6:
             ② 严格按时间顺序三分——训练 {a} 条 / 验证 {b-a} 条 / 测试 {n_samples-b} 条，绝不打乱；
             ③ 验证集为<b>独立留出</b>(不参与训练/测试/寻优)；标准化器只在训练集上 fit，再套用到验证/测试集。</p>
             """
+            self._html_source = html                 # 供"综合报告"复用
             self.mldata_srcbox.setHtml(html)
 
         def _fill_mldata_analysis(self, df, code, enrich_status=None, news=None, name="", warns=None):
@@ -3069,7 +3076,9 @@ if HAS_PYSIDE6:
                     "近期涨跌、以及是否命中风险新闻。模型据此学习，但<b>股价由多因素共同驱动</b>，"
                     "本软件<b>不会</b>替你断言「这次涨跌是机构/主力/散户/某条新闻造成的」——那种单一因果归因"
                     "免费数据无法可靠判定，谁那么说谁在误导你。请把以上当作客观事实参考，自行判断。</p>")
-            self.mldata_analysis.setHtml(risk_html + head + "".join(f"<p>{s}</p>" for s in secs) + foot)
+            self._html_risk = risk_html              # 供"综合报告"复用
+            self._html_analysis = head + "".join(f"<p>{s}</p>" for s in secs) + foot
+            self.mldata_analysis.setHtml(risk_html + self._html_analysis)
 
         def _fill_mldata_table(self, fe, y, sample_dates, a, b, target_mode):
             n = len(y)
@@ -3101,6 +3110,132 @@ if HAS_PYSIDE6:
                 for c, v in enumerate(vals):
                     self.mldata_table.setItem(row, c, QTableWidgetItem(v))
             self.mldata_table.resizeColumnsToContents()
+
+        # ---- 9.2.1h 综合报告标签页（汇总所有图表+数据，可预览、可导出HTML） ----
+        def _build_report_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            self.report_btn = QPushButton("🧾 生成/刷新 报告预览")
+            self.report_btn.setStyleSheet("font-weight:bold; padding:6px;")
+            self.report_btn.clicked.connect(self._on_gen_report)
+            top.addWidget(self.report_btn)
+            self.report_export_btn = QPushButton("💾 导出 HTML 报告")
+            self.report_export_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2c6fbb; color:white;")
+            self.report_export_btn.clicked.connect(self._on_export_report)
+            top.addWidget(self.report_export_btn)
+            self.report_hint = QLabel("先在各页生成内容(K线/预测/回测/未来/数据透视)，再点这里汇总；报告可上下滚动、可导出。")
+            self.report_hint.setStyleSheet("color:#666;")
+            top.addWidget(self.report_hint, stretch=1)
+            layout.addLayout(top)
+            self.report_view = QTextBrowser()        # 可滚动预览，图表以内嵌图片原样呈现
+            self.report_view.setOpenExternalLinks(True)
+            layout.addWidget(self.report_view, stretch=1)
+            return panel
+
+        @staticmethod
+        def _fig_to_img(fig, title):
+            """把一个 matplotlib 图转成 <h2>标题</h2><img base64>；图为空则返回空串。"""
+            if fig is None or not fig.get_axes():
+                return ""
+            buf = io.BytesIO()
+            try:
+                fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+            except Exception:
+                return ""
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return (f"<h2>{title}</h2>"
+                    f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto;"
+                    "border:1px solid #ddd'/>")
+
+        def _results_table_html(self):
+            """把训练结果(每格 训练/验证/测试)拼成 HTML 表格。"""
+            valid = [r for r in self.results if not r.error]
+            if not valid:
+                return ""
+            metric_names = list(valid[0].metrics.keys())
+
+            def _f(d, k):
+                if not d or k not in d:
+                    return "-"
+                v = d[k]
+                return f"{v:.3f}" if isinstance(v, float) else str(v)
+            head = "<tr bgcolor=#eef><th>算法</th>" + "".join(f"<th>{m}(训/验/测)</th>" for m in metric_names) + "</tr>"
+            rows = []
+            for r in self.results:
+                if r.error:
+                    rows.append(f"<tr><td>{r.algo_name}</td><td colspan={len(metric_names)}>失败: {r.error}</td></tr>")
+                    continue
+                cells = "".join(f"<td>{_f(r.metrics_train,m)} / {_f(r.metrics_val,m)} / {_f(r.metrics,m)}</td>"
+                                for m in metric_names)
+                rows.append(f"<tr><td><b>{r.algo_name}</b></td>{cells}</tr>")
+            return ("<h2>指标结果（训练 / 验证 / 测试）</h2>"
+                    "<p style='color:#888'>训练误差远小于验证/测试即为过拟合；DA/UP_P 需明显高于「总是涨」基准。</p>"
+                    f"<table border=1 cellpadding=4 cellspacing=0 width=100%>{head}{''.join(rows)}</table>")
+
+        def _build_report_html(self):
+            """把前面所有图表(原样内嵌为图片)+数据(表格/风险/分析/溯源)汇总成一份 HTML。"""
+            code = self.code_edit.text().strip() if hasattr(self, "code_edit") else ""
+            when = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            parts = [
+                "<h1 style='color:#2c6fbb'>A 股综合分析报告</h1>",
+                f"<p>股票代码：<b>{code or '合成数据'}</b>　生成时间：{when}　"
+                "<span style='color:#c0392b'>本报告仅供研究，不构成任何投资建议。</span></p>",
+            ]
+            # 风险提示优先级最高 —— 放最前
+            if getattr(self, "_html_risk", ""):
+                parts.append("<h2>⚠️ 风险提示</h2>" + self._html_risk)
+            # 图表（原样内嵌，优先级高）
+            for title, fig in [
+                ("行情 K 线图", getattr(self, "kline_figure", None)),
+                ("真实趋势与训练/验证/测试划分", getattr(self, "mldata_figure", None)),
+                ("预测结果对比图", getattr(self, "figure", None)),
+                ("未来走势预测图", getattr(self, "fc_figure", None)),
+                ("策略回测（净值曲线）", getattr(self, "bt_figure", None)),
+            ]:
+                parts.append(self._fig_to_img(fig, title))
+            # 指标结果表格
+            parts.append(self._results_table_html())
+            # 数据分析速览（含各来源真实最新值 + 新闻）
+            if getattr(self, "_html_analysis", ""):
+                parts.append("<h2>各来源数据分析速览</h2>" + self._html_analysis)
+            # 输入来源 + 数据溯源链接
+            if getattr(self, "_html_source", ""):
+                parts.append(self._html_source)
+            body = "".join(p for p in parts if p)
+            # 表格/图片样式（优先级最高：撑满宽度、可横向不溢出）
+            style = ("<style>body{font-family:'Microsoft YaHei',Arial,sans-serif;max-width:1000px;"
+                     "margin:12px auto;line-height:1.6;color:#222} h1,h2{border-bottom:1px solid #eee;padding-bottom:4px}"
+                     "table{border-collapse:collapse;width:100%} img{max-width:100%;height:auto}"
+                     "a{color:#2c6fbb;word-break:break-all}</style>")
+            return f"<html><head><meta charset='utf-8'>{style}</head><body>{body}</body></html>"
+
+        def _on_gen_report(self):
+            if not self.results and not getattr(self, "_html_analysis", ""):
+                QMessageBox.information(self, "提示",
+                                        "报告为空。请先在各页生成内容：\n"
+                                        "① 行情K线图→获取K线  ② 运行模型  ③ 未来预测/策略回测  ④ 机器学习内部→数据透视\n"
+                                        "然后回来点「生成/刷新 报告预览」。")
+                return
+            self.report_view.setHtml(self._build_report_html())
+            self.report_hint.setText("报告已生成，可上下滚动查看；点「导出 HTML 报告」保存为网页。")
+            self._oplog("生成综合报告预览。")
+
+        def _on_export_report(self):
+            html = self._build_report_html()
+            code = self.code_edit.text().strip() or "report"
+            default = os.path.join(BASE_DIR, f"报告_{code}_{dt.datetime.now():%Y%m%d_%H%M}.html")
+            path, _ = QFileDialog.getSaveFileName(self, "导出 HTML 报告", default, "HTML 文件 (*.html)")
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(html)
+                self._oplog(f"导出HTML报告：{path}")
+                QMessageBox.information(self, "导出成功",
+                                       f"报告已导出：\n{path}\n\n图表已内嵌为图片，双击即可用浏览器打开(离线可看)。")
+            except Exception as e:
+                QMessageBox.critical(self, "导出失败", str(e))
 
         # ---- 9.2.1f 策略回测标签页 ----
         def _build_backtest_tab(self) -> QWidget:
