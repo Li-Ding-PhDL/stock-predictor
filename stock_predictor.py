@@ -1981,6 +1981,7 @@ class ModelResult:
     cv_metrics: Optional[Dict[str, float]] = None
     formula: Optional[str] = None          # 仅 SR/GEP/MEP 有意义
     error: Optional[str] = None            # 若训练失败，记录错误信息，不让一个算法出错影响其它算法
+    prev_close: Optional[np.ndarray] = None  # 每个测试样本的"基准日收盘价"，供方向性收益回测使用
 
 
 @dataclass
@@ -2103,7 +2104,8 @@ class TrainingPipeline:
 
             return ModelResult(algo_name=algo_name, metrics=metrics, y_test_true=close_test,
                                 y_test_pred=pred_price, test_dates=pdata.d_test,
-                                cv_metrics=cv_metrics, formula=formula)
+                                cv_metrics=cv_metrics, formula=formula,
+                                prev_close=pdata.prev_close_test)
         except Exception as e:
             log(f"[{algo_name}] 训练失败：{e}")
             return ModelResult(algo_name=algo_name, metrics={}, y_test_true=close_test,
@@ -2151,7 +2153,8 @@ class TrainingPipeline:
         metrics = Metrics.calc_all(pdata.close_test, naive_price, self.config.metrics)
         self._apply_dir(metrics, pdata.close_test, naive_price, pdata.prev_close_test)
         return ModelResult(algo_name="Naive(前值)", metrics=metrics, y_test_true=pdata.close_test,
-                           y_test_pred=naive_price, test_dates=pdata.d_test)
+                           y_test_pred=naive_price, test_dates=pdata.d_test,
+                           prev_close=pdata.prev_close_test)
 
     def _alwaysup_baseline(self, pdata: PreparedData) -> ModelResult:
         """
@@ -2164,7 +2167,7 @@ class TrainingPipeline:
         self._apply_dir(metrics, pdata.close_test, up_price, pdata.prev_close_test)
         return ModelResult(algo_name="总是涨(方向基准)", metrics=metrics,
                            y_test_true=pdata.close_test, y_test_pred=up_price,
-                           test_dates=pdata.d_test)
+                           test_dates=pdata.d_test, prev_close=pdata.prev_close_test)
 
     # ---------- 8.5 批量运行多个算法 ----------
     def run_batch(self, algo_names: List[str], raw_df: pd.DataFrame,
@@ -2232,6 +2235,59 @@ class TrainingPipeline:
             "pred_close": round(pred_close, 4),
             "pred_change_pct": round((pred_close - last_close) / (last_close + 1e-12) * 100, 3),
         }
+
+
+# ==================== 第八部分补充：方向性收益回测（带手续费的诚实检验） ====================
+def backtest_directional(prev_close, close_target, pred_price, dates,
+                         horizon: int = 1, cost_bps: float = 0.2,
+                         ann_days: int = 252) -> Dict[str, Any]:
+    """
+    "跟着预测做多/空仓"策略回测：每一段(周期=horizon)开始时，若模型预测**上涨**(pred>基准价)就满仓
+    持有到该段结束，否则空仓(收益 0)。每次真正持有(买入→卖出)扣一次**往返交易成本** cost_bps(%)
+    (含佣金+印花税+滑点)。用非重叠切段(步长=horizon)避免交易重叠。
+
+    这是检验"预测涨跌到底能不能赚钱"的终极诚实标准：策略净值必须明显跑赢"买入持有"，才算真有用。
+
+    返回统计 + 净值曲线(策略 vs 买入持有)，可直接用于画图与 JSON。
+    """
+    prev_close = np.asarray(prev_close, float); close_target = np.asarray(close_target, float)
+    pred_price = np.asarray(pred_price, float)
+    n = len(prev_close)
+    if n == 0:
+        return {"error": "无测试样本"}
+    idx = np.arange(0, n, max(1, horizon))           # 非重叠取段
+    pc, ct, pp = prev_close[idx], close_target[idx], pred_price[idx]
+    seg_ret = ct / (pc + 1e-12) - 1.0                # 每段真实收益率
+    pos = (pp > pc).astype(float)                    # 仓位：预测涨=1(满仓)，否则=0(空仓)
+    gross = np.where(pos > 0, seg_ret, 0.0)          # 毛收益(未扣成本)
+    # 只在"仓位变化"时扣成本(买入/卖出各扣一次单边)，连续持有不重复扣，更贴近实盘
+    oneway = (cost_bps / 100.0) / 2.0
+    prev_pos = np.concatenate([[0.0], pos[:-1]])
+    cost_arr = np.abs(pos - prev_pos) * oneway       # 每段开始时的买/卖成本
+    cost_arr[-1] += pos[-1] * oneway                 # 末段若仍持有，结束时清仓再扣一次单边
+    strat_ret = gross - cost_arr
+
+    eq_strat = np.cumprod(1.0 + strat_ret)
+    eq_bh = np.cumprod(1.0 + seg_ret)                # 买入持有(全程持有)
+    years = max(n / ann_days, 1e-9)                  # 测试期约 n 个交易日
+    def _ann(total): return (1.0 + total) ** (1.0 / years) - 1.0
+    total = float(eq_strat[-1] - 1.0); total_bh = float(eq_bh[-1] - 1.0)
+    peak = np.maximum.accumulate(eq_strat); mdd = float((eq_strat / peak - 1.0).min())
+    n_trades = int(((pos - prev_pos) > 0).sum())     # 买入次数=交易次数
+    held = pos > 0
+    win_rate = float(np.mean(strat_ret[held] > 0) * 100) if held.sum() > 0 else 0.0
+    sharpe = float(np.mean(strat_ret) / (np.std(strat_ret) + 1e-12) *
+                   np.sqrt(ann_days / max(1, horizon))) if len(strat_ret) > 1 else 0.0
+    return {
+        "n_segments": int(len(idx)), "n_trades": n_trades,
+        "total_return_pct": round(total * 100, 2), "annual_return_pct": round(_ann(total) * 100, 2),
+        "buyhold_return_pct": round(total_bh * 100, 2), "buyhold_annual_pct": round(_ann(total_bh) * 100, 2),
+        "excess_vs_buyhold_pct": round((total - total_bh) * 100, 2),
+        "max_drawdown_pct": round(mdd * 100, 2), "win_rate_pct": round(win_rate, 2),
+        "sharpe": round(sharpe, 3), "cost_bps": cost_bps,
+        "eq_strat": eq_strat, "eq_bh": eq_bh,
+        "seg_dates": pd.Series(dates).reset_index(drop=True).iloc[idx].reset_index(drop=True),
+    }
 
 
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
@@ -2311,6 +2367,9 @@ if HAS_PYSIDE6:
 
             self.result_table = QTableWidget()
             self.tabs.addTab(self.result_table, "指标结果表格")
+
+            # 策略回测：按预测方向做多/空仓，扣手续费，和买入持有对比
+            self.tabs.addTab(self._build_backtest_tab(), "策略回测")
 
             self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
             self.tabs.addTab(self.log_box, "运行日志")
@@ -2608,6 +2667,77 @@ if HAS_PYSIDE6:
                     self.mldata_table.setItem(row, c, QTableWidgetItem(v))
             self.mldata_table.resizeColumnsToContents()
 
+        # ---- 9.2.1f 策略回测标签页 ----
+        def _build_backtest_tab(self) -> QWidget:
+            """
+            方向性收益回测：跑完模型后，选一个模型，按"预测涨就满仓、否则空仓"扣手续费模拟，
+            与"买入持有"对比净值曲线。这是"预测涨跌到底能不能赚钱"的终极诚实检验。
+            """
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("模型:"))
+            self.bt_model_combo = QComboBox()
+            top.addWidget(self.bt_model_combo)
+            top.addWidget(QLabel("往返成本(%):"))
+            self.bt_cost_edit = QLineEdit("0.2")
+            self.bt_cost_edit.setFixedWidth(60)
+            self.bt_cost_edit.setToolTip("一次买入+卖出的总成本：佣金+印花税+滑点。A股大致 0.15%~0.3%。")
+            top.addWidget(self.bt_cost_edit)
+            self.bt_btn = QPushButton("▶ 回测")
+            self.bt_btn.setStyleSheet("font-weight:bold; padding:6px;")
+            self.bt_btn.clicked.connect(self._on_run_backtest)
+            top.addWidget(self.bt_btn)
+            top.addStretch()
+            layout.addLayout(top)
+
+            self.bt_stat = QLabel("先在左侧运行模型，再来这里选模型回测。")
+            self.bt_stat.setWordWrap(True)
+            self.bt_stat.setStyleSheet("padding:4px;")
+            layout.addWidget(self.bt_stat)
+
+            self.bt_figure = Figure(figsize=(8, 4))
+            self.bt_canvas = FigureCanvas(self.bt_figure)
+            layout.addWidget(self.bt_canvas, stretch=1)
+            return panel
+
+        def _on_run_backtest(self):
+            r = next((x for x in self.results
+                      if x.algo_name == self.bt_model_combo.currentText() and not x.error), None)
+            if r is None or r.prev_close is None:
+                QMessageBox.warning(self, "提示", "请先运行模型，再选择一个成功的模型回测。")
+                return
+            try:
+                cost = float(self.bt_cost_edit.text())
+            except ValueError:
+                cost = 0.2
+            horizon = getattr(self, "_last_horizon", 1)
+            bt = backtest_directional(r.prev_close, r.y_test_true, r.y_test_pred,
+                                      r.test_dates, horizon=horizon, cost_bps=cost)
+            if "error" in bt:
+                QMessageBox.warning(self, "提示", bt["error"]); return
+            self._draw_backtest(r.algo_name, bt)
+
+        def _draw_backtest(self, algo, bt):
+            verdict = "✅ 跑赢买入持有" if bt["excess_vs_buyhold_pct"] > 0 else "❌ 没跑赢买入持有"
+            self.bt_stat.setText(
+                f"【{algo}】周期{getattr(self,'_last_horizon',1)}日 · 往返成本{bt['cost_bps']}% · "
+                f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%　||　"
+                f"策略总收益 {bt['total_return_pct']}%(年化{bt['annual_return_pct']}%) vs "
+                f"买入持有 {bt['buyhold_return_pct']}%(年化{bt['buyhold_annual_pct']}%) · "
+                f"超额 {bt['excess_vs_buyhold_pct']}% · 最大回撤 {bt['max_drawdown_pct']}% · "
+                f"夏普 {bt['sharpe']}　→　{verdict}")
+            self.bt_figure.clear()
+            ax = self.bt_figure.add_subplot(111)
+            d = pd.to_datetime(bt["seg_dates"])
+            ax.plot(d, bt["eq_strat"], label="跟随预测策略", color="#c0392b", linewidth=1.6)
+            ax.plot(d, bt["eq_bh"], label="买入持有", color="#4a90d9", linewidth=1.4, linestyle="--")
+            ax.axhline(1.0, color="#999", linewidth=0.8)
+            ax.set_ylabel("净值(初始=1)"); ax.set_title(f"{algo} 方向性收益回测（扣 {bt['cost_bps']}% 往返成本）")
+            ax.legend(loc="best"); ax.grid(True, alpha=0.25)
+            self.bt_figure.autofmt_xdate()
+            self.bt_canvas.draw()
+
         # ---- 9.2.2 数据配置区 ----
         def _build_data_group(self) -> QGroupBox:
             box = QGroupBox("数据配置")
@@ -2813,6 +2943,7 @@ if HAS_PYSIDE6:
 
             target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
             horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            self._last_horizon = horizon              # 供"策略回测"页使用
             config = TrainConfig(
                 window_size=20, horizon=horizon, train_ratio=train_ratio, target_mode=target_mode,
                 use_cv=self.cv_checkbox.isChecked(), cv_folds=5,
@@ -2835,6 +2966,9 @@ if HAS_PYSIDE6:
             self._log("全部模型训练完成。")
             self._update_result_table()
             self._update_chart()
+            # 用成功训练的模型填充"策略回测"页的模型下拉（基准行也可回测，作为对照）
+            self.bt_model_combo.clear()
+            self.bt_model_combo.addItems([r.algo_name for r in results if not r.error])
             self.tabs.setCurrentIndex(0)
 
         def _on_training_error(self, msg: str):
@@ -2907,6 +3041,8 @@ def run_experiment(code: str = "600519",
                    use_valuation: bool = True,
                    use_index: bool = True,
                    use_fundflow: bool = True,
+                   backtest: bool = False,
+                   cost_bps: float = 0.2,
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     一个"无界面、纯函数式"的完整实验入口，专为脚本化 / 被其它程序或 AI 调用而设计。
@@ -2970,6 +3106,14 @@ def run_experiment(code: str = "600519",
             n_test = len(r.y_test_true)
             break
 
+    # ---- 4) 可选：方向性收益回测（扣手续费，和买入持有对比）----
+    def _bt(r):
+        if not backtest or r.error or r.prev_close is None:
+            return None
+        b = backtest_directional(r.prev_close, r.y_test_true, r.y_test_pred,
+                                 r.test_dates, horizon=horizon, cost_bps=cost_bps)
+        return {k: v for k, v in b.items() if k not in ("eq_strat", "eq_bh", "seg_dates")}
+
     return {
         "data_source": data_source,
         "config": {
@@ -2981,7 +3125,7 @@ def run_experiment(code: str = "600519",
         "n_samples": {"test": n_test},
         "results": [
             {"algo": r.algo_name, "metrics": r.metrics, "formula": r.formula,
-             "cv_metrics": r.cv_metrics, "error": r.error}
+             "cv_metrics": r.cv_metrics, "error": r.error, "backtest": _bt(r)}
             for r in results
         ],
         "forecast": forecasts,
@@ -3014,6 +3158,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-index", action="store_true", help="不接入大盘环境(沪深300)")
     p.add_argument("--no-fundflow", action="store_true", help="不接入主力资金流向(主力/大单净流入+进场/洗盘代理)")
     p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的未来收盘价")
+    p.add_argument("--backtest", action="store_true", help="方向性收益回测(按预测涨跌做多/空仓，扣手续费)")
+    p.add_argument("--cost", type=float, default=0.2, help="回测往返成本(%%)：佣金+印花税+滑点，默认 0.2")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
     return p
 
@@ -3030,6 +3176,7 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         add_naive_baseline=not args.no_naive, forecast=args.forecast,
         use_valuation=not args.no_valuation, use_index=not args.no_index,
         use_fundflow=not args.no_fundflow,
+        backtest=args.backtest, cost_bps=args.cost,
         progress_cb=print,
     )
 
@@ -3059,6 +3206,19 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"  {f['algo']:<12} 最后({f['last_date']})收盘={f['last_close']} "
                       f"-> 预测={f['pred_close']}  ({f['pred_change_pct']:+}%)")
         print("  ⚠ 单日单模型的点预测仅供研究参考，绝不构成任何投资建议。")
+
+    if args.backtest:
+        print(f"\n【方向性收益回测：按预测涨跌做多/空仓，往返成本 {args.cost}%】")
+        print(f"{'算法':<14}{'策略收益%':>10}{'年化%':>9}{'买入持有%':>10}{'超额%':>9}"
+              f"{'最大回撤%':>10}{'胜率%':>8}{'夏普':>8}")
+        for r in out["results"]:
+            b = r.get("backtest")
+            if not b:
+                continue
+            print(f"{r['algo']:<14}{b['total_return_pct']:>10}{b['annual_return_pct']:>9}"
+                  f"{b['buyhold_return_pct']:>10}{b['excess_vs_buyhold_pct']:>9}"
+                  f"{b['max_drawdown_pct']:>10}{b['win_rate_pct']:>8}{b['sharpe']:>8}")
+        print("  → 只有策略明显跑赢\"买入持有\"(超额为正)，才说明预测涨跌真的能赚钱。仍不构成投资建议。")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
