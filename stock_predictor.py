@@ -747,6 +747,14 @@ class FeatureEngineer:
             if "mf_main_pct" in df.columns:
                 df["mf_pct5"] = pd.to_numeric(df["mf_main_pct"], errors="coerce").rolling(5).mean()
 
+        # ---- 4.1.10 外部数据列缺失处理 ----
+        # 外部来源(估值/大盘/资金流)可能在"上市前/数据未覆盖期/亏损股无市盈率"等处为 NaN。
+        # 这些列的 NaN 一律填 0(中性、无未来泄露)——否则后面按行 dropna 时，只要某外部列局部/整列为 NaN，
+        # 就会把大段甚至全部历史行删光(空数据集报错 array=[])。填 0 表示"该处无此信息"，不影响时序纪律。
+        for c in df.columns:
+            if c != "date" and str(c).startswith(("val_", "idx_", "mf_")):
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
         return df
 
     # ---------- 4.2 构造监督学习样本（滑动窗口）----------
@@ -766,6 +774,7 @@ class FeatureEngineer:
         df = self.add_technical_indicators(df)
         # 停牌日成交量可能为 0，使得"环比/量比"等特征出现 inf；dropna 删不掉 inf，需先转成 NaN 再删。
         df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(axis=1, how="all")            # 安全网：先丢弃"完全为空"的特征列，避免整表被行dropna删空
         df = df.dropna().reset_index(drop=True)      # 技术指标开头会有 NaN（如 MA60 需要60天），一并丢弃
 
         if feature_cols is None:
