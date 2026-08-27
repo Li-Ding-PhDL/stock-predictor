@@ -387,10 +387,11 @@ class StockDataFetcher:
         df["date"] = pd.to_datetime(df["date"])
         return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
-    # ---------- 3.1c 外部数据接入：财报估值 / 大盘环境 / 新闻（全部真实来源，缺失自动跳过不臆造）----------
+    # ---------- 3.1c 外部数据接入：财报估值 / 大盘环境 / 主力资金 / 新闻（全部真实来源，缺失自动跳过不臆造）----------
     @staticmethod
     def enrich(df: pd.DataFrame, code: str, want_valuation: bool = True,
-               want_index: bool = True, bypass_proxy: bool = True) -> Tuple[pd.DataFrame, Dict[str, str]]:
+               want_index: bool = True, want_fundflow: bool = True,
+               bypass_proxy: bool = True) -> Tuple[pd.DataFrame, Dict[str, str]]:
         """
         把日线行情 df 用"按日期对齐(merge_asof 向后取最近已知值，无未来泄露)"的方式，
         并入真实的**财报估值**(日频 PE/PB/PS/股息率/总市值) 与**大盘环境**(沪深300 涨跌/均线偏离)。
@@ -423,7 +424,41 @@ class StockDataFetcher:
                 status["index"] = f"跳过(取数失败: {e})"
         elif want_index:
             status["index"] = "跳过(未安装 akshare)"
+        if want_fundflow and HAS_AKSHARE:
+            try:
+                mf = _nsdate(StockDataFetcher._fetch_fundflow(code, bypass_proxy))
+                df = pd.merge_asof(df, mf, on="date", direction="backward")
+                status["fundflow"] = f"已接入(东方财富主力资金, {len(mf)}行)"
+            except Exception as e:
+                status["fundflow"] = f"跳过(取数失败: {e})"
+        elif want_fundflow:
+            status["fundflow"] = "跳过(未安装 akshare)"
         return df.reset_index(drop=True), status
+
+    @staticmethod
+    def _fetch_fundflow(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
+        """
+        真实主力资金流向(日频)：akshare stock_individual_fund_flow，数据源=东方财富。
+        这是"主力/大单是买是卖"的**历史可回测**版本，也是"买卖手力量"的历史等价物
+        （实时盘口委买委卖是快照、无免费历史，不能用于回测）。
+        取：主力净流入净额/净占比、超大单/大单/中单/小单净额。
+        """
+        market = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8")) else "sz")
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            f = ak.stock_individual_fund_flow(stock=code, market=market)
+        ren = {"日期": "date",
+               "主力净流入-净额": "mf_main_net", "主力净流入-净占比": "mf_main_pct",
+               "超大单净流入-净额": "mf_xl_net", "大单净流入-净额": "mf_l_net",
+               "中单净流入-净额": "mf_m_net", "小单净流入-净额": "mf_s_net"}
+        f = f.rename(columns=ren)
+        keep = ["date"] + [c for c in ren.values() if c != "date" and c in f.columns]
+        f = f[keep]
+        f["date"] = pd.to_datetime(f["date"]).astype("datetime64[ns]")
+        for c in keep:
+            if c != "date":
+                f[c] = pd.to_numeric(f[c], errors="coerce")
+        return f.dropna(subset=["date"]).sort_values("date")
 
     @staticmethod
     def _fetch_valuation(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
@@ -594,6 +629,22 @@ class FeatureEngineer:
             hi_w = df["high"].rolling(w).max(); lo_w = df["low"].rolling(w).min()
             df[f"pos_{tag}"] = (df["close"] - lo_w) / (hi_w - lo_w + 1e-9)            # 周期区间位置
             df[f"madev_{tag}"] = df["close"] / (df["close"].rolling(w).mean() + 1e-9) - 1  # 相对周期均线偏离
+
+        # ---- 4.1.10 主力意图代理特征（仅当已接入真实主力资金流向 mf_* 时才计算，全部只回看历史，无泄露）----
+        # 用真实的"每日主力净流入"派生"进场/退场/洗盘"的**可学习代理**，而不是臆造一个"主力预言"。
+        if "mf_main_net" in df.columns:
+            mf = pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0.0)
+            sgn = np.sign(mf)
+            # 连续净流入(+)/净流出(-)天数：刻画"主力持续进场/持续撤退"
+            grp = (sgn != sgn.shift()).cumsum()
+            df["mf_streak"] = sgn * (df.groupby(grp).cumcount() + 1)
+            df["mf_cum5"] = mf.rolling(5).sum()            # 近一周主力累计净流入
+            df["mf_cum20"] = mf.rolling(20).sum()          # 近一月主力累计净流入
+            # 资金-价格背离：主力净流入方向 与 当日涨跌方向 不一致 → 吸筹/洗盘 或 派发 的代理信号
+            price_sgn = np.sign(df["close"].pct_change().fillna(0.0))
+            df["mf_price_div"] = sgn - price_sgn           # +2≈价跌但主力流入(疑吸筹/洗盘); -2≈价涨但主力流出(疑派发)
+            if "mf_main_pct" in df.columns:
+                df["mf_pct5"] = pd.to_numeric(df["mf_main_pct"], errors="coerce").rolling(5).mean()
 
         return df
 
@@ -2411,9 +2462,10 @@ if HAS_PYSIDE6:
                     self.mldata_hint.setText(f"正在拉取 {code} 行情与外部数据 ...")
                     QApplication.processEvents()
                     df = StockDataFetcher().fetch(code, start, end)
-                    if self.chk_val.isChecked() or self.chk_idx.isChecked():
+                    if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                         df, enrich_status = StockDataFetcher.enrich(
-                            df, code, self.chk_val.isChecked(), self.chk_idx.isChecked())
+                            df, code, self.chk_val.isChecked(),
+                            self.chk_idx.isChecked(), self.chk_mf.isChecked())
                     if self.chk_news.isChecked():
                         try:
                             news = StockDataFetcher.fetch_news(code)
@@ -2482,6 +2534,9 @@ if HAS_PYSIDE6:
                  "val_pe_ttm/val_pb/val_ps_ttm/val_dv_ttm/val_total_mv"),
                 (has("idx_"), "大盘环境(沪深300)", f"东方财富 · {enrich_status.get('index','')}",
                  "idx_ret_1d、idx_madev20"),
+                (has("mf_"), "主力资金 & 主力意图代理", f"东方财富资金流 · {enrich_status.get('fundflow','')}",
+                 "主力/超大单/大单净流入 mf_*；连续进/出场 mf_streak、累计 mf_cum5/20、"
+                 "资金-价格背离 mf_price_div(吸筹/洗盘 vs 派发 代理)"),
             ]
             rows = []
             for ok, g, src, ex in groups:
@@ -2514,6 +2569,11 @@ if HAS_PYSIDE6:
               <tr bgcolor=#eef><th>输入类别</th><th>真实来源</th><th>具体特征</th></tr>{rows_html}
             </table>
             {news_html}
+            <p><b>关于"主力意图"与"买卖手"（诚实说明）：</b>
+            "主力进场/退场/洗盘"没有权威标签，本软件不臆造"主力预言"，而是接入<b>真实的每日主力资金净流入</b>
+            并派生代理特征(连续净流入天数、资金-价格背离)喂给模型，由模型自己学。
+            实时盘口"买1-5/卖1-5(买卖手)"是<b>快照、无免费历史序列</b>，用于历史回测会造成泄露或造假，
+            因此用可回测的"每日主力/大单净额"作为其历史等价物。</p>
             <p style="color:#2c6fbb"><b>为什么不会泄露未来数据：</b>
             ① 所有特征(含估值/大盘)都按日期"向后对齐"，只用当天及以前的已知值；
             ② 严格按时间顺序切分——训练集在前 {split_idx} 条、测试集在后 {n_samples-split_idx} 条，绝不打乱；
@@ -2610,12 +2670,14 @@ if HAS_PYSIDE6:
             self.chk_val.setChecked(True)
             self.chk_idx = QCheckBox("大盘环境：沪深300 涨跌/均线偏离 (东方财富)")
             self.chk_idx.setChecked(True)
+            self.chk_mf = QCheckBox("主力资金流向：主力/超大单/大单净流入 + 进场/洗盘代理 (东方财富)")
+            self.chk_mf.setChecked(True)
             self.chk_news = QCheckBox("个股新闻：真实标题+链接，仅在\"机器学习内部\"页展示 (东方财富)")
             self.chk_news.setChecked(True)
-            for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_news):
+            for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_mf, self.chk_news):
                 layout.addWidget(c)
-            tip = QLabel("说明：勾选项失败会自动跳过该来源(特征就是没有)，绝不填假数据；"
-                         "新闻只作展示、不作历史训练特征(避免臆造情绪分)。")
+            tip = QLabel("说明：勾选项失败会自动跳过该来源(特征就是没有)，绝不填假数据；新闻只作展示；"
+                         "盘口买卖手为实时快照(无免费历史)，故用可回测的\"每日主力净流入\"作其历史等价物。")
             tip.setWordWrap(True); tip.setStyleSheet("color:#888; font-size:11px;")
             layout.addWidget(tip)
             return box
@@ -2733,10 +2795,11 @@ if HAS_PYSIDE6:
                     end = self.end_date.date().toString("yyyyMMdd")
                     self._log(f"正在从 akshare 拉取 {code} [{start} ~ {end}] 的行情数据 ...")
                     self.raw_df = fetcher.fetch(code, start, end)
-                    # 接入外部真实数据（财报估值 / 大盘环境），失败自动跳过、绝不造假
-                    if self.chk_val.isChecked() or self.chk_idx.isChecked():
+                    # 接入外部真实数据（财报估值 / 大盘环境 / 主力资金），失败自动跳过、绝不造假
+                    if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                         self.raw_df, st = StockDataFetcher.enrich(
-                            self.raw_df, code, self.chk_val.isChecked(), self.chk_idx.isChecked())
+                            self.raw_df, code, self.chk_val.isChecked(),
+                            self.chk_idx.isChecked(), self.chk_mf.isChecked())
                         for k, v in st.items():
                             self._log(f"[外部数据·{k}] {v}")
             except Exception as e:
@@ -2843,6 +2906,7 @@ def run_experiment(code: str = "600519",
                    forecast: bool = False,
                    use_valuation: bool = True,
                    use_index: bool = True,
+                   use_fundflow: bool = True,
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     一个"无界面、纯函数式"的完整实验入口，专为脚本化 / 被其它程序或 AI 调用而设计。
@@ -2877,8 +2941,8 @@ def run_experiment(code: str = "600519",
         log(f"正在拉取真实行情 {code} [{start}~{end}]（东方财富优先，失败自动切 baostock）...")
         raw_df = StockDataFetcher().fetch(code, start, end)
         data_source = f"akshare:{code}"
-        if use_valuation or use_index:
-            raw_df, est = StockDataFetcher.enrich(raw_df, code, use_valuation, use_index)
+        if use_valuation or use_index or use_fundflow:
+            raw_df, est = StockDataFetcher.enrich(raw_df, code, use_valuation, use_index, use_fundflow)
             for k, v in est.items():
                 log(f"[外部数据·{k}] {v}")
 
@@ -2948,6 +3012,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-naive", action="store_true", help="不加入朴素基准(不建议)")
     p.add_argument("--no-valuation", action="store_true", help="不接入财报估值(PE/PB/PS/市值)")
     p.add_argument("--no-index", action="store_true", help="不接入大盘环境(沪深300)")
+    p.add_argument("--no-fundflow", action="store_true", help="不接入主力资金流向(主力/大单净流入+进场/洗盘代理)")
     p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的未来收盘价")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
     return p
@@ -2964,6 +3029,7 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         use_cv=args.cv, metrics=[m.strip() for m in args.metrics.split(",") if m.strip()],
         add_naive_baseline=not args.no_naive, forecast=args.forecast,
         use_valuation=not args.no_valuation, use_index=not args.no_index,
+        use_fundflow=not args.no_fundflow,
         progress_cb=print,
     )
 
