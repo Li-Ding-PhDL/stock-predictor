@@ -178,6 +178,7 @@ try:
     from PySide6.QtGui import QFont
     matplotlib.use("QtAgg")     # 让 matplotlib 使用 Qt 后端，方便嵌入 PySide6 界面
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
     HAS_PYSIDE6 = True
 except ImportError:
     HAS_PYSIDE6 = False
@@ -2364,6 +2365,34 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
     }
 
 
+# ==================== 第八部分补充2：未来走势预测（多周期直接预测，不递归、不造假） ====================
+def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "return",
+                   horizons=(1, 5, 10, 20, 40, 60), window: int = 20,
+                   progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """
+    预测"未来走势"的诚实做法：对每个周期 h（1日/1周/2周/1月/2月/3月）**分别**训练一个
+    "直接预测第 h 天"的模型(用全部历史)，各得到一个未来价格锚点。各锚点都是真实的直接预测，
+    中间可插值成曲线——**不做递归预测**(拿预测喂预测会误差爆炸)，**不编造**未来的开高低量。
+
+    返回：{algo, last_close, last_date, points:[{horizon, pred_close, change_pct} ...]}
+    """
+    log = progress_cb or (lambda m: None)
+    points, last_close, last_date = [], None, None
+    for h in horizons:
+        cfg = TrainConfig(window_size=window, horizon=h, target_mode=target_mode,
+                          hpo_method="关闭", add_naive_baseline=False)
+        pipe = TrainingPipeline(cfg)
+        try:
+            log(f"[未来预测] 训练「第 {h} 天」直接预测模型 ...")
+            r = pipe.predict_next(algo_name, raw_df)
+            points.append({"horizon": h, "pred_close": r["pred_close"],
+                           "change_pct": r["pred_change_pct"]})
+            last_close, last_date = r["last_close"], r["last_date"]
+        except Exception as e:
+            points.append({"horizon": h, "error": str(e)})
+    return {"algo": algo_name, "last_close": last_close, "last_date": last_date, "points": points}
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -2439,6 +2468,9 @@ if HAS_PYSIDE6:
             self.figure = Figure(figsize=(8, 5))
             self.canvas = FigureCanvas(self.figure)
             self.tabs.addTab(self.canvas, "预测结果对比图")
+
+            # 未来预测走势图（多周期直接预测：1日/1周/1月/3月），可缩放看每日价格
+            self.tabs.addTab(self._build_forecast_tab(), "未来预测图")
 
             self.result_table = QTableWidget()
             self.tabs.addTab(self.result_table, "指标结果表格")
@@ -2828,6 +2860,117 @@ if HAS_PYSIDE6:
             ax.legend(loc="best"); ax.grid(True, alpha=0.25)
             self.bt_figure.autofmt_xdate()
             self.bt_canvas.draw()
+
+        # ---- 9.2.1g 未来预测走势标签页 ----
+        def _build_forecast_tab(self) -> QWidget:
+            """未来走势预测：对 1日/1周/2周/1月/2月/3月 分别直接预测，连成未来曲线并给出每股价格。
+            图带缩放工具条(放大镜可放大看每日价格)。右侧列出各周期的预测价。"""
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("模型:"))
+            self.fc_model_combo = QComboBox()
+            self.fc_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
+            self.fc_model_combo.setCurrentText("Lasso")
+            top.addWidget(self.fc_model_combo)
+            self.fc_btn = QPushButton("🔮 预测未来走势")
+            self.fc_btn.setStyleSheet("font-weight:bold; padding:6px;")
+            self.fc_btn.clicked.connect(self._on_run_forecast)
+            top.addWidget(self.fc_btn)
+            self.fc_hint = QLabel("对多个周期分别直接预测(不递归、不造假)。可用图下方工具条放大看每日价格。")
+            self.fc_hint.setStyleSheet("color:#666;")
+            top.addWidget(self.fc_hint, stretch=1)
+            layout.addLayout(top)
+
+            body = QHBoxLayout()
+            left = QVBoxLayout()
+            self.fc_figure = Figure(figsize=(7, 4.5))
+            self.fc_canvas = FigureCanvas(self.fc_figure)
+            left.addWidget(NavigationToolbar(self.fc_canvas, panel))   # 缩放/平移工具条
+            left.addWidget(self.fc_canvas, stretch=1)
+            body.addLayout(left, stretch=3)
+            self.fc_side = QTextEdit(); self.fc_side.setReadOnly(True)
+            self.fc_side.setFixedWidth(260)
+            body.addWidget(self.fc_side)
+            layout.addLayout(body, stretch=1)
+            return panel
+
+        def _on_run_forecast(self):
+            try:
+                use_synthetic = self.data_source_combo.currentIndex() == 1
+                if use_synthetic:
+                    df = StockDataFetcher.generate_synthetic_data(); code = "合成数据"
+                else:
+                    code = self.code_edit.text().strip()
+                    start = self.start_date.date().toString("yyyyMMdd")
+                    end = self.end_date.date().toString("yyyyMMdd")
+                    self.fc_hint.setText(f"正在拉取 {code} 并训练多周期预测模型 ...")
+                    QApplication.processEvents()
+                    df = StockDataFetcher().fetch(code, start, end)
+                    if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
+                        df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
+                                                        self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
+                algo = self.fc_model_combo.currentText()
+                self.fc_hint.setText(f"正在用 {algo} 训练 6 个周期的直接预测模型（稍候）...")
+                QApplication.processEvents()
+                fc = forecast_curve(algo, df, target_mode=target_mode,
+                                    horizons=(1, 5, 10, 20, 40, 60), progress_cb=self._log)
+                self._draw_forecast(code, df, fc)
+                self._oplog(f"未来预测：{code}，模型{algo}。")
+            except Exception as e:
+                QMessageBox.critical(self, "未来预测失败", str(e))
+                self.fc_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
+
+        def _draw_forecast(self, code, df, fc):
+            self.fc_figure.clear()
+            ax = self.fc_figure.add_subplot(111)
+            # 最近 ~120 个交易日的真实收盘
+            hist = df.tail(120).reset_index(drop=True)
+            hd = pd.to_datetime(hist["date"]); hc = hist["close"].to_numpy(float)
+            ax.plot(hd, hc, color="#333", linewidth=1.2, label="历史真实收盘")
+            last_date = pd.to_datetime(fc["last_date"]); last_close = fc["last_close"]
+
+            # 未来锚点：每个周期 h -> 未来第 h 个交易日
+            fut_dates = [last_date] + [(last_date + pd.tseries.offsets.BDay(p["horizon"]))
+                                       for p in fc["points"] if "pred_close" in p]
+            fut_prices = [last_close] + [p["pred_close"] for p in fc["points"] if "pred_close" in p]
+            ax.plot(fut_dates, fut_prices, color="#c0392b", linewidth=1.6, linestyle="--",
+                    marker="o", markersize=4, label="未来预测(各周期直接预测)")
+            # 高亮 1个月/3个月
+            label_map = {20: ("1个月", "#1e8449"), 60: ("3个月", "#d35400")}
+            for p in fc["points"]:
+                if "pred_close" not in p:
+                    continue
+                fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                if p["horizon"] in label_map:
+                    name, col = label_map[p["horizon"]]
+                    ax.scatter([fdate], [p["pred_close"]], color=col, s=60, zorder=5)
+                    ax.annotate(f"{name}\n{p['pred_close']:.2f}", (fdate, p["pred_close"]),
+                                textcoords="offset points", xytext=(6, 8), color=col, fontsize=9)
+            ax.axvline(last_date, color="#aaa", linestyle=":", linewidth=1)
+            ax.set_ylabel("收盘价"); ax.set_title(f"{code} 未来走势预测（{fc['algo']}，1日~3个月）")
+            ax.legend(loc="best", fontsize=8); ax.grid(True, alpha=0.25)
+            self.fc_figure.autofmt_xdate(); self.fc_canvas.draw()
+
+            # 右侧：每股预测价
+            name_map = {1: "明日", 5: "1周后", 10: "2周后", 20: "1个月后", 40: "2个月后", 60: "3个月后"}
+            rows = [f"<h3>{code} · {fc['algo']}</h3>",
+                    f"<p>最新收盘（{fc['last_date']}）：<b>{last_close:.2f} 元</b></p>",
+                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>",
+                    "<tr bgcolor=#eef><th>时点</th><th>预测价(元)</th><th>涨跌</th></tr>"]
+            for p in fc["points"]:
+                nm = name_map.get(p["horizon"], f"{p['horizon']}日后")
+                if "pred_close" in p:
+                    chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
+                    rows.append(f"<tr><td>{nm}</td><td><b>{p['pred_close']:.2f}</b></td>"
+                                f"<td style='color:{col}'>{chg:+.2f}%</td></tr>")
+                else:
+                    rows.append(f"<tr><td>{nm}</td><td colspan=2>失败</td></tr>")
+            rows.append("</table>")
+            rows.append("<p style='color:#c0392b'>⚠ 每个点是对应周期的<b>直接</b>预测，中间为插值；"
+                        "预测越往后越不可靠，绝不构成投资建议。</p>")
+            self.fc_side.setHtml("".join(rows))
 
         # ---- 9.2.2 数据配置区 ----
         def _build_data_group(self) -> QGroupBox:
