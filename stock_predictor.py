@@ -387,6 +387,87 @@ class StockDataFetcher:
         df["date"] = pd.to_datetime(df["date"])
         return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
+    # ---------- 3.1c 外部数据接入：财报估值 / 大盘环境 / 新闻（全部真实来源，缺失自动跳过不臆造）----------
+    @staticmethod
+    def enrich(df: pd.DataFrame, code: str, want_valuation: bool = True,
+               want_index: bool = True, bypass_proxy: bool = True) -> Tuple[pd.DataFrame, Dict[str, str]]:
+        """
+        把日线行情 df 用"按日期对齐(merge_asof 向后取最近已知值，无未来泄露)"的方式，
+        并入真实的**财报估值**(日频 PE/PB/PS/股息率/总市值) 与**大盘环境**(沪深300 涨跌/均线偏离)。
+        任一来源取数失败时**自动跳过该来源**(对应特征就是没有)，绝不填充假数据。
+        返回 (增强后的 df, 各来源状态字典)。
+        """
+        # merge_asof 要求两侧 date 列 dtype 完全一致；统一成 datetime64[ns]，避免 us/s 分辨率不一致报错
+        def _nsdate(d):
+            d = d.copy()
+            d["date"] = pd.to_datetime(d["date"]).astype("datetime64[ns]")
+            return d.sort_values("date")
+
+        df = _nsdate(df)
+        status: Dict[str, str] = {}
+        if want_valuation and HAS_AKSHARE:
+            try:
+                v = _nsdate(StockDataFetcher._fetch_valuation(code, bypass_proxy))
+                df = pd.merge_asof(df, v, on="date", direction="backward")
+                status["valuation"] = f"已接入(乐咕乐股, {len(v)}行)"
+            except Exception as e:
+                status["valuation"] = f"跳过(取数失败: {e})"
+        elif want_valuation:
+            status["valuation"] = "跳过(未安装 akshare)"
+        if want_index and HAS_AKSHARE:
+            try:
+                ix = _nsdate(StockDataFetcher._fetch_index(bypass_proxy))
+                df = pd.merge_asof(df, ix, on="date", direction="backward")
+                status["index"] = "已接入(沪深300)"
+            except Exception as e:
+                status["index"] = f"跳过(取数失败: {e})"
+        elif want_index:
+            status["index"] = "跳过(未安装 akshare)"
+        return df.reset_index(drop=True), status
+
+    @staticmethod
+    def _fetch_valuation(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
+        """真实财报估值(日频)：akshare stock_a_indicator_lg，数据源=乐咕乐股 legulegu.com。
+        字段：pe/pe_ttm/pb/ps/ps_ttm/dv_ratio/dv_ttm/total_mv。取其中有代表性的几项。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            v = ak.stock_a_indicator_lg(symbol=code)
+        v = v.rename(columns={"trade_date": "date"})
+        v["date"] = pd.to_datetime(v["date"]).astype("datetime64[ns]")
+        keep = {"date": "date", "pe_ttm": "val_pe_ttm", "pb": "val_pb", "ps_ttm": "val_ps_ttm",
+                "dv_ttm": "val_dv_ttm", "total_mv": "val_total_mv"}
+        cols = [c for c in keep if c in v.columns]
+        v = v[cols].rename(columns=keep)
+        for c in v.columns:
+            if c != "date":
+                v[c] = pd.to_numeric(v[c], errors="coerce")
+        return v.dropna(subset=["date"]).sort_values("date")
+
+    @staticmethod
+    def _fetch_index(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
+        """真实大盘环境：akshare stock_zh_index_daily(沪深300)。产出当日涨跌与相对20日均线偏离。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            ix = ak.stock_zh_index_daily(symbol=symbol)
+        ix["date"] = pd.to_datetime(ix["date"]).astype("datetime64[ns]")
+        ix = ix.sort_values("date")
+        ix["idx_ret_1d"] = ix["close"].pct_change()
+        ix["idx_madev20"] = ix["close"] / (ix["close"].rolling(20).mean() + 1e-9) - 1
+        return ix[["date", "idx_ret_1d", "idx_madev20"]].dropna()
+
+    @staticmethod
+    def fetch_news(code: str, limit: int = 15, bypass_proxy: bool = True) -> pd.DataFrame:
+        """真实个股新闻(仅供展示/近期参考)：akshare stock_news_em，数据源=东方财富。
+        注意：新闻接口只覆盖近期，且把文本转成可靠的历史情绪分数需要 NLP 模型；为避免臆造，
+        本软件**不**把新闻情绪当作历史训练特征，只在界面展示真实标题与链接。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            nd = ak.stock_news_em(symbol=code)
+        nd = nd.rename(columns={"新闻标题": "title", "发布时间": "time",
+                                "文章来源": "source", "新闻链接": "url"})
+        cols = [c for c in ["time", "title", "source", "url"] if c in nd.columns]
+        return nd[cols].head(limit)
+
     # ---------- 3.2 缓存文件路径 ----------
     def _cache_path(self, code: str, start_date: str, end_date: str, adjust: str) -> str:
         fname = f"{code}_{start_date}_{end_date}_{adjust}.parquet"
@@ -505,6 +586,14 @@ class FeatureEngineer:
         roll_hi = df["high"].rolling(20).max()
         roll_lo = df["low"].rolling(20).min()
         df["pos_in_range20"] = (df["close"] - roll_lo) / (roll_hi - roll_lo + 1e-9)
+
+        # ---- 4.1.9 周/月/季 多周期趋势（由日线滚动计算，只回看历史，无未来泄露）----
+        # 这是把"周K线/月K线"信息编码进特征的标准做法：各周期的涨跌幅、区间位置、相对均线偏离。
+        for w, tag in [(5, "w1"), (20, "m1"), (60, "q1")]:      # 5日≈1周, 20日≈1月, 60日≈1季
+            df[f"ret_{tag}"] = df["close"] / (df["close"].shift(w) + 1e-9) - 1        # 周期涨跌幅
+            hi_w = df["high"].rolling(w).max(); lo_w = df["low"].rolling(w).min()
+            df[f"pos_{tag}"] = (df["close"] - lo_w) / (hi_w - lo_w + 1e-9)            # 周期区间位置
+            df[f"madev_{tag}"] = df["close"] / (df["close"].rolling(w).mean() + 1e-9) - 1  # 相对周期均线偏离
 
         return df
 
@@ -1877,6 +1966,29 @@ class TrainingPipeline:
             return prev_close * (1.0 + pred_target)
         return pred_target
 
+    @staticmethod
+    def _dir_metrics(close_true, price_pred, prev_close) -> Dict[str, float]:
+        """
+        对**任意预测周期(horizon)**都正确的方向指标：以每个样本自己的"基准日收盘价"prev_close
+        为参照，比较"未来是否上涨"的真实与预测。这样第二天/3日/一周/一月/三月的涨跌都能正确评估
+        （通用版 Metrics.da/up_p 用相邻真值近似，仅 horizon=1 才准，故这里在管道内用真实基准价覆盖）。
+        """
+        ct = np.asarray(close_true, float); pp = np.asarray(price_pred, float)
+        pc = np.asarray(prev_close, float)
+        true_up = ct > pc
+        pred_up = pp > pc
+        da = float(np.mean(true_up == pred_up) * 100) if len(ct) else 0.0
+        up_p = float(np.mean(true_up[pred_up]) * 100) if pred_up.sum() > 0 else 0.0
+        return {"DA": round(da, 6), "UP_P": round(up_p, 6)}
+
+    def _apply_dir(self, metrics: Dict[str, float], close_true, price_pred, prev_close):
+        """把管道内算出的、对任意周期都正确的 DA/UP_P 覆盖进 metrics（仅当用户勾选了它们）。"""
+        dm = self._dir_metrics(close_true, price_pred, prev_close)
+        for k in ("DA", "UP_P"):
+            if k in metrics:
+                metrics[k] = dm[k]
+        return metrics
+
     # ---------- 8.1 数据准备：技术指标 -> 样本 -> 标准化 -> 时间序列切分 ----------
     def prepare_data(self, raw_df: pd.DataFrame) -> PreparedData:
         X, y, dates = self.fe.build_supervised_samples(raw_df)
@@ -1927,6 +2039,7 @@ class TrainingPipeline:
             pred_target = self.fe.inverse_y(model.predict(X_test))
             pred_price = self._to_price(pred_target, pdata.prev_close_test)
             metrics = Metrics.calc_all(close_test, pred_price, self.config.metrics)
+            self._apply_dir(metrics, close_test, pred_price, pdata.prev_close_test)
 
             # ---- 8.2.5 可选：5折交叉验证（衡量稳定性；仅算非方向类指标，方向类需价格还原故略）----
             cv_metrics = None
@@ -1985,6 +2098,7 @@ class TrainingPipeline:
         """
         naive_price = pdata.prev_close_test.astype(float)
         metrics = Metrics.calc_all(pdata.close_test, naive_price, self.config.metrics)
+        self._apply_dir(metrics, pdata.close_test, naive_price, pdata.prev_close_test)
         return ModelResult(algo_name="Naive(前值)", metrics=metrics, y_test_true=pdata.close_test,
                            y_test_pred=naive_price, test_dates=pdata.d_test)
 
@@ -1996,6 +2110,7 @@ class TrainingPipeline:
         """
         up_price = pdata.prev_close_test.astype(float) * 1.001    # 恒定"涨一点"，方向恒为涨
         metrics = Metrics.calc_all(pdata.close_test, up_price, self.config.metrics)
+        self._apply_dir(metrics, pdata.close_test, up_price, pdata.prev_close_test)
         return ModelResult(algo_name="总是涨(方向基准)", metrics=metrics,
                            y_test_true=pdata.close_test, y_test_pred=up_price,
                            test_dates=pdata.d_test)
@@ -2007,13 +2122,13 @@ class TrainingPipeline:
         pdata = self.prepare_data(raw_df)
         results = []
         # 两个诚实性基准放最前面，一眼对照：模型须在"价格误差"上赢过 Naive、在"方向"上赢过"总是涨"。
-        if self.config.add_naive_baseline and self.config.horizon == 1 and len(pdata.close_test) >= 2:
+        # 对任意预测周期都成立：用每个样本的"基准日收盘价"判断这段周期到底涨没涨。
+        if self.config.add_naive_baseline and len(pdata.close_test) >= 2:
             results.append(self._naive_baseline(pdata))
             results.append(self._alwaysup_baseline(pdata))
-            ct = pdata.close_test
-            up_rate = float(np.mean(ct[1:] > ct[:-1]) * 100)
-            log(f"[诚实性提示] 测试集共 {len(ct)} 天，其中上涨日占比 {up_rate:.1f}%。"
-                f"模型方向准确率(DA) 必须明显 > {up_rate:.1f}% 才算真的有涨跌判别力。")
+            up_rate = float(np.mean(pdata.close_test > pdata.prev_close_test) * 100)
+            log(f"[诚实性提示] 预测周期={self.config.horizon}个交易日；测试集共 {len(pdata.close_test)} 段，"
+                f"其中上涨占比 {up_rate:.1f}%。模型方向准确率(DA) 必须明显 > {up_rate:.1f}% 才算真有判别力。")
         for algo_name in algo_names:
             results.append(self.run_single(algo_name, pdata, progress_cb))
         return results
@@ -2123,6 +2238,7 @@ if HAS_PYSIDE6:
             config_panel = QWidget()
             config_layout = QVBoxLayout(config_panel)
             config_layout.addWidget(self._build_data_group())
+            config_layout.addWidget(self._build_external_group())
             config_layout.addWidget(self._build_algo_group())
             config_layout.addWidget(self._build_function_group())
             config_layout.addWidget(self._build_metric_group())
@@ -2284,6 +2400,7 @@ if HAS_PYSIDE6:
         def _on_build_mldata(self):
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
+                enrich_status, news = {}, None
                 if use_synthetic:
                     df = StockDataFetcher.generate_synthetic_data()
                     code = "合成数据"
@@ -2291,13 +2408,22 @@ if HAS_PYSIDE6:
                     code = self.code_edit.text().strip()
                     start = self.start_date.date().toString("yyyyMMdd")
                     end = self.end_date.date().toString("yyyyMMdd")
-                    self.mldata_hint.setText(f"正在拉取 {code} 行情 ...")
+                    self.mldata_hint.setText(f"正在拉取 {code} 行情与外部数据 ...")
                     QApplication.processEvents()
                     df = StockDataFetcher().fetch(code, start, end)
+                    if self.chk_val.isChecked() or self.chk_idx.isChecked():
+                        df, enrich_status = StockDataFetcher.enrich(
+                            df, code, self.chk_val.isChecked(), self.chk_idx.isChecked())
+                    if self.chk_news.isChecked():
+                        try:
+                            news = StockDataFetcher.fetch_news(code)
+                        except Exception as e:
+                            enrich_status["news"] = f"跳过(取数失败: {e})"
 
                 target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
+                horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
                 train_ratio = next(r for r, rb in self.split_radios.items() if rb.isChecked())
-                fe = FeatureEngineer(window_size=20, horizon=1, target_mode=target_mode)
+                fe = FeatureEngineer(window_size=20, horizon=horizon, target_mode=target_mode)
                 X, y, sample_dates = fe.build_supervised_samples(df)
                 if len(X) < 10:
                     QMessageBox.warning(self, "提示", "样本太少，无法透视，请拉长日期区间。")
@@ -2305,10 +2431,10 @@ if HAS_PYSIDE6:
                 split_idx = int(len(X) * train_ratio)
 
                 self._draw_mldata_trend(code, sample_dates, fe.close_target_, split_idx, target_mode)
-                self._fill_mldata_source(fe, target_mode, len(X), split_idx)
+                self._fill_mldata_source(fe, target_mode, len(X), split_idx, enrich_status, news)
                 self._fill_mldata_table(fe, y, sample_dates, split_idx, target_mode)
                 self.mldata_hint.setText(
-                    f"{code}：共 {len(X)} 条样本，训练 {split_idx} / 测试 {len(X)-split_idx}，"
+                    f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本，训练 {split_idx} / 测试 {len(X)-split_idx}，"
                     f"分界日期 {pd.to_datetime(sample_dates.iloc[split_idx]).strftime('%Y-%m-%d')}。")
             except Exception as e:
                 QMessageBox.critical(self, "数据透视失败", str(e))
@@ -2337,41 +2463,59 @@ if HAS_PYSIDE6:
             self.mldata_figure.tight_layout()
             self.mldata_canvas.draw()
 
-        def _fill_mldata_source(self, fe, target_mode, n_samples, split_idx):
+        def _fill_mldata_source(self, fe, target_mode, n_samples, split_idx,
+                                enrich_status=None, news=None):
             cols = list(getattr(fe, "feature_cols", []))
             n_feat = len(cols)
-            # 已接入（当前真实使用）的输入，按来源分组
+            has = lambda pref: any(c.startswith(pref) for c in cols)   # 该类特征是否真的存在于特征列
+            enrich_status = enrich_status or {}
+
+            # 已接入（当前真实使用）的输入，按来源分组；状态根据"特征列里是否真有对应列"如实判定
             groups = [
-                ("原始行情(日线)", "数据源直接给出", "open/close/high/low/volume/amount 等"),
-                ("均线趋势", "由收盘价计算", "MA5/10/20/60、EMA、MACD"),
-                ("超买超卖/通道", "由行情计算", "RSI14、布林带、KDJ"),
-                ("量能", "由成交量计算", "volume_ma5、volume_change"),
-                ("动量/波动", "由收益率计算", "return_1d、volatility_10d"),
-                ("市场情绪(量价代理)", "由行情计算", "量比 vol_ratio、换手率、日内振幅、连涨跌天数、近20日区间位置"),
+                (True, "原始行情(日线)", "东方财富/baostock", "open/close/high/low/volume/amount 等"),
+                (True, "技术指标", "由日线计算", "MA/EMA/MACD、RSI14、布林带、KDJ"),
+                (True, "量能 & 动量波动", "由行情计算", "volume_ma5/volume_change、return_1d、volatility_10d"),
+                (True, "市场情绪(量价代理)", "由行情计算", "量比、换手率、日内振幅、连涨跌天数、近20日区间位置"),
+                (has("ret_") or has("pos_w") or has("madev_"), "周/月/季 多周期趋势(≈周K/月K线)",
+                 "由日线滚动计算(无泄露)", "ret_w1/m1/q1、pos_*、madev_*（1周/1月/1季 涨跌·区间·均线偏离）"),
+                (has("val_"), "财报估值(日频)", f"乐咕乐股 legulegu.com · {enrich_status.get('valuation','')}",
+                 "val_pe_ttm/val_pb/val_ps_ttm/val_dv_ttm/val_total_mv"),
+                (has("idx_"), "大盘环境(沪深300)", f"东方财富 · {enrich_status.get('index','')}",
+                 "idx_ret_1d、idx_madev20"),
             ]
-            rows_ok = "".join(
-                f"<tr><td>✅ {g}</td><td>{src}</td><td>{ex}</td></tr>" for g, src, ex in groups)
-            # 诚实标注：用户期望但当前"尚未接入"的输入（需要额外数据源，不臆造）
-            todo = [
-                ("周K线 / 月K线", "需对日线重采样(resample W/M)后并入特征"),
-                ("财报基本面(PE/PB/ROE/营收)", "需财报数据源，如 akshare stock_financial_* / baostock 季频数据"),
-                ("新闻 / 舆情情绪", "需新闻/股吧文本 + NLP 情感打分（务必真抓，不编造分数）"),
-                ("板块 / 行业", "需行业分类与板块指数数据"),
-            ]
-            rows_todo = "".join(
-                f"<tr><td>⛔ {g}</td><td>{how}</td></tr>" for g, how in todo)
+            rows = []
+            for ok, g, src, ex in groups:
+                mark = "✅" if ok else "⛔ 未接入"
+                color = "" if ok else " bgcolor=#fee"
+                rows.append(f"<tr{color}><td>{mark} {g}</td><td>{src}</td><td>{ex}</td></tr>")
+            rows_html = "".join(rows)
+
+            # 新闻：真实标题+链接，仅展示、不作历史训练特征（诚实说明原因）
+            if news is not None and len(news) > 0:
+                items = []
+                for _, r in news.iterrows():
+                    t = str(r.get("title", "")); u = str(r.get("url", "")); tm = str(r.get("time", ""))
+                    items.append(f"<li>{tm}　<a href='{u}'>{t}</a></li>")
+                news_html = ("<p><b>个股新闻(真实标题+链接，来自东方财富)：</b>"
+                             "<span style='color:#c0392b'>仅展示、不作为历史训练特征</span>"
+                             "——新闻接口只覆盖近期，且把文本变成可靠的历史情绪分需要 NLP 模型，"
+                             "为避免臆造，本软件不把编造的情绪分喂给模型。</p>"
+                             f"<ul>{''.join(items)}</ul>")
+            else:
+                ns = enrich_status.get("news", "未获取")
+                news_html = (f"<p><b>个股新闻：</b>{ns}。真实来源=东方财富 stock_news_em；"
+                             "仅展示、不作历史训练特征(避免臆造情绪分)。</p>")
+
             html = f"""
             <h3>输入的真实来源（当前共 {n_feat} 个特征 × 窗口20天 = 每条样本 {n_feat*20} 维）</h3>
-            <p><b>已接入（模型真的在用）：</b></p>
+            <p>下表状态按"特征列里是否真有对应列"如实判定；⛔ 表示该来源本次未接入(取数失败/未勾选)，
+            <b>软件绝不用假数据填充</b>。</p>
             <table border=1 cellpadding=4 cellspacing=0 width=100%>
-              <tr bgcolor=#eef><th>输入类别</th><th>来源</th><th>具体特征</th></tr>{rows_ok}
+              <tr bgcolor=#eef><th>输入类别</th><th>真实来源</th><th>具体特征</th></tr>{rows_html}
             </table>
-            <p><b>你期望、但当前<span style="color:#c0392b">尚未接入</span>（需外部数据源，软件不臆造）：</b></p>
-            <table border=1 cellpadding=4 cellspacing=0 width=100%>
-              <tr bgcolor=#fee><th>期望输入</th><th>接入方式（可作为后续扩展）</th></tr>{rows_todo}
-            </table>
+            {news_html}
             <p style="color:#2c6fbb"><b>为什么不会泄露未来数据：</b>
-            ① 所有特征只用"当天及以前"的信息计算；
+            ① 所有特征(含估值/大盘)都按日期"向后对齐"，只用当天及以前的已知值；
             ② 严格按时间顺序切分——训练集在前 {split_idx} 条、测试集在后 {n_samples-split_idx} 条，绝不打乱；
             ③ 标准化器只在训练集上 fit，再套用到测试集。</p>
             """
@@ -2445,6 +2589,35 @@ if HAS_PYSIDE6:
                                          "无论哪种，评估都会统一还原成价格并给出方向准确率。")
             layout.addWidget(self.target_combo, 4, 1)
 
+            layout.addWidget(QLabel("预测周期:"), 5, 0)
+            self.horizon_combo = QComboBox()
+            # (显示文本, 对应的交易日数 horizon)
+            self._horizon_options = [("第二天 (1日)", 1), ("3日", 3), ("一周 (5日)", 5),
+                                     ("一个月 (20日)", 20), ("三个月 (60日)", 60)]
+            self.horizon_combo.addItems([t for t, _ in self._horizon_options])
+            self.horizon_combo.setToolTip("预测未来多少个交易日后的涨跌。方向准确率/基准对所有周期都已算对。")
+            layout.addWidget(self.horizon_combo, 5, 1)
+
+            return box
+
+        # ---- 9.2.2b 外部数据接入区（真实来源，可勾选；仅真实数据模式生效）----
+        def _build_external_group(self) -> QGroupBox:
+            box = QGroupBox("外部数据接入 (真实来源，仅真实数据模式生效)")
+            layout = QVBoxLayout(box)
+            self.chk_weekly = QCheckBox("周/月/季 多周期趋势特征 (由日线计算，始终开启)")
+            self.chk_weekly.setChecked(True); self.chk_weekly.setEnabled(False)
+            self.chk_val = QCheckBox("财报估值：PE/PB/PS/股息率/总市值 (日频 · 乐咕乐股 legulegu.com)")
+            self.chk_val.setChecked(True)
+            self.chk_idx = QCheckBox("大盘环境：沪深300 涨跌/均线偏离 (东方财富)")
+            self.chk_idx.setChecked(True)
+            self.chk_news = QCheckBox("个股新闻：真实标题+链接，仅在\"机器学习内部\"页展示 (东方财富)")
+            self.chk_news.setChecked(True)
+            for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_news):
+                layout.addWidget(c)
+            tip = QLabel("说明：勾选项失败会自动跳过该来源(特征就是没有)，绝不填假数据；"
+                         "新闻只作展示、不作历史训练特征(避免臆造情绪分)。")
+            tip.setWordWrap(True); tip.setStyleSheet("color:#888; font-size:11px;")
+            layout.addWidget(tip)
             return box
 
         # ---- 9.2.3 算法多选区（对应截图 B-1.1，按 3 类分组）----
@@ -2560,6 +2733,12 @@ if HAS_PYSIDE6:
                     end = self.end_date.date().toString("yyyyMMdd")
                     self._log(f"正在从 akshare 拉取 {code} [{start} ~ {end}] 的行情数据 ...")
                     self.raw_df = fetcher.fetch(code, start, end)
+                    # 接入外部真实数据（财报估值 / 大盘环境），失败自动跳过、绝不造假
+                    if self.chk_val.isChecked() or self.chk_idx.isChecked():
+                        self.raw_df, st = StockDataFetcher.enrich(
+                            self.raw_df, code, self.chk_val.isChecked(), self.chk_idx.isChecked())
+                        for k, v in st.items():
+                            self._log(f"[外部数据·{k}] {v}")
             except Exception as e:
                 QMessageBox.critical(self, "数据获取失败", str(e))
                 return
@@ -2570,8 +2749,9 @@ if HAS_PYSIDE6:
             metrics = [name for name, cb in self.metric_checkboxes.items() if cb.isChecked()] or ["R2", "MAE", "RMSE"]
 
             target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
             config = TrainConfig(
-                window_size=20, horizon=1, train_ratio=train_ratio, target_mode=target_mode,
+                window_size=20, horizon=horizon, train_ratio=train_ratio, target_mode=target_mode,
                 use_cv=self.cv_checkbox.isChecked(), cv_folds=5,
                 hpo_method=hpo_method, hpo_trials=15, metrics=metrics
             )
@@ -2661,6 +2841,8 @@ def run_experiment(code: str = "600519",
                    metrics: Optional[List[str]] = None,
                    add_naive_baseline: bool = True,
                    forecast: bool = False,
+                   use_valuation: bool = True,
+                   use_index: bool = True,
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     一个"无界面、纯函数式"的完整实验入口，专为脚本化 / 被其它程序或 AI 调用而设计。
@@ -2695,6 +2877,10 @@ def run_experiment(code: str = "600519",
         log(f"正在拉取真实行情 {code} [{start}~{end}]（东方财富优先，失败自动切 baostock）...")
         raw_df = StockDataFetcher().fetch(code, start, end)
         data_source = f"akshare:{code}"
+        if use_valuation or use_index:
+            raw_df, est = StockDataFetcher.enrich(raw_df, code, use_valuation, use_index)
+            for k, v in est.items():
+                log(f"[外部数据·{k}] {v}")
 
     # ---- 2) 组装配置并训练 ----
     config = TrainConfig(window_size=window, horizon=horizon, train_ratio=train_ratio,
@@ -2760,7 +2946,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cv", action="store_true", help="启用 5 折交叉验证")
     p.add_argument("--metrics", default="R2,MAE,RMSE,DA,UP_P", help="逗号分隔的评价指标")
     p.add_argument("--no-naive", action="store_true", help="不加入朴素基准(不建议)")
-    p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的下一交易日收盘价")
+    p.add_argument("--no-valuation", action="store_true", help="不接入财报估值(PE/PB/PS/市值)")
+    p.add_argument("--no-index", action="store_true", help="不接入大盘环境(沪深300)")
+    p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的未来收盘价")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
     return p
 
@@ -2775,6 +2963,7 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         target_mode=args.target,
         use_cv=args.cv, metrics=[m.strip() for m in args.metrics.split(",") if m.strip()],
         add_naive_baseline=not args.no_naive, forecast=args.forecast,
+        use_valuation=not args.no_valuation, use_index=not args.no_index,
         progress_cb=print,
     )
 

@@ -90,9 +90,14 @@ python -c "import stock_predictor"
   `python-weka-wrapper3`（Kstar/M5Rules）或 `geppy`（GEP）做精确实现。
 - **✅ 收益率预测模式**（已完成）：`target_mode="return"` 已实现并设为默认，评估统一还原成价格。
 - **✅ ARIMA 经典时序模型**（已完成）：可选 `statsmodels`；目前为多步 forecast，可进一步做 walk-forward 一步预测。
-- **市场情绪**：已加入**量价情绪代理**(量比/换手率/振幅/连涨跌/区间位置)。真正的**舆情情绪**(新闻/股吧/研报
-  文本 NLP) 需接外部数据源，是很好的扩展——但务必真实抓取、不得臆造情绪分数（见红线第 4 条精神）。
-- **多步预测 / 多标的**：`horizon>1` 时两条基准与 DA/UP_P 仅对 `horizon=1` 严格成立，可扩展。
+- **✅ 多周期预测**（已完成）：horizon 支持 1/3/5/20/60 日；DA/UP_P 与两条基准在管道内用每个样本的
+  `prev_close` 计算，对所有周期都正确（`TrainingPipeline._dir_metrics`）。GUI「预测周期」下拉可选。
+- **✅ 周/月/季趋势特征**（已完成）：`add_technical_indicators` 4.1.9，由日线滚动计算，无泄露。
+- **✅ 外部数据接入**（已完成）：`StockDataFetcher.enrich()` 用 merge_asof 并入财报估值(乐咕乐股
+  `stock_a_indicator_lg`)与大盘环境(沪深300 `stock_zh_index_daily`)；新闻(`stock_news_em`)仅展示不训练。
+  失败自动跳过、绝不造假。**注意 merge_asof 两侧 date 必须同分辨率，已统一 datetime64[ns]。**
+- **市场情绪**：已加入量价情绪代理。真正的**舆情情绪**(新闻/股吧 NLP) 仍是扩展——务必真实抓取、不臆造分数。
+- **板块/行业**：可加行业分类 + 板块指数(如 `stock_board_industry_hist_em`)，按 enrich 同款 merge_asof 并入。
 - **回测层**：目前只做逐点误差评估，可加"按预测方向模拟买卖"的收益回测（含手续费/滑点）。
 - **ARIMA 的公平性**：当前多步 forecast 在股票上会收敛到均值，往往跑不赢基准；可改成滚动一步预测以更公平。
 
