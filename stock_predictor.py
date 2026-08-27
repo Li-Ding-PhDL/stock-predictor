@@ -175,7 +175,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QGroupBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton, QLabel,
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
-        QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit
+        QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate
     from PySide6.QtGui import QFont
@@ -2690,7 +2690,8 @@ if HAS_PYSIDE6:
             self.mldata_canvas = FigureCanvas(self.mldata_figure)
             split.addWidget(self.mldata_canvas)
             # 中：输入的真实来源说明
-            self.mldata_srcbox = QTextEdit(); self.mldata_srcbox.setReadOnly(True)
+            self.mldata_srcbox = QTextBrowser()             # QTextBrowser 支持点击超链接
+            self.mldata_srcbox.setOpenExternalLinks(True)   # 让 <a href> 链接在系统浏览器打开
             split.addWidget(self.mldata_srcbox)
             # 下：数据集预览表
             self.mldata_table = QTableWidget()
@@ -2734,7 +2735,8 @@ if HAS_PYSIDE6:
                 a = int(len(X) * train_ratio)              # 训练/验证/测试三分切点，与真实训练一致
                 b = a + (len(X) - a) // 2
                 self._draw_mldata_trend(code, sample_dates, fe.close_target_, a, b, target_mode)
-                self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, news)
+                self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, news,
+                                         code if not use_synthetic else "")
                 self._fill_mldata_table(fe, y, sample_dates, a, b, target_mode)
                 self.mldata_hint.setText(
                     f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本 = 训练 {a} / 验证 {b-a} / 测试 {len(X)-b}。"
@@ -2771,8 +2773,33 @@ if HAS_PYSIDE6:
             self.mldata_figure.tight_layout()
             self.mldata_canvas.draw()
 
+        @staticmethod
+        def _source_links_html(code: str) -> str:
+            """为当前股票生成"数据溯源"真实链接(点击在浏览器打开对应来源网页)。"""
+            if not code:
+                return ("<p><b>数据溯源：</b>当前为合成数据(无真实来源)。选真实数据并填股票代码后，"
+                        "这里会列出可点击跳转的真实来源网址。</p>")
+            mkt = "sh" if code.startswith("6") else ("bj" if code.startswith(("4", "8", "920")) else "sz")
+            MKT = mkt.upper()
+            links = [
+                ("行情/K线（东方财富个股页）", f"https://quote.eastmoney.com/{mkt}{code}.html"),
+                ("公司财报/F10（东方财富财务分析）",
+                 f"https://emweb.securities.eastmoney.com/pc_hsf10/pages/index.html?type=web&code={MKT}{code}#/cwfx"),
+                ("估值 PE/PB/市值（百度股市通）", f"https://gushitong.baidu.com/stock/ab-{code}"),
+                ("主力资金流向（东方财富）", f"https://data.eastmoney.com/zjlx/{code}.html"),
+                ("大盘环境 沪深300（东方财富）", "https://quote.eastmoney.com/zs000300.html"),
+                ("个股新闻（东方财富搜索）", f"https://so.eastmoney.com/news/s?keyword={code}"),
+                ("公司公告/招股书（巨潮资讯 官方披露）",
+                 f"http://www.cninfo.com.cn/new/fulltextSearch?keyWord={code}"),
+            ]
+            rows = "".join(f"<tr><td>{n}</td><td><a href='{u}'>{u}</a></td></tr>" for n, u in links)
+            return (f"<h3>数据溯源（{code} · 点击可在浏览器打开真实来源）</h3>"
+                    "<p>本软件所有真实数据均来自以下公开网站，可逐一核对：</p>"
+                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+                    f"<tr bgcolor=#eef><th>数据类别</th><th>真实来源网址（可点击）</th></tr>{rows}</table>")
+
         def _fill_mldata_source(self, fe, target_mode, n_samples, a, b,
-                                enrich_status=None, news=None):
+                                enrich_status=None, news=None, code=""):
             cols = list(getattr(fe, "feature_cols", []))
             n_feat = len(cols)
             has = lambda pref: any(c.startswith(pref) for c in cols)   # 该类特征是否真的存在于特征列
@@ -2824,6 +2851,7 @@ if HAS_PYSIDE6:
             <table border=1 cellpadding=4 cellspacing=0 width=100%>
               <tr bgcolor=#eef><th>输入类别</th><th>真实来源</th><th>具体特征</th></tr>{rows_html}
             </table>
+            {self._source_links_html(code)}
             {news_html}
             <p><b>关于"主力意图"与"买卖手"（诚实说明）：</b>
             "主力进场/退场/洗盘"没有权威标签，本软件不臆造"主力预言"，而是接入<b>真实的每日主力资金净流入</b>

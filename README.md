@@ -45,24 +45,27 @@
 
 ## 安装
 
+**一次性装齐(推荐)——克隆后一条命令搞定：**
+
 ```bash
-# 1) 克隆仓库
 git clone https://github.com/Li-Ding-PhDL/stock-predictor.git
 cd stock-predictor
-
-# 2) 安装核心依赖（必须）
-pip install numpy pandas scikit-learn matplotlib pyarrow
-
-# 3) 按需安装可选依赖
-pip install PySide6            # 想用图形界面
-pip install akshare            # 想用真实 A 股数据
-pip install xgboost lightgbm catboost torch pytorch-tabnet gplearn optuna   # 更多算法
-
-# 或一次性安装 requirements.txt 里未注释的部分
 pip install -r requirements.txt
 ```
 
-缺失可选依赖时程序**不会崩溃**：对应算法在界面里自动置灰，akshare 缺失则自动改用合成数据。
+**或者只装一行(不克隆也能装全部依赖)：**
+
+```bash
+pip install numpy pandas scikit-learn matplotlib pyarrow requests PySide6 akshare baostock statsmodels optuna xgboost lightgbm catboost gplearn torch pytorch-tabnet
+```
+
+> `torch`(深度学习)下载较大;不需要 LSTM/Transformer 等可去掉它和 `pytorch-tabnet`。
+> 缺任何可选依赖程序**都不会崩溃**：对应算法在界面里自动置灰，真实数据源缺失则自动改用合成数据。
+
+运行：
+```bash
+python stock_predictor.py
+```
 
 ---
 
@@ -136,6 +139,10 @@ pip install akshare baostock
 
 > 诚实说明：新闻/舆情要变成可靠的**历史**情绪分需要 NLP 模型且历史覆盖不足，软件不编造分数喂给模型。
 > 板块/行业指数为进一步扩展项（见 AGENTS.md）。所有对齐都用 `merge_asof` 向后取最近已知值，**不泄露未来**。
+
+**数据溯源（可点击跳转真实来源）**：「机器学习内部」页会为当前股票列出所有数据的**真实来源网址**，点击直接
+在浏览器打开——行情/K线(东财个股页)、公司财报F10(东财财务分析)、估值(百度股市通)、主力资金流(东财)、
+大盘沪深300(东财)、个股新闻(东财，含每条新闻真实链接)、公司公告(巨潮资讯官方披露)。所有数据来源公开、可逐一核对。
 
 ### 多周期涨跌预测
 GUI「预测周期」可选 **第二天(1) / 3日 / 一周(5) / 一个月(20) / 三个月(60)**；CLI 用 `--horizon`。
