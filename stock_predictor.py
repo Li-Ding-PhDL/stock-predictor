@@ -416,7 +416,8 @@ class StockDataFetcher:
             try:
                 v = _nsdate(StockDataFetcher._fetch_valuation(code, bypass_proxy))
                 df = pd.merge_asof(df, v, on="date", direction="backward")
-                status["valuation"] = f"已接入(乐咕乐股, {len(v)}行)"
+                vcols = [c for c in v.columns if c != "date"]
+                status["valuation"] = f"已接入({len(v)}行: {'/'.join(vcols)})"
             except Exception as e:
                 status["valuation"] = f"跳过(取数失败: {e})"
         elif want_valuation:
@@ -482,25 +483,51 @@ class StockDataFetcher:
 
     @staticmethod
     def _fetch_valuation(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
-        """真实财报估值(日频)：akshare stock_a_indicator_lg，数据源=乐咕乐股 legulegu.com。
-        字段：pe/pe_ttm/pb/ps/ps_ttm/dv_ratio/dv_ttm/total_mv。取其中有代表性的几项。
-        兼容不同 akshare 版本的函数名(stock_a_indicator_lg / stock_a_lg_indicator)。"""
-        fn = getattr(ak, "stock_a_indicator_lg", None) or getattr(ak, "stock_a_lg_indicator", None)
-        if fn is None:
-            raise RuntimeError("当前 akshare 版本无估值接口(stock_a_indicator_lg)，请升级: pip install -U akshare")
+        """真实财报估值(日频)。优先旧接口 stock_a_indicator_lg(乐咕乐股)；新版 akshare 已移除它，
+        自动改用 stock_zh_valuation_baidu(百度)——逐指标(总市值/市盈率TTM/市净率/市盈率静)取全历史再按日期合并。
+        返回列含 date + val_*(具体哪些取决于哪个接口/指标成功，缺失就没有，绝不造假)。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        fn_lg = getattr(ak, "stock_a_indicator_lg", None) or getattr(ak, "stock_a_lg_indicator", None)
+        # ---- 路径 A：旧乐咕乐股接口(若此 akshare 版本仍有) ----
+        if fn_lg is not None:
+            with ctx:
+                v = StockDataFetcher._retry(lambda: fn_lg(symbol=code))
+            v = v.rename(columns={"trade_date": "date"})
+            v["date"] = pd.to_datetime(v["date"]).astype("datetime64[ns]")
+            keep = {"date": "date", "pe_ttm": "val_pe_ttm", "pb": "val_pb", "ps_ttm": "val_ps_ttm",
+                    "dv_ttm": "val_dv_ttm", "total_mv": "val_total_mv"}
+            cols = [c for c in keep if c in v.columns]
+            v = v[cols].rename(columns=keep)
+            for c in v.columns:
+                if c != "date":
+                    v[c] = pd.to_numeric(v[c], errors="coerce")
+            return v.dropna(subset=["date"]).sort_values("date")
+        # ---- 路径 B：百度个股估值 stock_zh_valuation_baidu(新版 akshare) ----
+        if getattr(ak, "stock_zh_valuation_baidu", None) is None:
+            raise RuntimeError("当前 akshare 无个股估值接口(stock_a_indicator_lg / stock_zh_valuation_baidu)")
+        want = {"总市值": "val_total_mv", "市盈率(TTM)": "val_pe_ttm",
+                "市净率": "val_pb", "市盈率(静)": "val_pe_static"}
+        merged = None
+        # 注意：ctx(_no_proxy) 是"一次性"上下文管理器，必须把整个循环包在一个 with 里，
+        # 不能在循环内反复 with ctx（第二次进入会报错，导致后续指标被误跳过）。
         with ctx:
-            v = StockDataFetcher._retry(lambda: fn(symbol=code))
-        v = v.rename(columns={"trade_date": "date"})
-        v["date"] = pd.to_datetime(v["date"]).astype("datetime64[ns]")
-        keep = {"date": "date", "pe_ttm": "val_pe_ttm", "pb": "val_pb", "ps_ttm": "val_ps_ttm",
-                "dv_ttm": "val_dv_ttm", "total_mv": "val_total_mv"}
-        cols = [c for c in keep if c in v.columns]
-        v = v[cols].rename(columns=keep)
-        for c in v.columns:
-            if c != "date":
-                v[c] = pd.to_numeric(v[c], errors="coerce")
-        return v.dropna(subset=["date"]).sort_values("date")
+            for ind, col in want.items():
+                try:
+                    d = StockDataFetcher._retry(
+                        lambda ind=ind: ak.stock_zh_valuation_baidu(symbol=code, indicator=ind, period="全部"))
+                except Exception:
+                    continue                     # 单个指标失败就跳过，不影响其它指标
+                if d is None or len(d) == 0:
+                    continue
+                date_col = "date" if "date" in d.columns else d.columns[0]
+                val_col = "value" if "value" in d.columns else d.columns[-1]
+                d = d[[date_col, val_col]].rename(columns={date_col: "date", val_col: col})
+                d["date"] = pd.to_datetime(d["date"]).astype("datetime64[ns]")
+                d[col] = pd.to_numeric(d[col], errors="coerce")
+                merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
+        if merged is None or len(merged) == 0:
+            raise RuntimeError("百度估值接口未取到任何指标数据")
+        return merged.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
     @staticmethod
     def _fetch_index(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
@@ -2709,8 +2736,8 @@ if HAS_PYSIDE6:
                 (True, "市场情绪(量价代理)", "由行情计算", "量比、换手率、日内振幅、连涨跌天数、近20日区间位置"),
                 (has("ret_") or has("pos_w") or has("madev_"), "周/月/季 多周期趋势(≈周K/月K线)",
                  "由日线滚动计算(无泄露)", "ret_w1/m1/q1、pos_*、madev_*（1周/1月/1季 涨跌·区间·均线偏离）"),
-                (has("val_"), "财报估值(日频)", f"乐咕乐股 legulegu.com · {enrich_status.get('valuation','')}",
-                 "val_pe_ttm/val_pb/val_ps_ttm/val_dv_ttm/val_total_mv"),
+                (has("val_"), "财报估值(日频)", f"乐咕乐股/百度(自动) · {enrich_status.get('valuation','')}",
+                 "val_pe_ttm / val_pb / val_total_mv 等(实际列见运行日志)"),
                 (has("idx_"), "大盘环境(沪深300)", f"东方财富 · {enrich_status.get('index','')}",
                  "idx_ret_1d、idx_madev20"),
                 (has("mf_"), "主力资金 & 主力意图代理", f"东方财富资金流 · {enrich_status.get('fundflow','')}",
@@ -3033,7 +3060,7 @@ if HAS_PYSIDE6:
             layout = QVBoxLayout(box)
             self.chk_weekly = QCheckBox("周/月/季 多周期趋势特征 (由日线计算，始终开启)")
             self.chk_weekly.setChecked(True); self.chk_weekly.setEnabled(False)
-            self.chk_val = QCheckBox("财报估值：PE/PB/PS/股息率/总市值 (日频 · 乐咕乐股 legulegu.com)")
+            self.chk_val = QCheckBox("财报估值：PE/PB/总市值 (日频 · 乐咕乐股或百度，自动适配)")
             self.chk_val.setChecked(True)
             self.chk_idx = QCheckBox("大盘环境：沪深300 涨跌/均线偏离 (东方财富)")
             self.chk_idx.setChecked(True)
