@@ -2148,6 +2148,9 @@ if HAS_PYSIDE6:
             self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
             self.tabs.addTab(self.log_box, "运行日志")
 
+            # 最后一个标签页：机器学习内部（真实趋势 + 输入来源 + 训练/测试数据集，透明可查）
+            self.tabs.addTab(self._build_mldata_tab(), "机器学习内部")
+
             main_layout.addWidget(self.tabs, stretch=1)
 
         # ---- 9.2.1b 行情 K 线图标签页 ----
@@ -2243,6 +2246,163 @@ if HAS_PYSIDE6:
                 rotation=30, fontsize=8)
             plt.setp(ax_p.get_xticklabels(), visible=False)
             self.kline_canvas.draw()
+
+        # ---- 9.2.1e 机器学习内部（数据透视）标签页 ----
+        def _build_mldata_tab(self) -> QWidget:
+            """
+            把"喂给模型的东西"完全透明化：真实趋势图（并标出训练/测试分界，证明不泄露）、
+            每个输入特征的真实来源（诚实标注哪些已接入、哪些还没接入）、以及最终数据集预览。
+            """
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+
+            top = QHBoxLayout()
+            self.mldata_btn = QPushButton("🔬 生成/刷新 数据透视")
+            self.mldata_btn.setStyleSheet("font-weight:bold; padding:6px;")
+            self.mldata_btn.clicked.connect(self._on_build_mldata)
+            top.addWidget(self.mldata_btn)
+            self.mldata_hint = QLabel("按左侧数据配置(代码/日期/数据源/预测目标)与训练比例，生成本页透视。")
+            self.mldata_hint.setStyleSheet("color:#666;")
+            top.addWidget(self.mldata_hint, stretch=1)
+            layout.addLayout(top)
+
+            split = QSplitter(Qt.Vertical)
+            # 上：真实趋势 + 训练/测试分界
+            self.mldata_figure = Figure(figsize=(8, 3))
+            self.mldata_canvas = FigureCanvas(self.mldata_figure)
+            split.addWidget(self.mldata_canvas)
+            # 中：输入的真实来源说明
+            self.mldata_srcbox = QTextEdit(); self.mldata_srcbox.setReadOnly(True)
+            split.addWidget(self.mldata_srcbox)
+            # 下：数据集预览表
+            self.mldata_table = QTableWidget()
+            split.addWidget(self.mldata_table)
+            split.setSizes([300, 240, 300])
+            layout.addWidget(split, stretch=1)
+            return panel
+
+        def _on_build_mldata(self):
+            try:
+                use_synthetic = self.data_source_combo.currentIndex() == 1
+                if use_synthetic:
+                    df = StockDataFetcher.generate_synthetic_data()
+                    code = "合成数据"
+                else:
+                    code = self.code_edit.text().strip()
+                    start = self.start_date.date().toString("yyyyMMdd")
+                    end = self.end_date.date().toString("yyyyMMdd")
+                    self.mldata_hint.setText(f"正在拉取 {code} 行情 ...")
+                    QApplication.processEvents()
+                    df = StockDataFetcher().fetch(code, start, end)
+
+                target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
+                train_ratio = next(r for r, rb in self.split_radios.items() if rb.isChecked())
+                fe = FeatureEngineer(window_size=20, horizon=1, target_mode=target_mode)
+                X, y, sample_dates = fe.build_supervised_samples(df)
+                if len(X) < 10:
+                    QMessageBox.warning(self, "提示", "样本太少，无法透视，请拉长日期区间。")
+                    return
+                split_idx = int(len(X) * train_ratio)
+
+                self._draw_mldata_trend(code, sample_dates, fe.close_target_, split_idx, target_mode)
+                self._fill_mldata_source(fe, target_mode, len(X), split_idx)
+                self._fill_mldata_table(fe, y, sample_dates, split_idx, target_mode)
+                self.mldata_hint.setText(
+                    f"{code}：共 {len(X)} 条样本，训练 {split_idx} / 测试 {len(X)-split_idx}，"
+                    f"分界日期 {pd.to_datetime(sample_dates.iloc[split_idx]).strftime('%Y-%m-%d')}。")
+            except Exception as e:
+                QMessageBox.critical(self, "数据透视失败", str(e))
+                self.mldata_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
+
+        def _draw_mldata_trend(self, code, sample_dates, close_target, split_idx, target_mode):
+            self.mldata_figure.clear()
+            ax = self.mldata_figure.add_subplot(111)
+            x = np.arange(len(close_target))
+            ax.plot(x, close_target, color="#333", linewidth=1.0, label="真实收盘价")
+            # 训练区(蓝)/测试区(橙)背景，直观证明"训练在前、测试在后，不泄露"
+            ax.axvspan(0, split_idx, color="#4a90d9", alpha=0.10)
+            ax.axvspan(split_idx, len(x), color="#e08a2c", alpha=0.12)
+            ax.axvline(split_idx, color="#c0392b", linestyle="--", linewidth=1.2)
+            ax.text(split_idx / 2, ax.get_ylim()[1], "训练集", ha="center", va="top",
+                    color="#2c6fbb", fontsize=10)
+            ax.text((split_idx + len(x)) / 2, ax.get_ylim()[1], "测试集", ha="center", va="top",
+                    color="#d35400", fontsize=10)
+            idx = np.linspace(0, len(x) - 1, min(8, len(x))).astype(int)
+            ax.set_xticks(x[idx])
+            ax.set_xticklabels([pd.to_datetime(sample_dates.iloc[i]).strftime("%y-%m-%d") for i in idx],
+                               rotation=30, fontsize=8)
+            ax.set_ylabel("收盘价")
+            ax.set_title(f"{code} 真实趋势与训练/测试划分（预测目标：{'涨跌幅' if target_mode=='return' else '价格'}）")
+            ax.grid(True, alpha=0.25)
+            self.mldata_figure.tight_layout()
+            self.mldata_canvas.draw()
+
+        def _fill_mldata_source(self, fe, target_mode, n_samples, split_idx):
+            cols = list(getattr(fe, "feature_cols", []))
+            n_feat = len(cols)
+            # 已接入（当前真实使用）的输入，按来源分组
+            groups = [
+                ("原始行情(日线)", "数据源直接给出", "open/close/high/low/volume/amount 等"),
+                ("均线趋势", "由收盘价计算", "MA5/10/20/60、EMA、MACD"),
+                ("超买超卖/通道", "由行情计算", "RSI14、布林带、KDJ"),
+                ("量能", "由成交量计算", "volume_ma5、volume_change"),
+                ("动量/波动", "由收益率计算", "return_1d、volatility_10d"),
+                ("市场情绪(量价代理)", "由行情计算", "量比 vol_ratio、换手率、日内振幅、连涨跌天数、近20日区间位置"),
+            ]
+            rows_ok = "".join(
+                f"<tr><td>✅ {g}</td><td>{src}</td><td>{ex}</td></tr>" for g, src, ex in groups)
+            # 诚实标注：用户期望但当前"尚未接入"的输入（需要额外数据源，不臆造）
+            todo = [
+                ("周K线 / 月K线", "需对日线重采样(resample W/M)后并入特征"),
+                ("财报基本面(PE/PB/ROE/营收)", "需财报数据源，如 akshare stock_financial_* / baostock 季频数据"),
+                ("新闻 / 舆情情绪", "需新闻/股吧文本 + NLP 情感打分（务必真抓，不编造分数）"),
+                ("板块 / 行业", "需行业分类与板块指数数据"),
+            ]
+            rows_todo = "".join(
+                f"<tr><td>⛔ {g}</td><td>{how}</td></tr>" for g, how in todo)
+            html = f"""
+            <h3>输入的真实来源（当前共 {n_feat} 个特征 × 窗口20天 = 每条样本 {n_feat*20} 维）</h3>
+            <p><b>已接入（模型真的在用）：</b></p>
+            <table border=1 cellpadding=4 cellspacing=0 width=100%>
+              <tr bgcolor=#eef><th>输入类别</th><th>来源</th><th>具体特征</th></tr>{rows_ok}
+            </table>
+            <p><b>你期望、但当前<span style="color:#c0392b">尚未接入</span>（需外部数据源，软件不臆造）：</b></p>
+            <table border=1 cellpadding=4 cellspacing=0 width=100%>
+              <tr bgcolor=#fee><th>期望输入</th><th>接入方式（可作为后续扩展）</th></tr>{rows_todo}
+            </table>
+            <p style="color:#2c6fbb"><b>为什么不会泄露未来数据：</b>
+            ① 所有特征只用"当天及以前"的信息计算；
+            ② 严格按时间顺序切分——训练集在前 {split_idx} 条、测试集在后 {n_samples-split_idx} 条，绝不打乱；
+            ③ 标准化器只在训练集上 fit，再套用到测试集。</p>
+            """
+            self.mldata_srcbox.setHtml(html)
+
+        def _fill_mldata_table(self, fe, y, sample_dates, split_idx, target_mode):
+            n = len(y)
+            tgt_label = "目标(涨跌幅%)" if target_mode == "return" else "目标(收盘价)"
+            headers = ["序号", "目标日期", "基准日收盘", tgt_label, "所属集合"]
+            self.mldata_table.setColumnCount(len(headers))
+            self.mldata_table.setHorizontalHeaderLabels(headers)
+            # 样本可能上千条：为流畅只展示前 60 + 后 60，并在中间放一行省略提示
+            if n <= 130:
+                show_idx = list(range(n))
+            else:
+                show_idx = list(range(60)) + [-1] + list(range(n - 60, n))
+            self.mldata_table.setRowCount(len(show_idx))
+            for row, i in enumerate(show_idx):
+                if i == -1:
+                    self.mldata_table.setItem(row, 0, QTableWidgetItem("..."))
+                    for c in range(1, len(headers)):
+                        self.mldata_table.setItem(row, c, QTableWidgetItem("..."))
+                    continue
+                d = pd.to_datetime(sample_dates.iloc[i]).strftime("%Y-%m-%d")
+                pc = fe.prev_close_[i]
+                tv = (y[i] * 100) if target_mode == "return" else y[i]
+                grp = "训练集" if i < split_idx else "测试集"
+                vals = [str(i), d, f"{pc:.2f}", f"{tv:.3f}", grp]
+                for c, v in enumerate(vals):
+                    self.mldata_table.setItem(row, c, QTableWidgetItem(v))
+            self.mldata_table.resizeColumnsToContents()
 
         # ---- 9.2.2 数据配置区 ----
         def _build_data_group(self) -> QGroupBox:
