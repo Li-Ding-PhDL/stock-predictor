@@ -2698,14 +2698,20 @@ if HAS_PYSIDE6:
             self.mldata_figure = Figure(figsize=(8, 3))
             self.mldata_canvas = FigureCanvas(self.mldata_figure)
             split.addWidget(self.mldata_canvas)
-            # 中：输入的真实来源说明
+            # 中：输入的真实来源说明 + 溯源链接
             self.mldata_srcbox = QTextBrowser()             # QTextBrowser 支持点击超链接
             self.mldata_srcbox.setOpenExternalLinks(True)   # 让 <a href> 链接在系统浏览器打开
             split.addWidget(self.mldata_srcbox)
-            # 下：数据集预览表
+            # 下：左右分栏 —— 左=各来源"分析后的信息"(真实最新值+新闻)，右=数据集预览表
+            bottom = QSplitter(Qt.Horizontal)
+            self.mldata_analysis = QTextBrowser()
+            self.mldata_analysis.setOpenExternalLinks(True)
+            bottom.addWidget(self.mldata_analysis)
             self.mldata_table = QTableWidget()
-            split.addWidget(self.mldata_table)
-            split.setSizes([300, 240, 300])
+            bottom.addWidget(self.mldata_table)
+            bottom.setSizes([560, 460])
+            split.addWidget(bottom)
+            split.setSizes([280, 230, 340])
             layout.addWidget(split, stretch=1)
             return panel
 
@@ -2744,8 +2750,9 @@ if HAS_PYSIDE6:
                 a = int(len(X) * train_ratio)              # 训练/验证/测试三分切点，与真实训练一致
                 b = a + (len(X) - a) // 2
                 self._draw_mldata_trend(code, sample_dates, fe.close_target_, a, b, target_mode)
-                self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, news,
+                self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, None,
                                          code if not use_synthetic else "")
+                self._fill_mldata_analysis(df, code if not use_synthetic else "", enrich_status, news)
                 self._fill_mldata_table(fe, y, sample_dates, a, b, target_mode)
                 self.mldata_hint.setText(
                     f"{code}：预测周期 {horizon}日；共 {len(X)} 条样本 = 训练 {a} / 验证 {b-a} / 测试 {len(X)-b}。"
@@ -2849,9 +2856,8 @@ if HAS_PYSIDE6:
                              "为避免臆造，本软件不把编造的情绪分喂给模型。</p>"
                              f"<ul>{''.join(items)}</ul>")
             else:
-                ns = enrich_status.get("news", "未获取")
-                news_html = (f"<p><b>个股新闻：</b>{ns}。真实来源=东方财富 stock_news_em；"
-                             "仅展示、不作历史训练特征(避免臆造情绪分)。</p>")
+                news_html = ("<p><b>个股新闻：</b>真实标题+链接见右下「各来源数据分析速览」面板；"
+                             "真实来源=东方财富 stock_news_em；仅展示、不作历史训练特征(避免臆造情绪分)。</p>")
 
             html = f"""
             <h3>输入的真实来源（当前共 {n_feat} 个特征 × 窗口20天 = 每条样本 {n_feat*20} 维）</h3>
@@ -2873,6 +2879,87 @@ if HAS_PYSIDE6:
             ③ 验证集为<b>独立留出</b>(不参与训练/测试/寻优)；标准化器只在训练集上 fit，再套用到验证/测试集。</p>
             """
             self.mldata_srcbox.setHtml(html)
+
+        def _fill_mldata_analysis(self, df, code, enrich_status=None, news=None):
+            """各来源"分析后的信息"：从真实数据里算出每个来源的最新值/近况(不预测、不臆造)。"""
+            enrich_status = enrich_status or {}
+
+            def _money(v):
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    return "-"
+                if abs(v) >= 1e8:
+                    return f"{v/1e8:.2f} 亿"
+                return f"{v/1e4:.0f} 万"
+
+            def _last(col):
+                if col in df.columns:
+                    s = pd.to_numeric(df[col], errors="coerce").dropna()
+                    if len(s):
+                        return float(s.iloc[-1])
+                return None
+
+            secs = []
+            # ---- 行情速览（一定有）----
+            close = pd.to_numeric(df["close"], errors="coerce")
+            lc = float(close.iloc[-1]); ld = pd.to_datetime(df["date"].iloc[-1]).strftime("%Y-%m-%d")
+            def _chg(w):
+                return (lc / float(close.iloc[-1-w]) - 1) * 100 if len(close) > w else float("nan")
+            vol20 = close.pct_change().tail(20).std() * 100
+            ma20 = close.tail(20).mean()
+            secs.append(
+                "<b>📈 行情/K线：</b>最新收盘 <b>{:.2f}</b> 元（{}）；近1周 {:+.2f}%、近1月 {:+.2f}%、"
+                "近1季 {:+.2f}%；近20日波动率 {:.2f}%；{}20日均线({:.2f})。".format(
+                    lc, ld, _chg(5), _chg(20), _chg(60), vol20,
+                    "站上" if lc >= ma20 else "跌破", ma20))
+            # ---- 财报估值 ----
+            pe, pb, mv = _last("val_pe_ttm"), _last("val_pb"), _last("val_total_mv")
+            if any(v is not None for v in (pe, pb, mv)):
+                parts = []
+                if pe is not None: parts.append(f"PE(TTM) {pe:.1f}" if pe > 0 else "PE(TTM) 亏损/无")
+                if pb is not None: parts.append(f"PB {pb:.2f}")
+                if mv is not None: parts.append(f"总市值 {_money(mv)}元")
+                secs.append("<b>💰 财报估值：</b>" + "；".join(parts) +
+                            "　<span style='color:#888'>（乐咕乐股/百度）</span>")
+            elif enrich_status.get("valuation"):
+                secs.append(f"<b>💰 财报估值：</b>{enrich_status['valuation']}")
+            # ---- 主力资金 ----
+            mf = _last("mf_main_net")
+            if mf is not None:
+                mfs = pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0.0)
+                cum5 = mfs.tail(5).sum()
+                sgn = np.sign(mfs.to_numpy())
+                streak = 1
+                for k in range(len(sgn) - 2, -1, -1):
+                    if sgn[k] == sgn[-1] and sgn[-1] != 0:
+                        streak += 1
+                    else:
+                        break
+                trend = "连续净流入" if sgn[-1] > 0 else ("连续净流出" if sgn[-1] < 0 else "持平")
+                secs.append(
+                    f"<b>🏦 主力资金：</b>最新主力净流入 <b>{_money(mf)}</b>元；近5日累计 {_money(cum5)}元；"
+                    f"{trend} {streak} 天。<span style='color:#888'>（东方财富）</span>")
+            elif enrich_status.get("fundflow"):
+                secs.append(f"<b>🏦 主力资金：</b>{enrich_status['fundflow']}")
+            # ---- 大盘环境 ----
+            idxr = _last("idx_ret_1d")
+            if idxr is not None:
+                secs.append(f"<b>🌐 大盘环境：</b>沪深300 最新日涨跌 {idxr*100:+.2f}%。"
+                            "<span style='color:#888'>（东方财富）</span>")
+            # ---- 新闻（真实标题+链接）----
+            if news is not None and len(news) > 0:
+                items = "".join(
+                    f"<li>{str(r.get('time',''))}　<a href='{r.get('url','')}'>{r.get('title','')}</a></li>"
+                    for _, r in news.head(6).iterrows())
+                secs.append("<b>📰 最近新闻（东方财富·点击可看原文）：</b><ul>" + items + "</ul>")
+            elif enrich_status.get("news"):
+                secs.append(f"<b>📰 新闻：</b>{enrich_status['news']}")
+
+            head = (f"<h3>各来源数据分析速览（{code or '合成数据'}）</h3>"
+                    "<p style='color:#888'>以下均为<b>真实数据的最新值/近况</b>，不是预测、不臆造；"
+                    "点新闻链接可看原文。</p>")
+            self.mldata_analysis.setHtml(head + "".join(f"<p>{s}</p>" for s in secs))
 
         def _fill_mldata_table(self, fe, y, sample_dates, a, b, target_mode):
             n = len(y)
