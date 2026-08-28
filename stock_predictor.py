@@ -199,6 +199,9 @@ CACHE_DIR = os.path.join(BASE_DIR, "data_cache")      # 行情数据本地缓存
 os.makedirs(CACHE_DIR, exist_ok=True)
 MONITOR_DIR = os.path.join(BASE_DIR, "monitor_log")   # 实时监控的盘口快照记录目录（自采集真实数据）
 os.makedirs(MONITOR_DIR, exist_ok=True)
+PRED_DIR = os.path.join(BASE_DIR, "predictions")      # 预测跟踪：保存每次预测，等日期到了对比真实股价
+os.makedirs(PRED_DIR, exist_ok=True)
+PRED_LOG = os.path.join(PRED_DIR, "pred_log.csv")
 
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
@@ -2679,6 +2682,99 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
     return rows
 
 
+# ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
+PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "base_date", "base_close",
+             "pred_close", "pred_change_pct", "pred_dir", "target_date",
+             "status", "actual_close", "actual_change_pct", "hit_dir", "verified_at"]
+
+
+def load_pred_log() -> pd.DataFrame:
+    if os.path.exists(PRED_LOG):
+        try:
+            return pd.read_csv(PRED_LOG, dtype=str).fillna("")
+        except Exception:
+            pass
+    return pd.DataFrame(columns=PRED_COLS)
+
+
+def save_predictions(rows: List[Dict[str, Any]]) -> int:
+    """把若干条新预测追加进日志(去重：同 code+model+horizon+base_date 只留最新)。返回新增条数。"""
+    df = load_pred_log()
+    add = pd.DataFrame(rows)
+    for c in PRED_COLS:
+        if c not in add.columns:
+            add[c] = ""
+    df = pd.concat([df, add[PRED_COLS]], ignore_index=True)
+    df = df.drop_duplicates(subset=["code", "model", "horizon", "base_date"], keep="last")
+    df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
+    return len(add)
+
+
+def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> int:
+    """对所有"到期(target_date<=今天)但未验证"的预测，拉真实股价对比，回填实际涨跌与是否命中方向。
+    返回本次新验证的条数。全部基于真实历史行情，绝不臆造。"""
+    log = progress_cb or (lambda m: None)
+    df = load_pred_log()
+    if len(df) == 0:
+        return 0
+    today = dt.date.today().strftime("%Y-%m-%d")
+    pend = df[(df["status"] != "verified") & (df["target_date"] <= today) & (df["target_date"] != "")]
+    if len(pend) == 0:
+        return 0
+    n_ok = 0
+    for code in pend["code"].unique():
+        try:
+            end = dt.date.today().strftime("%Y%m%d")
+            hist = StockDataFetcher().fetch(code, "20190101", end, use_cache=False)
+            hist = hist[["date", "close"]].copy()
+            hist["date"] = pd.to_datetime(hist["date"])
+        except Exception as e:
+            log(f"[验证] {code} 取真实行情失败: {e}")
+            continue
+        for idx in pend[pend["code"] == code].index:
+            try:
+                tgt = pd.to_datetime(df.at[idx, "target_date"])
+                after = hist[hist["date"] >= tgt]
+                if len(after) == 0:
+                    continue                       # 目标日之后还没有真实数据
+                actual = float(after["close"].iloc[0])
+                base = float(df.at[idx, "base_close"])
+                chg = (actual / base - 1) * 100
+                pred_dir = df.at[idx, "pred_dir"]
+                actual_dir = "涨" if actual >= base else "跌"
+                # 注意：日志以 str 载入(pyarrow str 列拒绝写入 float)，回填一律转成字符串
+                df.at[idx, "actual_close"] = str(round(actual, 4))
+                df.at[idx, "actual_change_pct"] = str(round(chg, 3))
+                df.at[idx, "hit_dir"] = "1" if pred_dir == actual_dir else "0"
+                df.at[idx, "status"] = "verified"
+                df.at[idx, "verified_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+                n_ok += 1
+            except Exception:
+                continue
+    df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
+    return n_ok
+
+
+def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
+    """按预测周期统计**真实**方向准确率(只用已验证的记录)。返回 {周期标签: {n, dir_acc, mae_ret}}。"""
+    df = load_pred_log()
+    v = df[df["status"] == "verified"].copy()
+    label = {"1": "每天(1日)", "3": "三天", "5": "每周(5日)", "20": "每月(20日)", "60": "每季(60日)"}
+    out = {}
+    if len(v) == 0:
+        return out
+    v["hit_dir"] = pd.to_numeric(v["hit_dir"], errors="coerce")
+    v["ae"] = (pd.to_numeric(v["pred_change_pct"], errors="coerce") -
+               pd.to_numeric(v["actual_change_pct"], errors="coerce")).abs()
+    for hz, g in v.groupby("horizon"):
+        out[label.get(str(hz), f"{hz}日")] = {
+            "n": int(len(g)),
+            "dir_acc": round(float(g["hit_dir"].mean() * 100), 1),
+            "mae_ret": round(float(g["ae"].mean()), 2),
+        }
+    return out
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -2841,6 +2937,9 @@ if HAS_PYSIDE6:
 
             # 实时监控：交易时段定时刷新真实盘口 + 预测参考
             self.tabs.addTab(self._build_monitor_tab(), "实时监控")
+
+            # 预测跟踪：保存每次预测，等日期到了对比真实股价，算真实准确率
+            self.tabs.addTab(self._build_tracking_tab(), "预测跟踪")
 
             # 批量扫描：多股批量 取数→训练→预测→风险
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
@@ -3709,6 +3808,122 @@ if HAS_PYSIDE6:
                 QMessageBox.information(self, "导出成功", f"已导出：\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", str(e))
+
+        # ---- 9.2.1i 预测跟踪标签页（存预测→到期对比真实→算真实准确率） ----
+        def _build_tracking_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("模型:"))
+            self.trk_model_combo = QComboBox()
+            self.trk_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
+            self.trk_model_combo.setCurrentText("Lasso")
+            top.addWidget(self.trk_model_combo)
+            b1 = QPushButton("📌 记录当前预测(1/3/5/20/60日)")
+            b1.setStyleSheet("font-weight:bold; padding:6px;")
+            b1.clicked.connect(self._on_record_prediction)
+            top.addWidget(b1)
+            b2 = QPushButton("🔄 验证并刷新(对比真实股价)")
+            b2.setStyleSheet("font-weight:bold; padding:6px; background:#2c6fbb; color:white;")
+            b2.clicked.connect(self._on_verify_predictions)
+            top.addWidget(b2)
+            top.addStretch()
+            layout.addLayout(top)
+            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(150)
+            layout.addWidget(self.trk_summary)
+            self.trk_table = QTableWidget()
+            layout.addWidget(self.trk_table, stretch=1)
+            self._refresh_tracking()
+            return panel
+
+        def _on_record_prediction(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "预测跟踪需真实数据(合成数据无意义)。请把数据源切到真实数据。")
+                return
+            code = self.code_edit.text().strip()
+            model = self.trk_model_combo.currentText()
+            target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
+            try:
+                self.trk_summary.setHtml(f"<p>正在用 {model} 为 {code} 生成 1/3/5/20/60 日预测并记录 ...</p>")
+                QApplication.processEvents()
+                df = StockDataFetcher().fetch(code, self.start_date.date().toString("yyyyMMdd"),
+                                              self.end_date.date().toString("yyyyMMdd"))
+                if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
+                    df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
+                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                name = StockDataFetcher.fetch_stock_name(code)
+                fc = forecast_curve(model, df, target_mode=target_mode,
+                                    horizons=(1, 3, 5, 20, 60), progress_cb=self._log)
+                base_date = fc["last_date"]; base_close = fc["last_close"]
+                rows = []
+                for p in fc["points"]:
+                    if "pred_close" not in p:
+                        continue
+                    h = p["horizon"]
+                    tgt = (pd.to_datetime(base_date) + pd.tseries.offsets.BDay(h)).strftime("%Y-%m-%d")
+                    rows.append({
+                        "id": f"{code}_{model}_{h}_{base_date}",
+                        "made_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "code": code, "name": name, "model": model, "horizon": h,
+                        "base_date": base_date, "base_close": base_close,
+                        "pred_close": p["pred_close"], "pred_change_pct": p["change_pct"],
+                        "pred_dir": "涨" if p["pred_close"] >= base_close else "跌",
+                        "target_date": tgt, "status": "pending"})
+                save_predictions(rows)
+                self._oplog(f"记录预测：{code} {model}，{len(rows)} 个周期。")
+                self._refresh_tracking()
+                QMessageBox.information(self, "已记录",
+                                       f"已记录 {len(rows)} 条预测(基准日 {base_date})。\n"
+                                       "等目标日期到了，点「验证并刷新」用真实股价对比，即得真实准确率。")
+            except Exception as e:
+                QMessageBox.critical(self, "记录失败", str(e))
+
+        def _on_verify_predictions(self):
+            try:
+                n = verify_predictions(progress_cb=self._log)
+                self._oplog(f"验证预测：新对比真实股价 {n} 条。")
+                self._refresh_tracking()
+                QMessageBox.information(self, "验证完成",
+                                       f"本次新验证 {n} 条(目标日期已到、拉真实股价对比)。\n"
+                                       "未到期的显示「待验证」，到期后再来验证即可。")
+            except Exception as e:
+                QMessageBox.critical(self, "验证失败", str(e))
+
+        def _refresh_tracking(self):
+            # 顶部：真实准确率(仅已验证)
+            acc = prediction_accuracy()
+            if acc:
+                rows = "".join(f"<tr><td>{k}</td><td>{v['n']}</td>"
+                               f"<td><b>{v['dir_acc']}%</b></td><td>{v['mae_ret']}%</td></tr>"
+                               for k, v in acc.items())
+                html = ("<h3>真实预测准确率（仅统计已到期、已用真实股价验证的记录）</h3>"
+                        "<table border=1 cellpadding=3 cellspacing=0>"
+                        "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th><th>涨跌幅平均误差</th></tr>"
+                        f"{rows}</table>"
+                        "<p style='color:#c0392b'>方向准确率需明显>50%才有意义；样本少时仅供参考，不构成投资建议。</p>")
+            else:
+                html = ("<h3>真实预测准确率</h3><p style='color:#888'>还没有已验证的预测。"
+                        "先「记录当前预测」，等目标日期到了再「验证并刷新」——这样得到的才是<b>真实的未来对比</b>，"
+                        "不是回测假象。</p>")
+            self.trk_summary.setHtml(html)
+            # 下：预测明细表
+            df = load_pred_log()
+            cols = ["made_at", "code", "name", "model", "horizon", "base_date", "base_close",
+                    "pred_close", "pred_change_pct", "pred_dir", "target_date", "status",
+                    "actual_close", "actual_change_pct", "hit_dir"]
+            heads = ["记录时间", "代码", "名称", "模型", "周期", "基准日", "基准价", "预测价",
+                     "预测涨跌%", "方向", "目标日", "状态", "实际价", "实际涨跌%", "命中"]
+            self.trk_table.setColumnCount(len(cols))
+            self.trk_table.setHorizontalHeaderLabels(heads)
+            df = df.tail(300).reset_index(drop=True) if len(df) else df
+            self.trk_table.setRowCount(len(df))
+            for i in range(len(df)):
+                for j, c in enumerate(cols):
+                    val = str(df.at[i, c]) if c in df.columns else ""
+                    if c == "hit_dir":
+                        val = "✓命中" if val == "1" else ("✗未中" if val == "0" else "-")
+                    self.trk_table.setItem(i, j, QTableWidgetItem(val))
+            self.trk_table.resizeColumnsToContents()
 
         # ---- 9.2.1f 策略回测标签页 ----
         def _build_backtest_tab(self) -> QWidget:

@@ -24,3 +24,6 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- 预测跟踪日志（本地记录，不入库）----
+predictions/
