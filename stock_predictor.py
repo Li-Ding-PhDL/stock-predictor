@@ -2145,6 +2145,7 @@ class ModelResult:
     prev_close: Optional[np.ndarray] = None  # 每个测试样本的"基准日收盘价"，供方向性收益回测使用
     metrics_train: Optional[Dict[str, float]] = None  # 训练集误差（看是否过拟合）
     metrics_val: Optional[Dict[str, float]] = None    # 独立验证集误差（不参与训练/测试/寻优）
+    feature_importance: Optional[List[Tuple[str, float]]] = None  # 模型最看重的输入(按重要性排序)
 
 
 @dataclass
@@ -2234,6 +2235,25 @@ class TrainingPipeline:
             close_train=ct[:a], close_val=ct[a:b], close_test=ct[b:],
         )
 
+    def _feature_importance(self, model, topn: int = 8):
+        """取模型对各输入特征的重要性(按原始特征聚合窗口内各天)。树模型用 feature_importances_、
+        线性模型用 |系数|；其余(SVR-rbf/深度学习)无标准重要性则返回 None。返回 [(特征名, 占比%)]。"""
+        est = getattr(model, "model", None)
+        imp = None
+        if est is not None:
+            if hasattr(est, "feature_importances_"):
+                imp = np.asarray(est.feature_importances_, dtype=float).ravel()
+            elif hasattr(est, "coef_"):
+                imp = np.abs(np.asarray(est.coef_, dtype=float)).ravel()
+        feats = list(getattr(self.fe, "feature_cols", []))
+        n = len(feats)
+        if imp is None or n == 0 or len(imp) != n * self.config.window_size:
+            return None
+        agg = imp.reshape(self.config.window_size, n).sum(axis=0)   # 按原始特征聚合窗口内各天
+        total = float(agg.sum()) + 1e-12
+        order = np.argsort(agg)[::-1][:topn]
+        return [(feats[i], round(float(agg[i] / total * 100), 2)) for i in order if agg[i] > 0]
+
     def _eval(self, model, X, prev_close, close_true) -> Dict[str, float]:
         """在给定数据集上评估模型：预测→还原价格→算价格类+方向类指标(统一价格口径)。"""
         if X is None or len(X) == 0:
@@ -2298,7 +2318,8 @@ class TrainingPipeline:
                                 y_test_pred=pred_price, test_dates=pdata.d_test,
                                 cv_metrics=cv_metrics, formula=formula,
                                 prev_close=pdata.prev_close_test,
-                                metrics_train=metrics_train, metrics_val=metrics_val)
+                                metrics_train=metrics_train, metrics_val=metrics_val,
+                                feature_importance=self._feature_importance(model))
         except Exception as e:
             log(f"[{algo_name}] 训练失败：{e}")
             return ModelResult(algo_name=algo_name, metrics={}, y_test_true=close_test,
@@ -2791,8 +2812,16 @@ if HAS_PYSIDE6:
             # 未来预测走势图（多周期直接预测：1日/1周/1月/3月），可缩放看每日价格
             self.tabs.addTab(self._build_forecast_tab(), "未来预测图")
 
+            result_panel = QWidget()
+            rp_layout = QVBoxLayout(result_panel)
+            self.reco_view = QTextBrowser()          # 顶部：模型推荐 + 预测依据
+            self.reco_view.setOpenExternalLinks(True)
+            self.reco_view.setMaximumHeight(260)
+            self.reco_view.setHtml("<p style='color:#888'>运行模型后，这里给出<b>基于真实DA的模型推荐</b>与<b>预测依据</b>。</p>")
+            rp_layout.addWidget(self.reco_view)
             self.result_table = QTableWidget()
-            self.tabs.addTab(self.result_table, "指标结果表格")
+            rp_layout.addWidget(self.result_table, stretch=1)
+            self.tabs.addTab(result_panel, "指标结果表格")
 
             # 策略回测：按预测方向做多/空仓，扣手续费，和买入持有对比
             self.tabs.addTab(self._build_backtest_tab(), "策略回测")
@@ -3344,6 +3373,9 @@ if HAS_PYSIDE6:
             # 风险提示优先级最高 —— 放最前
             if getattr(self, "_html_risk", ""):
                 parts.append("<h2>⚠️ 风险提示</h2>" + self._html_risk)
+            # 模型推荐与预测依据
+            if getattr(self, "_html_reco", ""):
+                parts.append("<h2>🎯 模型推荐与预测依据</h2>" + self._html_reco)
             # 图表（原样内嵌，优先级高）
             for title, fig in [
                 ("行情 K 线图", getattr(self, "kline_figure", None)),
@@ -4104,8 +4136,91 @@ if HAS_PYSIDE6:
             self.bt_model_combo.clear()
             self.bt_model_combo.addItems([r.algo_name for r in results if not r.error])
             ok = sum(1 for r in results if not r.error)
+            self._html_reco = self._build_recommendation_html(results)   # 供报告复用
+            self.reco_view.setHtml(self._html_reco)
             self._oplog(f"训练完成：{ok} 个模型成功；结果见「指标结果表格」(每格=训练/验证/测试)。")
             self.tabs.setCurrentIndex(2)          # 直接跳到「指标结果表格」看误差对比
+
+        # 常见特征的中文可读名（找不到就用原名）
+        _FEATURE_LABELS = {
+            "close": "收盘价", "open": "开盘", "high": "最高", "low": "最低", "volume": "成交量",
+            "amount": "成交额", "turnover": "换手率", "ma5": "5日均线", "ma10": "10日均线",
+            "ma20": "20日均线", "ma60": "60日均线", "macd_dif": "MACD-DIF", "macd_dea": "MACD-DEA",
+            "macd_hist": "MACD柱", "rsi14": "RSI", "kdj_k": "KDJ-K", "kdj_d": "KDJ-D", "kdj_j": "KDJ-J",
+            "boll_upper": "布林上轨", "boll_lower": "布林下轨", "return_1d": "日收益率",
+            "volatility_10d": "10日波动率", "vol_ratio": "量比", "amplitude_feat": "日内振幅",
+            "updown_streak": "连涨跌天数", "pos_in_range20": "20日区间位置",
+            "ret_w1": "周涨跌", "ret_m1": "月涨跌", "ret_q1": "季涨跌",
+            "val_pe_ttm": "市盈率TTM", "val_pb": "市净率", "val_total_mv": "总市值",
+            "idx_ret_1d": "沪深300涨跌", "idx_madev20": "大盘均线偏离",
+            "mf_main_net": "主力净流入", "mf_main_pct": "主力净占比", "mf_xl_net": "超大单净额",
+            "mf_l_net": "大单净额", "mf_streak": "主力连续进出天数", "mf_cum5": "主力5日累计",
+            "mf_price_div": "资金-价格背离",
+        }
+
+        def _build_recommendation_html(self, results):
+            base = next((r for r in results if r.algo_name == "总是涨(方向基准)"), None)
+            up_rate = base.metrics.get("DA") if (base and base.metrics) else None
+            models = [r for r in results if not r.error
+                      and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)") and r.metrics]
+            if not models:
+                return "<p>没有成功训练的模型。</p>"
+            best = max(models, key=lambda r: (r.metrics.get("DA") or 0))
+            da = best.metrics.get("DA"); up_p = best.metrics.get("UP_P")
+            # 判定：DA 要明显高于"总是涨"基准(+3%)且>52%，才推荐；否则诚实劝退
+            good = (up_rate is not None and da is not None and da >= up_rate + 3.0 and da >= 52.0)
+            if good:
+                verdict = (f"<div style='background:#f2fbf2;border:2px solid #1e8449;padding:8px'>"
+                           f"<b style='color:#1e8449'>🎯 建议用 {best.algo_name} 做本次预测</b>　"
+                           f"（测试方向准确率 DA <b>{da}%</b>，明显高于「总是涨」基准 {up_rate}%；"
+                           f"预测上涨时的精确率 UP_P {up_p}%）。仍仅供参考，不构成投资建议。</div>")
+            else:
+                verdict = (f"<div style='background:#fff4f4;border:2px solid #c0392b;padding:8px'>"
+                           f"<b style='color:#c0392b'>⚠️ 本次没有模型明显优于「总是涨」基准</b>"
+                           f"（基准 {up_rate}%，最高的 {best.algo_name} 也只有 {da}%）——"
+                           f"<b>不建议据此预测，别信任何单一预测。</b>换股票/换周期/多试几个模型再看。</div>")
+            # 预测依据①：模型最看重的真实输入
+            fi = best.feature_importance
+            if fi:
+                lab = lambda k: self._FEATURE_LABELS.get(k, k)
+                imp = "、".join(f"{lab(k)} {v}%" for k, v in fi[:6])
+                why1 = (f"<p><b>📌 {best.algo_name} 最看重的输入（占比）：</b>{imp}。"
+                        "<span style='color:#888'>这是模型<b>依据</b>的输入，不是涨跌的真正原因——"
+                        "市场多因素驱动，无法单一归因。</span></p>")
+            else:
+                why1 = ("<p><b>📌 预测依据：</b>该模型(如 SVR-rbf / 深度学习)无标准特征重要性，"
+                        "无法给出输入权重；想看依据可用 <b>RF / Lasso / XGBoost</b> 等模型。</p>")
+            # 预测依据②：当前真实数据现状 + 来源
+            why2 = self._data_context_html()
+            return verdict + why1 + why2
+
+        def _data_context_html(self):
+            df = getattr(self, "raw_df", None)
+            if df is None or "close" not in df.columns:
+                return ""
+            code = self.code_edit.text().strip()
+            def last(col):
+                if col in df.columns:
+                    s = pd.to_numeric(df[col], errors="coerce").dropna()
+                    return float(s.iloc[-1]) if len(s) else None
+                return None
+            bits = []
+            close = pd.to_numeric(df["close"], errors="coerce")
+            if len(close) > 21:
+                bits.append(f"近1月涨跌 {close.iloc[-1]/close.iloc[-21]*100-100:+.1f}%")
+            pe, mf, idxr = last("val_pe_ttm"), last("mf_main_net"), last("idx_ret_1d")
+            if pe is not None:
+                bits.append(f"市盈率TTM {pe:.1f}" if pe > 0 else "市盈率 亏损")
+            if mf is not None:
+                bits.append(f"最新主力净流入 {mf/1e4:.0f}万" + ("(流入)" if mf >= 0 else "(流出)"))
+            if idxr is not None:
+                bits.append(f"沪深300最新 {idxr*100:+.2f}%")
+            if not bits:
+                return ""
+            links = self._source_links_html(code) if code else ""
+            return (f"<p><b>📊 当前真实数据现状（模型环境）：</b>" + "；".join(bits) +
+                    "。<span style='color:#888'>数据来源见下方溯源链接，可逐一核对。</span></p>" +
+                    ("<details><summary>展开数据溯源链接</summary>" + links + "</details>" if links else ""))
 
         def _on_training_error(self, msg: str):
             self.progress_bar.hide()
