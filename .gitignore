@@ -2,6 +2,9 @@
 data_cache/
 *.parquet
 
+# ---- 实时监控自采集的盘口快照（本地数据，不入库）----
+monitor_log/
+
 # ---- 运行产物 ----
 out*.json
 *.png

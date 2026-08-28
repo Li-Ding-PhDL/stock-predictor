@@ -197,6 +197,8 @@ except ImportError:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "data_cache")      # 行情数据本地缓存目录
 os.makedirs(CACHE_DIR, exist_ok=True)
+MONITOR_DIR = os.path.join(BASE_DIR, "monitor_log")   # 实时监控的盘口快照记录目录（自采集真实数据）
+os.makedirs(MONITOR_DIR, exist_ok=True)
 
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
@@ -3318,10 +3320,38 @@ if HAS_PYSIDE6:
                 QMessageBox.information(self, "提示", "实时监控需真实数据源，请把数据源切换为「真实数据」。")
                 return
             sec = int(self.mon_interval.currentText().split()[0])
+            self._mon_count = 0                      # 本次监控已记录的快照数
+            self._mon_file = ""
             self._monitor_timer.start(sec * 1000)
             self.mon_start_btn.setEnabled(False); self.mon_stop_btn.setEnabled(True)
-            self._oplog(f"开始实时监控 {self.code_edit.text().strip()}，每 {sec} 秒刷新。")
+            self._oplog(f"开始实时监控 {self.code_edit.text().strip()}，每 {sec} 秒刷新，快照将记录到 monitor_log/。")
             self._refresh_monitor()
+
+        def _record_snapshot(self, code, q):
+            """把一次实时盘口快照追加写入 CSV（自采集真实历史，供日后分析）。"""
+            import csv
+            try:
+                day = dt.datetime.now().strftime("%Y%m%d")
+                path = os.path.join(MONITOR_DIR, f"monitor_{code}_{day}.csv")
+                is_new = not os.path.exists(path)
+                row = {"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       "price": q.get("price"), "pct": q.get("pct"), "chg": q.get("chg"),
+                       "open": q.get("open"), "high": q.get("high"), "low": q.get("low"),
+                       "prev": q.get("prev"), "vol": q.get("vol"), "amount": q.get("amount"),
+                       "turnover": q.get("turnover"), "vol_ratio": q.get("vol_ratio")}
+                for i, (p, v) in enumerate(q.get("bids", []), 1):
+                    row[f"buy{i}_p"], row[f"buy{i}_v"] = p, v
+                for i, (p, v) in enumerate(q.get("asks", []), 1):
+                    row[f"sell{i}_p"], row[f"sell{i}_v"] = p, v
+                with open(path, "a", newline="", encoding="utf-8-sig") as fh:
+                    wr = csv.DictWriter(fh, fieldnames=list(row.keys()))
+                    if is_new:
+                        wr.writeheader()
+                    wr.writerow(row)
+                self._mon_count = getattr(self, "_mon_count", 0) + 1
+                self._mon_file = path
+            except Exception:
+                pass
 
         def _on_stop_monitor(self):
             self._monitor_timer.stop()
@@ -3335,8 +3365,11 @@ if HAS_PYSIDE6:
                 q = StockDataFetcher.fetch_realtime(code)
             except Exception as e:
                 self.mon_view.setHtml(f"<p style='color:#c0392b'>实时行情获取失败：{e}</p>"
-                                      "<p>可能是网络/接口波动，会在下次刷新重试；或先确认代码正确。</p>")
+                                      "<p>可能是网络/接口波动，会在下次刷新重试；或先确认代码正确。</p>"
+                                      f"<p style='color:#888'>已累计记录 {getattr(self,'_mon_count',0)} 条快照到 monitor_log/。</p>")
                 return
+            if self._monitor_timer.isActive():
+                self._record_snapshot(code, q)       # 记录本次真实盘口快照
 
             def num(v):
                 try:
@@ -3370,9 +3403,12 @@ if HAS_PYSIDE6:
                       + _lvl(list(reversed(q.get("asks", []))), "卖", "#1a9d5a")
                       + "<tr><td colspan=3 bgcolor=#f6f6f6></td></tr>"
                       + _lvl(q.get("bids", []), "买", "#c0392b") + "</table>")
+            rec = getattr(self, "_mon_count", 0)
+            recfile = os.path.basename(getattr(self, "_mon_file", "")) or "monitor_log/"
             note = ("<p style='color:#888;font-size:12px'>盘口为实时快照(东方财富)；"
-                    "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。"
-                    "下方为模型对未来的预测参考，点上方按钮更新。</p>")
+                    "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。</p>"
+                    f"<p style='color:#1e8449;font-size:12px'>📝 本次已记录 <b>{rec}</b> 条真实快照 → "
+                    f"<b>{recfile}</b>（自采集的盘口/买卖手历史，长期积累后可供模型分析）。</p>")
             self.mon_view.setHtml(head + info + pankou + note + (self._mon_fc_html or ""))
 
         def _on_monitor_forecast(self):
