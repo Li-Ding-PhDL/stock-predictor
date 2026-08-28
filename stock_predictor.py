@@ -3064,6 +3064,8 @@ if HAS_PYSIDE6:
 
         # ---- 9.2.1c 点击"获取 K 线"后：拉数据并画图 ----
         def _on_fetch_kline(self):
+            self.kline_btn.setEnabled(False); self.kline_hint.setText("⏳ 正在拉取行情并绘制 K 线 ...")
+            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 if use_synthetic:
@@ -3091,6 +3093,8 @@ if HAS_PYSIDE6:
             except Exception as e:
                 QMessageBox.critical(self, "K 线获取失败", str(e))
                 self.kline_hint.setText("获取失败，详见弹窗。若是代理/网络问题，可先用合成数据。")
+            finally:
+                QApplication.restoreOverrideCursor(); self.kline_btn.setEnabled(True)
 
         # ---- 9.2.1d 画蜡烛图（价格 + 均线 + 成交量）----
         @staticmethod
@@ -3215,6 +3219,8 @@ if HAS_PYSIDE6:
             return panel
 
         def _on_build_mldata(self):
+            self.mldata_btn.setEnabled(False); self.mldata_hint.setText("⏳ 正在拉取数据并生成透视 ...")
+            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 enrich_status, news = {}, None
@@ -3265,6 +3271,8 @@ if HAS_PYSIDE6:
             except Exception as e:
                 QMessageBox.critical(self, "数据透视失败", str(e))
                 self.mldata_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
+            finally:
+                QApplication.restoreOverrideCursor(); self.mldata_btn.setEnabled(True)
 
         def _draw_mldata_trend(self, code, sample_dates, close_target, a, b, target_mode):
             self.mldata_figure.clear()
@@ -3641,9 +3649,14 @@ if HAS_PYSIDE6:
                                         "① 行情K线图→获取K线  ② 运行模型  ③ 未来预测/策略回测  ④ 机器学习内部→数据透视\n"
                                         "然后回来点「生成/刷新 报告预览」。")
                 return
-            self.report_view.setHtml(self._build_report_html())
-            self.report_hint.setText("报告已生成，可上下滚动查看；点「导出 HTML 报告」保存为网页。")
-            self._oplog("生成综合报告预览。")
+            self.report_btn.setEnabled(False); self.report_hint.setText("⏳ 正在生成报告(含K线图) ...")
+            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            try:
+                self.report_view.setHtml(self._build_report_html())
+                self.report_hint.setText("报告已生成，可上下滚动查看；点「导出 HTML 报告」保存为网页。")
+                self._oplog("生成综合报告预览。")
+            finally:
+                QApplication.restoreOverrideCursor(); self.report_btn.setEnabled(True)
 
         def _on_export_report(self):
             html = self._build_report_html()
@@ -4192,6 +4205,8 @@ if HAS_PYSIDE6:
             return panel
 
         def _on_run_forecast(self):
+            self.fc_btn.setEnabled(False); self.fc_hint.setText("⏳ 正在训练多周期预测模型 ...")
+            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 if use_synthetic:
@@ -4217,6 +4232,8 @@ if HAS_PYSIDE6:
             except Exception as e:
                 QMessageBox.critical(self, "未来预测失败", str(e))
                 self.fc_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
+            finally:
+                QApplication.restoreOverrideCursor(); self.fc_btn.setEnabled(True)
 
         def _draw_forecast(self, code, df, fc):
             self.fc_figure.clear()
@@ -4659,6 +4676,27 @@ if HAS_PYSIDE6:
             """记录用户操作到"操作日志"页，带时间戳。"""
             ts = dt.datetime.now().strftime("%H:%M:%S")
             self.oplog_box.append(f"[{ts}] {msg}")
+
+        @contextlib.contextmanager
+        def _busy(self, label=None, msg="⏳ 正在运行，请稍候 ...", btn=None):
+            """统一的"加载中"提示：等待光标 + 该页提示文字 + 按钮临时禁用；结束自动恢复。
+            用法： with self._busy(self.kline_hint, "正在拉取行情 ...", self.kline_btn): ...heavy..."""
+            old = label.text() if label is not None else None
+            if label is not None:
+                label.setText(msg)
+            if btn is not None:
+                btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()             # 先把"加载中"画出来再干活
+            try:
+                yield
+            finally:
+                QApplication.restoreOverrideCursor()
+                if btn is not None:
+                    btn.setEnabled(True)
+                # 提示文字不强制还原(各处会自己设完成后的文案)；仅当调用方没改时保留原文
+                if label is not None and label.text() == msg and old is not None:
+                    label.setText(old)
 
 
 # ==================== 第十部分：可编程 API（供脚本 / 其它 AI 调用） ====================
