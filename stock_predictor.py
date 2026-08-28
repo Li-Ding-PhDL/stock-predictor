@@ -2724,12 +2724,44 @@ if HAS_PYSIDE6:
 
             self._build_ui()
             self._oplog("软件启动。已就绪。")
+            self._show_disclaimer()
+
+        def _show_disclaimer(self):
+            box = QMessageBox(self)
+            box.setWindowTitle("使用须知 · 合规与免责")
+            box.setIcon(QMessageBox.Warning)
+            box.setText("<b style='color:#c0392b'>⚠️ 请先阅读（合规红线）</b>")
+            box.setInformativeText(
+                "<p><b>1. 仅供学术研究与学习，本软件不构成任何投资建议。</b>市场接近有效，"
+                "任何模型的历史表现都不代表未来收益，据此交易风险自负。</p>"
+                "<p><b>2. 数据来自公开接口（东财/baostock/百度），请仅作个人研究：</b></p>"
+                "<ul>"
+                "<li>✅ 自己拉公开数据、自己研究、自己判断 —— 基本安全</li>"
+                "<li>❌ 高频轰炸接口（请保持低频，如监控 5~10 秒）</li>"
+                "<li>❌ 把抓取的原始数据打包<b>售卖 / 公开再分发</b></li>"
+                "<li>❌ 无证券投资咨询牌照<b>给他人荐股 / 收费</b>（属违规）</li>"
+                "<li>❌ 大规模对外<b>转发实时行情</b></li>"
+                "</ul>"
+                "<p>做成对外产品/服务前，请先咨询证券合规专业律师。</p>")
+            box.setStandardButtons(QMessageBox.Ok)
+            box.exec()
 
         # ---- 9.2.1 整体布局搭建 ----
         def _build_ui(self):
             central = QWidget()
             self.setCentralWidget(central)
-            main_layout = QHBoxLayout(central)
+            outer = QVBoxLayout(central)
+
+            # 顶部：常驻醒目合规红线条（始终可见）
+            bar = QLabel("⚠️ 仅供学术研究，不构成任何投资建议 ｜ 请自用·勿高频抓取·勿无牌荐股或售卖数据 ｜ "
+                         "据此交易风险自负")
+            bar.setStyleSheet("background:#c0392b; color:white; font-weight:bold; padding:5px;")
+            bar.setAlignment(Qt.AlignCenter)
+            outer.addWidget(bar)
+
+            content = QWidget()
+            main_layout = QHBoxLayout(content)
+            outer.addWidget(content, stretch=1)
 
             # 左：配置区（滚动，防止算法太多超出屏幕）
             scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFixedWidth(560)
@@ -3299,8 +3331,15 @@ if HAS_PYSIDE6:
             when = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = [
                 "<h1 style='color:#2c6fbb'>A 股综合分析报告</h1>",
-                f"<p>股票代码：<b>{code or '合成数据'}</b>　生成时间：{when}　"
-                "<span style='color:#c0392b'>本报告仅供研究，不构成任何投资建议。</span></p>",
+                f"<p>股票代码：<b>{code or '合成数据'}</b>　生成时间：{when}</p>",
+                "<div style='background:#fff4f4;border:2px solid #c0392b;padding:8px;margin:6px 0'>"
+                "<b style='color:#c0392b'>⚠️ 合规与免责（务必阅读）</b>"
+                "<ul style='margin:4px 0'>"
+                "<li><b>仅供学术研究与学习，不构成任何投资建议</b>，据此交易风险自负；"
+                "市场接近有效，历史表现不代表未来。</li>"
+                "<li>数据来自公开接口，请仅作个人研究：勿高频抓取、勿售卖/再分发数据、"
+                "勿无牌荐股或收费、勿大规模转发实时行情。</li>"
+                "</ul></div>",
             ]
             # 风险提示优先级最高 —— 放最前
             if getattr(self, "_html_risk", ""):
