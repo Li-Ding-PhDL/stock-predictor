@@ -2957,17 +2957,26 @@ if HAS_PYSIDE6:
             layout = QVBoxLayout(panel)
 
             top = QHBoxLayout()
+            top.addWidget(QLabel("周期:"))
+            self.kline_period = QComboBox()
+            # (显示, 重采样规则, 回看根数, 说明)
+            self._kline_periods = [("日K·近3月", "D", 63), ("周K·近1.5年", "W-FRI", 78),
+                                   ("月K·近6年", "ME", 72)]
+            self.kline_period.addItems([t for t, _, _ in self._kline_periods])
+            self.kline_period.currentIndexChanged.connect(lambda _: self._on_fetch_kline())
+            top.addWidget(self.kline_period)
             self.kline_btn = QPushButton("📈 获取/刷新 K 线图")
             self.kline_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.kline_btn.clicked.connect(self._on_fetch_kline)
             top.addWidget(self.kline_btn)
-            self.kline_hint = QLabel("提示：先在左上角填好股票代码/日期/数据源，再点这里。红涨绿跌。")
+            self.kline_hint = QLabel("红涨绿跌；虚线=区间平均线；图下方工具条可放大缩小。")
             self.kline_hint.setStyleSheet("color:#666;")
             top.addWidget(self.kline_hint, stretch=1)
             layout.addLayout(top)
 
             self.kline_figure = Figure(figsize=(8, 5))
             self.kline_canvas = FigureCanvas(self.kline_figure)
+            layout.addWidget(NavigationToolbar(self.kline_canvas, panel))    # 缩放/平移工具条
             layout.addWidget(self.kline_canvas, stretch=1)
             return panel
 
@@ -2989,15 +2998,32 @@ if HAS_PYSIDE6:
                 if df is None or len(df) == 0:
                     QMessageBox.warning(self, "提示", "没有取到任何行情数据，请检查代码/日期。")
                     return
-                self._draw_kline(df, title)
-                self.kline_hint.setText(f"共 {len(df)} 个交易日。红涨绿跌，含 MA5/10/20 与成交量。")
-                self._oplog(f"获取K线：{code if not use_synthetic else '合成数据'}，{len(df)} 个交易日。")
+                # 按所选周期重采样(日/周/月)并只取对应回看长度
+                pname, rule, lookback = self._kline_periods[self.kline_period.currentIndex()]
+                kdf = self._resample_kline(df, rule).tail(lookback).reset_index(drop=True)
+                title = (f"{'合成数据' if use_synthetic else code}  {pname}"
+                         f"（共 {len(kdf)} 根，虚线=区间平均{kdf['close'].mean():.2f}）")
+                self._draw_kline(kdf, title, avg=float(kdf["close"].mean()))
+                self.kline_hint.setText(f"{pname}：{len(kdf)} 根K线，红涨绿跌 + MA + 区间平均线(虚线)，工具条可缩放。")
+                self._oplog(f"获取K线：{code if not use_synthetic else '合成数据'} {pname}，{len(kdf)} 根。")
             except Exception as e:
                 QMessageBox.critical(self, "K 线获取失败", str(e))
                 self.kline_hint.setText("获取失败，详见弹窗。若是代理/网络问题，可先用合成数据。")
 
         # ---- 9.2.1d 画蜡烛图（价格 + 均线 + 成交量）----
-        def _draw_kline(self, df: pd.DataFrame, title: str):
+        @staticmethod
+        def _resample_kline(df, rule):
+            """日线重采样为 日(D)/周(W-FRI)/月(ME) K线。"""
+            d = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            d["date"] = pd.to_datetime(d["date"])
+            if rule == "D":
+                return d.reset_index(drop=True)
+            r = d.resample(rule, on="date").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last",
+                 "volume": "sum"}).dropna().reset_index()
+            return r
+
+        def _draw_kline(self, df: pd.DataFrame, title: str, avg=None):
             self.kline_figure.clear()
             gs = self.kline_figure.add_gridspec(4, 1, hspace=0.08)
             ax_p = self.kline_figure.add_subplot(gs[0:3, 0])
@@ -3020,6 +3046,9 @@ if HAS_PYSIDE6:
             for w, col in [(5, "#f2a900"), (10, "#3b7dd8"), (20, "#9270CA")]:
                 if len(df) >= w:
                     ax_p.plot(x, close_s.rolling(w).mean(), linewidth=1.0, label=f"MA{w}", color=col)
+            # 区间平均线（水平虚线：整段所选周期的平均收盘价）
+            if avg is not None:
+                ax_p.axhline(avg, color="#333", linestyle="--", linewidth=1.2, label=f"区间平均 {avg:.2f}")
             ax_p.legend(loc="best", fontsize=8)
             ax_p.set_ylabel("价格")
             ax_p.set_title(title)
