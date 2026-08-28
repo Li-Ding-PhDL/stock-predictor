@@ -2775,6 +2775,79 @@ def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
     return out
 
 
+# ==================== 第八部分补充6：盘口快照记录 + 挂单量变化分析 ====================
+def write_snapshot(code: str, q: Dict[str, Any]) -> str:
+    """把一次实时盘口快照追加写入当天 CSV(GUI 定时与 CLI --snapshot 共用)。返回文件路径。"""
+    import csv
+    day = dt.datetime.now().strftime("%Y%m%d")
+    path = os.path.join(MONITOR_DIR, f"monitor_{code}_{day}.csv")
+    is_new = not os.path.exists(path)
+    row = {"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "price": q.get("price"), "pct": q.get("pct"), "vol_ratio": q.get("vol_ratio"),
+           "turnover": q.get("turnover")}
+    for i, (p, v) in enumerate(q.get("bids", []), 1):
+        row[f"buy{i}_p"], row[f"buy{i}_v"] = p, v
+    for i, (p, v) in enumerate(q.get("asks", []), 1):
+        row[f"sell{i}_p"], row[f"sell{i}_v"] = p, v
+    with open(path, "a", newline="", encoding="utf-8-sig") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(row.keys()))
+        if is_new:
+            wr.writeheader()
+        wr.writerow(row)
+    return path
+
+
+def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, Any]:
+    """
+    挂单量变化分析(诚意粗判)：读当天记录的多次盘口快照，**按价位**对比首末两次的挂单量变化。
+    大额挂单若显著减少→可能撤单/成交(免费数据无法区分)；变化不大→挂单意愿相对真实。
+
+    诚实边界：只看得到"各价位聚合挂单量"，看不到逐笔委托，**无法区分撤单与成交**；要真正区分需付费
+    Level-2 数据。故本分析仅是**粗略参考**，不是"主力真伪"的定论。
+    """
+    day = day or dt.datetime.now().strftime("%Y%m%d")
+    path = os.path.join(MONITOR_DIR, f"monitor_{code}_{day}.csv")
+    if not os.path.exists(path):
+        return {"error": f"未找到当天快照文件 {os.path.basename(path)}；请先在交易时段记录几次盘口。"}
+    df = pd.read_csv(path)
+    if len(df) < 2:
+        return {"error": f"当天只有 {len(df)} 条快照，至少需要 2 条才能作差对比。"}
+    first, last = df.iloc[0], df.iloc[-1]
+
+    def side_map(row, pref):
+        m = {}
+        for i in range(1, 6):
+            p, v = row.get(f"{pref}{i}_p"), row.get(f"{pref}{i}_v")
+            try:
+                p = float(p); v = float(v)
+                if p > 0:
+                    m[round(p, 3)] = m.get(round(p, 3), 0.0) + v
+            except (TypeError, ValueError):
+                continue
+        return m
+
+    def compare(pref):
+        a, b = side_map(first, pref), side_map(last, pref)
+        rows, tot0, tot1 = [], 0.0, 0.0
+        for price in sorted(set(a) | set(b), reverse=True):
+            v0, v1 = a.get(price, 0.0), b.get(price, 0.0)
+            tot0 += v0; tot1 += v1
+            chg = (v1 - v0) / (v0 + 1e-9) * 100 if v0 > 0 else (100.0 if v1 > 0 else 0.0)
+            rows.append({"price": price, "v0": v0, "v1": v1, "chg_pct": round(chg, 1)})
+        keep = round(tot1 / (tot0 + 1e-9) * 100, 1) if tot0 > 0 else None
+        return rows, round(tot0, 0), round(tot1, 0), keep
+
+    buy_rows, b0, b1, buy_keep = compare("buy")
+    sell_rows, s0, s1, sell_keep = compare("sell")
+    return {
+        "code": code, "day": day, "n_snap": int(len(df)),
+        "t_first": str(first.get("time", "")), "t_last": str(last.get("time", "")),
+        "buy": buy_rows, "sell": sell_rows,
+        "buy_total0": b0, "buy_total1": b1, "buy_keep_pct": buy_keep,
+        "sell_total0": s0, "sell_total1": s1, "sell_keep_pct": sell_keep,
+    }
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -3578,6 +3651,9 @@ if HAS_PYSIDE6:
             self.mon_view_snap_btn = QPushButton("📂 查看已记录快照")
             self.mon_view_snap_btn.clicked.connect(self._on_view_snapshots)
             top.addWidget(self.mon_view_snap_btn)
+            self.mon_sincerity_btn = QPushButton("🔍 挂单诚意分析")
+            self.mon_sincerity_btn.clicked.connect(self._on_order_sincerity)
+            top.addWidget(self.mon_sincerity_btn)
             top.addStretch()
             layout.addLayout(top)
             self.mon_view = QTextBrowser()
@@ -3600,28 +3676,10 @@ if HAS_PYSIDE6:
             self._refresh_monitor()
 
         def _record_snapshot(self, code, q):
-            """把一次实时盘口快照追加写入 CSV（自采集真实历史，供日后分析）。"""
-            import csv
+            """把一次实时盘口快照追加写入 CSV（与 CLI --snapshot 同格式，供挂单分析）。"""
             try:
-                day = dt.datetime.now().strftime("%Y%m%d")
-                path = os.path.join(MONITOR_DIR, f"monitor_{code}_{day}.csv")
-                is_new = not os.path.exists(path)
-                row = {"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                       "price": q.get("price"), "pct": q.get("pct"), "chg": q.get("chg"),
-                       "open": q.get("open"), "high": q.get("high"), "low": q.get("low"),
-                       "prev": q.get("prev"), "vol": q.get("vol"), "amount": q.get("amount"),
-                       "turnover": q.get("turnover"), "vol_ratio": q.get("vol_ratio")}
-                for i, (p, v) in enumerate(q.get("bids", []), 1):
-                    row[f"buy{i}_p"], row[f"buy{i}_v"] = p, v
-                for i, (p, v) in enumerate(q.get("asks", []), 1):
-                    row[f"sell{i}_p"], row[f"sell{i}_v"] = p, v
-                with open(path, "a", newline="", encoding="utf-8-sig") as fh:
-                    wr = csv.DictWriter(fh, fieldnames=list(row.keys()))
-                    if is_new:
-                        wr.writeheader()
-                    wr.writerow(row)
+                self._mon_file = write_snapshot(code, q)
                 self._mon_count = getattr(self, "_mon_count", 0) + 1
-                self._mon_file = path
             except Exception:
                 pass
 
@@ -3744,6 +3802,46 @@ if HAS_PYSIDE6:
                 + "".join(rows) + "</table>"
                 f"<p style='color:#888;font-size:12px'>文件夹路径：{MONITOR_DIR}</p>")
             self._oplog(f"查看已记录快照：{len(files)} 个文件。")
+
+        def _on_order_sincerity(self):
+            """挂单量变化(诚意粗判)：对当天已记录的盘口快照按价位作差。"""
+            code = self.code_edit.text().strip()
+            r = analyze_order_sincerity(code)
+            if "error" in r:
+                self.mon_view.setHtml(f"<h3>挂单诚意分析</h3><p style='color:#c0392b'>{r['error']}</p>"
+                                      "<p style='color:#888'>做法：交易时段(尤其集合竞价9:15-9:25)多记录几次盘口，"
+                                      "或用 <code>python stock_predictor.py --snapshot 代码</code> 定时抓取。</p>")
+                return
+
+            def tbl(rows, title, color):
+                body = "".join(
+                    f"<tr><td>{x['price']}</td><td align=right>{x['v0']:.0f}</td>"
+                    f"<td align=right>{x['v1']:.0f}</td>"
+                    f"<td align=right style='color:{'#c0392b' if x['chg_pct']<-20 else ('#1e8449' if x['chg_pct']>20 else '#333')}'>"
+                    f"{x['chg_pct']:+.1f}%</td></tr>" for x in rows)
+                return (f"<h4 style='color:{color}'>{title}</h4>"
+                        "<table border=1 cellpadding=3 cellspacing=0 width=100%>"
+                        "<tr bgcolor=#eef><th>价位</th><th>首次挂单</th><th>最新挂单</th><th>变化</th></tr>"
+                        + body + "</table>")
+
+            def verdict(keep, side):
+                if keep is None:
+                    return ""
+                if keep < 60:
+                    return f"<b style='color:#c0392b'>{side}大单存活 {keep}%——大量挂单已消失(撤单或成交)，谨慎</b>"
+                if keep > 90:
+                    return f"<b style='color:#1e8449'>{side}大单存活 {keep}%——挂单稳定，意愿相对真实</b>"
+                return f"{side}大单存活 {keep}%"
+
+            html = (f"<h3>挂单诚意分析 · {code}（{r['day']}，{r['n_snap']} 次快照）</h3>"
+                    f"<p>对比时间：{r['t_first']} → {r['t_last']}</p>"
+                    f"<p>{verdict(r['buy_keep_pct'],'买盘')}　|　{verdict(r['sell_keep_pct'],'卖盘')}</p>"
+                    + tbl(r["buy"], "买盘(买手)各价位挂单变化", "#c0392b")
+                    + tbl(r["sell"], "卖盘(卖手)各价位挂单变化", "#1a9d5a")
+                    + "<p style='color:#c0392b;font-size:12px'>⚠️ 诚实边界：免费数据只看得到「各价位聚合挂单量」，"
+                    "<b>无法区分撤单与成交</b>；要真正判断主力真伪需付费 Level-2 逐笔委托。本分析仅粗略参考，非定论、非投资建议。</p>")
+            self.mon_view.setHtml(html)
+            self._oplog(f"挂单诚意分析：{code}。")
 
         # ---- 9.2.1j 批量扫描标签页 ----
         def _build_batch_tab(self) -> QWidget:
@@ -4672,6 +4770,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--backtest", action="store_true", help="方向性收益回测(按预测涨跌做多/空仓，扣手续费)")
     p.add_argument("--cost", type=float, default=0.2, help="回测往返成本(%%)：佣金+印花税+滑点，默认 0.2")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
+    p.add_argument("--snapshot", default=None,
+                   help="无界面抓取一次实时盘口并记录到 monitor_log/(供 Windows 任务计划定时调用)，如 --snapshot 002418")
     return p
 
 
@@ -4754,6 +4854,18 @@ def main():
             pass
 
     args = _build_arg_parser().parse_args()
+
+    # --snapshot：无界面抓一次盘口就退出（供 Windows 任务计划定时调用，不需开 GUI）
+    if args.snapshot:
+        code = args.snapshot.strip()
+        try:
+            q = StockDataFetcher.fetch_realtime(code)
+            path = write_snapshot(code, q)
+            trading, status = is_trading_now()
+            print(f"[snapshot] {code} 现价={q.get('price')} 涨跌={q.get('pct')}% [{status}] -> {path}")
+        except Exception as e:
+            print(f"[snapshot] {code} 抓取失败: {e}")
+        return
 
     # 判断是否走命令行模式：显式 --cli，或用户传了任何非默认业务参数而没要求 --gui
     only_defaults = (len(sys.argv) == 1)
