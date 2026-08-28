@@ -407,6 +407,7 @@ class StockDataFetcher:
     @staticmethod
     def enrich(df: pd.DataFrame, code: str, want_valuation: bool = True,
                want_index: bool = True, want_fundflow: bool = True,
+               want_us: bool = True, want_northbound: bool = True,
                bypass_proxy: bool = True) -> Tuple[pd.DataFrame, Dict[str, str]]:
         """
         把日线行情 df 用"按日期对齐(merge_asof 向后取最近已知值，无未来泄露)"的方式，
@@ -450,6 +451,24 @@ class StockDataFetcher:
                 status["fundflow"] = f"跳过(取数失败: {e})"
         elif want_fundflow:
             status["fundflow"] = "跳过(未安装 akshare)"
+        if want_us and HAS_AKSHARE:
+            try:
+                us = _nsdate(StockDataFetcher._fetch_us_index(bypass_proxy))
+                df = pd.merge_asof(df, us, on="date", direction="backward")
+                status["us"] = "已接入(隔夜纳斯达克, 日期+1对齐无泄露)"
+            except Exception as e:
+                status["us"] = f"跳过(取数失败: {e})"
+        elif want_us:
+            status["us"] = "跳过(未安装 akshare)"
+        if want_northbound and HAS_AKSHARE:
+            try:
+                nb = _nsdate(StockDataFetcher._fetch_northbound(bypass_proxy))
+                df = pd.merge_asof(df, nb, on="date", direction="backward")
+                status["northbound"] = f"已接入(北向资金, {len(nb)}行)"
+            except Exception as e:
+                status["northbound"] = f"跳过(取数失败: {e})"
+        elif want_northbound:
+            status["northbound"] = "跳过(未安装 akshare)"
         return df.reset_index(drop=True), status
 
     @staticmethod
@@ -600,6 +619,48 @@ class StockDataFetcher:
         ix["idx_ret_1d"] = ix["close"].pct_change()
         ix["idx_madev20"] = ix["close"] / (ix["close"].rolling(20).mean() + 1e-9) - 1
         return ix[["date", "idx_ret_1d", "idx_madev20"]].dropna()
+
+    @staticmethod
+    def _fetch_us_index(bypass_proxy: bool = True) -> pd.DataFrame:
+        """隔夜美股(纳斯达克)涨跌：akshare index_us_stock_sina(.IXIC)。
+        A股当日只能用"昨夜美股"(美股某日收盘在中国次日凌晨已知)，故把美股日期+1天再对齐，杜绝未来泄露。"""
+        fn = getattr(ak, "index_us_stock_sina", None)
+        if fn is None:
+            raise RuntimeError("当前 akshare 无美股指数接口 index_us_stock_sina")
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            us = StockDataFetcher._retry(lambda: fn(symbol=".IXIC"))
+        us = us.rename(columns={c: c.lower() for c in us.columns})
+        dcol = "date" if "date" in us.columns else us.columns[0]
+        us["date"] = pd.to_datetime(us[dcol]).astype("datetime64[ns]")
+        us = us.sort_values("date")
+        us["us_ret"] = pd.to_numeric(us["close"], errors="coerce").pct_change()
+        # 关键：美股 D 日收盘 → A股 D+1 日开盘前才可用，故日期+1天再对齐(无泄露)
+        us["date"] = us["date"] + pd.Timedelta(days=1)
+        return us[["date", "us_ret"]].dropna()
+
+    @staticmethod
+    def _fetch_northbound(bypass_proxy: bool = True) -> pd.DataFrame:
+        """北向资金(沪股通+深股通)每日净流入：兼容多个 akshare 函数名。产出 nb_net(亿元)。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        fn = (getattr(ak, "stock_hsgt_north_net_flow_in_em", None)
+              or getattr(ak, "stock_hsgt_hist_em", None))
+        if fn is None:
+            raise RuntimeError("当前 akshare 无北向资金接口(stock_hsgt_*)")
+        with ctx:
+            try:
+                nb = StockDataFetcher._retry(lambda: fn(symbol="北向"))
+            except TypeError:
+                nb = StockDataFetcher._retry(lambda: fn())
+        cols = {c: str(c) for c in nb.columns}
+        nb = nb.rename(columns=cols)
+        dcol = next((c for c in nb.columns if "日期" in c or c.lower() == "date"), nb.columns[0])
+        vcol = next((c for c in nb.columns if ("净" in c and ("流入" in c or "额" in c)) or "北向" in c),
+                    nb.columns[-1])
+        nb = nb[[dcol, vcol]].rename(columns={dcol: "date", vcol: "nb_net"})
+        nb["date"] = pd.to_datetime(nb["date"], errors="coerce").astype("datetime64[ns]")
+        nb["nb_net"] = pd.to_numeric(nb["nb_net"], errors="coerce")
+        return nb.dropna(subset=["date"]).sort_values("date")
 
     @staticmethod
     def fetch_news(code: str, limit: int = 15, bypass_proxy: bool = True) -> pd.DataFrame:
@@ -808,7 +869,7 @@ class FeatureEngineer:
         # 这些列的 NaN 一律填 0(中性、无未来泄露)——否则后面按行 dropna 时，只要某外部列局部/整列为 NaN，
         # 就会把大段甚至全部历史行删光(空数据集报错 array=[])。填 0 表示"该处无此信息"，不影响时序纪律。
         for c in df.columns:
-            if c != "date" and str(c).startswith(("val_", "idx_", "mf_")):
+            if c != "date" and str(c).startswith(("val_", "idx_", "mf_", "us_", "nb_")):
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
         return df
@@ -2685,7 +2746,7 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
 
 
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
-PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "base_date", "base_close",
+PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "target_date",
              "status", "actual_close", "actual_change_pct", "hit_dir", "verified_at"]
 
@@ -3237,7 +3298,8 @@ if HAS_PYSIDE6:
                     if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                         df, enrich_status = StockDataFetcher.enrich(
                             df, code, self.chk_val.isChecked(),
-                            self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                            self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
                     if self.chk_news.isChecked():
                         try:
                             news = StockDataFetcher.fetch_news(code)
@@ -3798,7 +3860,8 @@ if HAS_PYSIDE6:
                 df = StockDataFetcher().fetch(code, start, end)
                 if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                     df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
-                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
                 tm = "return" if self.target_combo.currentIndex() == 0 else "price"
                 algo = self.fc_model_combo.currentText() if hasattr(self, "fc_model_combo") else "Lasso"
                 fc = forecast_curve(algo, df, target_mode=tm, horizons=(1, 5, 20, 60), progress_cb=self._log)
@@ -3928,7 +3991,8 @@ if HAS_PYSIDE6:
             end = self.end_date.date().toString("yyyyMMdd")
             tm = "return" if self.target_combo.currentIndex() == 0 else "price"
             horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
-            flags = (self.chk_val.isChecked(), self.chk_idx.isChecked(), self.chk_mf.isChecked())
+            flags = (self.chk_val.isChecked(), self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
             self.batch_run_btn.setEnabled(False); self.batch_run_btn.setText("扫描中...")
             self._oplog(f"批量扫描 {len(codes)} 只：{', '.join(codes)}（模型{self.batch_algo.currentText()}，周期{horizon}日）")
             self.batch_worker = BatchWorker(codes, self.batch_algo.currentText(), start, end, tm, horizon, flags)
@@ -4022,8 +4086,20 @@ if HAS_PYSIDE6:
                                               self.end_date.date().toString("yyyyMMdd"))
                 if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                     df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
-                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
                 name = StockDataFetcher.fetch_stock_name(code)
+                # 为每个周期先算一次"记录时的模型测试DA"(方向准确率)，随预测一起存档，增加可信力
+                da_by_h = {}
+                for h in (1, 3, 5, 20, 60):
+                    try:
+                        cfg = TrainConfig(horizon=h, target_mode=target_mode, hpo_method="关闭",
+                                          metrics=["DA"])
+                        res = TrainingPipeline(cfg).run_batch([model], df)
+                        mr = next((r for r in res if r.algo_name == model and not r.error), None)
+                        da_by_h[h] = round(float(mr.metrics.get("DA", 0)), 1) if mr else ""
+                    except Exception:
+                        da_by_h[h] = ""
                 fc = forecast_curve(model, df, target_mode=target_mode,
                                     horizons=(1, 3, 5, 20, 60), progress_cb=self._log)
                 base_date = fc["last_date"]; base_close = fc["last_close"]
@@ -4037,6 +4113,7 @@ if HAS_PYSIDE6:
                         "id": f"{code}_{model}_{h}_{base_date}",
                         "made_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "code": code, "name": name, "model": model, "horizon": h,
+                        "model_da": da_by_h.get(h, ""),
                         "base_date": base_date, "base_close": base_close,
                         "pred_close": p["pred_close"], "pred_change_pct": p["change_pct"],
                         "pred_dir": "涨" if p["pred_close"] >= base_close else "跌",
@@ -4080,10 +4157,10 @@ if HAS_PYSIDE6:
             self.trk_summary.setHtml(html)
             # 下：预测明细表
             df = load_pred_log()
-            cols = ["made_at", "code", "name", "model", "horizon", "base_date", "base_close",
+            cols = ["made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
                     "pred_close", "pred_change_pct", "pred_dir", "target_date", "status",
                     "actual_close", "actual_change_pct", "hit_dir"]
-            heads = ["记录时间", "代码", "名称", "模型", "周期", "基准日", "基准价", "预测价",
+            heads = ["记录时间", "代码", "名称", "模型", "周期", "记录时DA%", "基准日", "基准价", "预测价",
                      "预测涨跌%", "方向", "目标日", "状态", "实际价", "实际涨跌%", "命中"]
             self.trk_table.setColumnCount(len(cols))
             self.trk_table.setHorizontalHeaderLabels(heads)
@@ -4220,7 +4297,8 @@ if HAS_PYSIDE6:
                     df = StockDataFetcher().fetch(code, start, end)
                     if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                         df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
-                                                        self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                                                        self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
                 target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
                 algo = self.fc_model_combo.currentText()
                 self.fc_hint.setText(f"正在用 {algo} 训练 6 个周期的直接预测模型（稍候）...")
@@ -4349,9 +4427,14 @@ if HAS_PYSIDE6:
             self.chk_idx.setChecked(True)
             self.chk_mf = QCheckBox("主力资金流向：主力/超大单/大单净流入 + 进场/洗盘代理 (东方财富)")
             self.chk_mf.setChecked(True)
+            self.chk_us = QCheckBox("隔夜美股：昨夜纳斯达克涨跌 (新浪，日期+1对齐无泄露)")
+            self.chk_us.setChecked(True)
+            self.chk_nb = QCheckBox("北向资金：沪深股通每日净流入 (东方财富)")
+            self.chk_nb.setChecked(True)
             self.chk_news = QCheckBox("个股新闻：真实标题+链接，仅在\"机器学习内部\"页展示 (东方财富)")
             self.chk_news.setChecked(True)
-            for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_mf, self.chk_news):
+            for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_mf,
+                      self.chk_us, self.chk_nb, self.chk_news):
                 layout.addWidget(c)
             tip = QLabel("说明：勾选项失败会自动跳过该来源(特征就是没有)，绝不填假数据；新闻只作展示；"
                          "盘口买卖手为实时快照(无免费历史)，故用可回测的\"每日主力净流入\"作其历史等价物。")
@@ -4480,7 +4563,8 @@ if HAS_PYSIDE6:
                     if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
                         self.raw_df, st = StockDataFetcher.enrich(
                             self.raw_df, code, self.chk_val.isChecked(),
-                            self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                            self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                            self.chk_us.isChecked(), self.chk_nb.isChecked())
                         for k, v in st.items():
                             self._log(f"[外部数据·{k}] {v}")
             except Exception as e:
@@ -4544,6 +4628,7 @@ if HAS_PYSIDE6:
             "ret_w1": "周涨跌", "ret_m1": "月涨跌", "ret_q1": "季涨跌",
             "val_pe_ttm": "市盈率TTM", "val_pb": "市净率", "val_total_mv": "总市值",
             "idx_ret_1d": "沪深300涨跌", "idx_madev20": "大盘均线偏离",
+            "us_ret": "隔夜纳斯达克涨跌", "nb_net": "北向资金净流入",
             "mf_main_net": "主力净流入", "mf_main_pct": "主力净占比", "mf_xl_net": "超大单净额",
             "mf_l_net": "大单净额", "mf_streak": "主力连续进出天数", "mf_cum5": "主力5日累计",
             "mf_price_div": "资金-价格背离",
