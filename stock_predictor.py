@@ -302,7 +302,9 @@ class StockDataFetcher:
         cache_path = self._cache_path(code, start_date, end_date, adjust)
 
         # ---- 3.1.1 优先读取本地缓存 ----
-        if use_cache and os.path.exists(cache_path):
+        # 但：若结束日期是"今天或未来"，当天日线还在变(报告价格会滞后)，则强制重新拉取最新数据，不吃旧缓存。
+        today = dt.date.today().strftime("%Y%m%d")
+        if use_cache and os.path.exists(cache_path) and end_date < today:
             return pd.read_parquet(cache_path)
 
         # ---- 3.1.2 按顺序尝试各数据源，任一成功即返回；全失败则汇总错误 ----
@@ -2914,6 +2916,13 @@ if HAS_PYSIDE6:
 
             self._build_ui()
             self._oplog("软件启动。已就绪。")
+            # 启动时自动验证：把之前记录、目标日期已到的预测，自动拉真实股价对比(哪怕你早忘了这只票)
+            try:
+                n = verify_predictions()
+                if n > 0:
+                    self._oplog(f"启动自动验证：{n} 条到期预测已对比真实股价（见「预测跟踪」页）。")
+            except Exception:
+                pass
             self._show_disclaimer()
 
         def _show_disclaimer(self):
@@ -3096,11 +3105,12 @@ if HAS_PYSIDE6:
                  "volume": "sum"}).dropna().reset_index()
             return r
 
-        def _draw_kline(self, df: pd.DataFrame, title: str, avg=None):
-            self.kline_figure.clear()
-            gs = self.kline_figure.add_gridspec(4, 1, hspace=0.08)
-            ax_p = self.kline_figure.add_subplot(gs[0:3, 0])
-            ax_v = self.kline_figure.add_subplot(gs[3, 0], sharex=ax_p)
+        def _draw_kline(self, df: pd.DataFrame, title: str, avg=None, fig=None):
+            fig = fig or self.kline_figure          # 传入 fig 时画到该图(供报告离屏生成)，否则画到屏幕K线图
+            fig.clear()
+            gs = fig.add_gridspec(4, 1, hspace=0.08)
+            ax_p = fig.add_subplot(gs[0:3, 0])
+            ax_v = fig.add_subplot(gs[3, 0], sharex=ax_p)
 
             x = np.arange(len(df))
             o = df["open"].to_numpy(float); c = df["close"].to_numpy(float)
@@ -3141,7 +3151,27 @@ if HAS_PYSIDE6:
                 [pd.to_datetime(df["date"].iloc[i]).strftime("%y-%m-%d") for i in idx],
                 rotation=30, fontsize=8)
             plt.setp(ax_p.get_xticklabels(), visible=False)
-            self.kline_canvas.draw()
+            if fig is self.kline_figure:
+                self.kline_canvas.draw()
+
+        def _report_kline_imgs(self):
+            """为报告离屏生成 日K(近3月)/周K(近1.5年)/月K(近6年) 三张图(带均线+区间平均)，返回HTML。"""
+            df = getattr(self, "raw_df", None)
+            if df is None or "close" not in getattr(df, "columns", []):
+                return ""
+            html = []
+            for pname, rule, lookback in self._kline_periods:
+                try:
+                    kdf = self._resample_kline(df, rule).tail(lookback).reset_index(drop=True)
+                    if len(kdf) < 3:
+                        continue
+                    tmp = Figure(figsize=(8, 5))
+                    self._draw_kline(kdf, f"{pname}（虚线=区间平均{kdf['close'].mean():.2f}）",
+                                     avg=float(kdf["close"].mean()), fig=tmp)
+                    html.append(self._fig_to_img(tmp, pname))
+                except Exception:
+                    continue
+            return "".join(html)
 
         # ---- 9.2.1e 机器学习内部（数据透视）标签页 ----
         def _build_mldata_tab(self) -> QWidget:
@@ -3577,9 +3607,11 @@ if HAS_PYSIDE6:
             # 模型推荐与预测依据
             if getattr(self, "_html_reco", ""):
                 parts.append("<h2>🎯 模型推荐与预测依据</h2>" + self._html_reco)
-            # 图表（原样内嵌，优先级高）
+            # 日K/周K/月K 三张图（报告自动生成，带均线+区间平均，无需先打开K线页）
+            parts.append("<h2>行情 K 线（日K近3月 / 周K近1.5年 / 月K近6年）</h2>")
+            parts.append(self._report_kline_imgs())
+            # 其它图表（原样内嵌，优先级高）
             for title, fig in [
-                ("行情 K 线图", getattr(self, "kline_figure", None)),
                 ("真实趋势与训练/验证/测试划分", getattr(self, "mldata_figure", None)),
                 ("预测结果对比图", getattr(self, "figure", None)),
                 ("未来走势预测图", getattr(self, "fc_figure", None)),
@@ -4772,6 +4804,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
     p.add_argument("--snapshot", default=None,
                    help="无界面抓取一次实时盘口并记录到 monitor_log/(供 Windows 任务计划定时调用)，如 --snapshot 002418")
+    p.add_argument("--verify", action="store_true",
+                   help="无界面自动验证到期预测(拉真实股价对比)，供定时任务每日调用")
     return p
 
 
@@ -4865,6 +4899,15 @@ def main():
             print(f"[snapshot] {code} 现价={q.get('price')} 涨跌={q.get('pct')}% [{status}] -> {path}")
         except Exception as e:
             print(f"[snapshot] {code} 抓取失败: {e}")
+        return
+
+    # --verify：无界面自动验证到期预测（供定时任务每日调用）
+    if args.verify:
+        try:
+            n = verify_predictions(progress_cb=print)
+            print(f"[verify] 本次验证 {n} 条到期预测。")
+        except Exception as e:
+            print(f"[verify] 失败: {e}")
         return
 
     # 判断是否走命令行模式：显式 --cli，或用户传了任何非默认业务参数而没要求 --gui
