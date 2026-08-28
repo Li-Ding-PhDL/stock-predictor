@@ -2613,6 +2613,51 @@ def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "ret
     return {"algo": algo_name, "last_close": last_close, "last_date": last_date, "points": points}
 
 
+# ==================== 第八部分补充4：批量扫描（多股批量 取数→训练→预测→风险） ====================
+def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
+               end: Optional[str] = None, target_mode: str = "return", horizon: int = 5,
+               use_valuation: bool = True, use_index: bool = True, use_fundflow: bool = True,
+               progress_cb: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
+    """
+    对一批股票逐只：取真实数据(+外部)→训练一个模型→测试集方向准确率(DA)→向前预测→风险筛查。
+    返回每只一行的字典列表(可排序/导出)。**这是研究筛查工具，不是荐股**：请用风险列避开雷，
+    别把"预测涨幅高/DA高"当买入信号——市场接近有效，单模型点预测不可靠。
+    """
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    rows = []
+    for i, code in enumerate(codes, 1):
+        code = code.strip()
+        if not code:
+            continue
+        log(f"[批量 {i}/{len(codes)}] {code} 取数+训练+预测 ...")
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            if use_valuation or use_index or use_fundflow:
+                df, _ = StockDataFetcher.enrich(df, code, use_valuation, use_index, use_fundflow)
+            name = StockDataFetcher.fetch_stock_name(code)
+            cfg = TrainConfig(horizon=horizon, target_mode=target_mode, hpo_method="关闭",
+                              metrics=["RMSE", "DA", "UP_P"])
+            pipe = TrainingPipeline(cfg)
+            res = pipe.run_batch([algo], df)
+            mr = next((r for r in res if r.algo_name == algo and not r.error), None)
+            da = mr.metrics.get("DA") if mr else None
+            up_p = mr.metrics.get("UP_P") if mr else None
+            fc = pipe.predict_next(algo, df)
+            warns = assess_risks(code, name, df, news=None)
+            hi_risk = [w for w in warns if w["level"] == "高"]
+            rows.append({
+                "code": code, "name": name, "last_close": fc["last_close"],
+                "pred_close": fc["pred_close"], "pred_change_pct": fc["pred_change_pct"],
+                "DA": da, "UP_P": up_p, "risk_n": len(warns),
+                "risk_top": (hi_risk[0]["category"] if hi_risk else (warns[0]["category"] if warns else "")),
+                "error": None,
+            })
+        except Exception as e:
+            rows.append({"code": code, "name": "", "error": str(e)})
+    return rows
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -2639,6 +2684,28 @@ if HAS_PYSIDE6:
                 results = pipeline.run_batch(self.algo_names, self.raw_df,
                                               progress_cb=lambda msg: self.progress_signal.emit(msg))
                 self.finished_signal.emit(results)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class BatchWorker(QThread):
+        """批量扫描后台线程：对一批股票逐只 取数→训练→预测→风险。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(list)          # List[dict]
+        error_signal = Signal(str)
+
+        def __init__(self, codes, algo, start, end, target_mode, horizon, flags):
+            super().__init__()
+            self.codes = codes; self.algo = algo; self.start = start; self.end = end
+            self.target_mode = target_mode; self.horizon = horizon; self.flags = flags
+
+        def run(self):
+            try:
+                rows = batch_scan(self.codes, algo=self.algo, start=self.start, end=self.end,
+                                  target_mode=self.target_mode, horizon=self.horizon,
+                                  use_valuation=self.flags[0], use_index=self.flags[1],
+                                  use_fundflow=self.flags[2],
+                                  progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(rows)
             except Exception as e:
                 self.error_signal.emit(str(e))
 
@@ -2713,6 +2780,9 @@ if HAS_PYSIDE6:
 
             # 实时监控：交易时段定时刷新真实盘口 + 预测参考
             self.tabs.addTab(self._build_monitor_tab(), "实时监控")
+
+            # 批量扫描：多股批量 取数→训练→预测→风险
+            self.tabs.addTab(self._build_batch_tab(), "批量扫描")
 
             main_layout.addWidget(self.tabs, stretch=1)
 
@@ -3306,6 +3376,9 @@ if HAS_PYSIDE6:
             self.mon_fc_btn = QPushButton("🔮 预测明日/一周/一月")
             self.mon_fc_btn.clicked.connect(self._on_monitor_forecast)
             top.addWidget(self.mon_fc_btn)
+            self.mon_view_snap_btn = QPushButton("📂 查看已记录快照")
+            self.mon_view_snap_btn.clicked.connect(self._on_view_snapshots)
+            top.addWidget(self.mon_view_snap_btn)
             top.addStretch()
             layout.addLayout(top)
             self.mon_view = QTextBrowser()
@@ -3444,6 +3517,127 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "预测失败", str(e))
             finally:
                 self.mon_fc_btn.setEnabled(True); self.mon_fc_btn.setText("🔮 预测明日/一周/一月")
+
+        def _on_view_snapshots(self):
+            """列出 monitor_log/ 已采集的快照文件(股票/日期/条数)。"""
+            try:
+                files = sorted(f for f in os.listdir(MONITOR_DIR) if f.endswith(".csv"))
+            except Exception:
+                files = []
+            if not files:
+                self.mon_view.setHtml("<h3>暂无已记录快照</h3>"
+                                      "<p>开始实时监控后，每次刷新会把真实盘口快照记录到 monitor_log/。</p>")
+                return
+            rows = []
+            for f in files:
+                path = os.path.join(MONITOR_DIR, f)
+                try:
+                    with open(path, encoding="utf-8-sig") as fh:
+                        n = sum(1 for _ in fh) - 1        # 减表头
+                    size = os.path.getsize(path) / 1024
+                except Exception:
+                    n, size = "?", 0
+                rows.append(f"<tr><td>{f}</td><td align=right>{n}</td><td align=right>{size:.1f} KB</td></tr>")
+            self.mon_view.setHtml(
+                f"<h3>已记录快照文件（共 {len(files)} 个 · 目录 monitor_log/）</h3>"
+                "<p style='color:#888'>这是你自采集的真实盘口/买卖手历史；长期积累后可供盘中建模分析。</p>"
+                "<table border=1 cellpadding=4 cellspacing=0><tr bgcolor=#eef><th>文件</th><th>快照条数</th><th>大小</th></tr>"
+                + "".join(rows) + "</table>"
+                f"<p style='color:#888;font-size:12px'>文件夹路径：{MONITOR_DIR}</p>")
+            self._oplog(f"查看已记录快照：{len(files)} 个文件。")
+
+        # ---- 9.2.1j 批量扫描标签页 ----
+        def _build_batch_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("股票代码(逗号/换行分隔):"))
+            self.batch_codes = QLineEdit("600519,000001,002418,300750")
+            top.addWidget(self.batch_codes, stretch=1)
+            top.addWidget(QLabel("模型:"))
+            self.batch_algo = QComboBox()
+            self.batch_algo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
+            self.batch_algo.setCurrentText("Lasso")
+            top.addWidget(self.batch_algo)
+            self.batch_run_btn = QPushButton("▶ 开始批量扫描")
+            self.batch_run_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2c6fbb; color:white;")
+            self.batch_run_btn.clicked.connect(self._on_batch_run)
+            top.addWidget(self.batch_run_btn)
+            self.batch_export_btn = QPushButton("💾 导出CSV")
+            self.batch_export_btn.clicked.connect(self._on_batch_export)
+            top.addWidget(self.batch_export_btn)
+            layout.addLayout(top)
+            self.batch_hint = QLabel("研究筛查工具，非荐股：用风险列避开雷；预测/DA高不等于该买。逐只训练，股票多会慢。")
+            self.batch_hint.setStyleSheet("color:#c0392b;")
+            layout.addWidget(self.batch_hint)
+            self.batch_table = QTableWidget()
+            layout.addWidget(self.batch_table, stretch=1)
+            self._batch_rows = []
+            return panel
+
+        def _on_batch_run(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "批量扫描需真实数据，请把数据源切换为「真实数据」。"); return
+            raw = self.batch_codes.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if not codes:
+                QMessageBox.warning(self, "提示", "请先填写股票代码。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            flags = (self.chk_val.isChecked(), self.chk_idx.isChecked(), self.chk_mf.isChecked())
+            self.batch_run_btn.setEnabled(False); self.batch_run_btn.setText("扫描中...")
+            self._oplog(f"批量扫描 {len(codes)} 只：{', '.join(codes)}（模型{self.batch_algo.currentText()}，周期{horizon}日）")
+            self.batch_worker = BatchWorker(codes, self.batch_algo.currentText(), start, end, tm, horizon, flags)
+            self.batch_worker.progress_signal.connect(self._log)
+            self.batch_worker.finished_signal.connect(self._on_batch_finished)
+            self.batch_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "批量出错", m),
+                                                              self._batch_reset_btn()))
+            self.batch_worker.start()
+
+        def _batch_reset_btn(self):
+            self.batch_run_btn.setEnabled(True); self.batch_run_btn.setText("▶ 开始批量扫描")
+
+        def _on_batch_finished(self, rows):
+            self._batch_rows = rows
+            self._batch_reset_btn()
+            # 按预测涨跌幅降序（失败的排最后）
+            rows_sorted = sorted(rows, key=lambda r: (r.get("pred_change_pct") is None,
+                                                      -(r.get("pred_change_pct") or 0)))
+            headers = ["代码", "名称", "最新价", "预测价", "预测涨跌%", "测试DA%", "UP_P%", "风险数", "主要风险"]
+            self.batch_table.setColumnCount(len(headers))
+            self.batch_table.setHorizontalHeaderLabels(headers)
+            self.batch_table.setRowCount(len(rows_sorted))
+            for i, r in enumerate(rows_sorted):
+                if r.get("error"):
+                    self.batch_table.setItem(i, 0, QTableWidgetItem(r["code"]))
+                    self.batch_table.setItem(i, 1, QTableWidgetItem(f"失败: {r['error'][:30]}"))
+                    continue
+                vals = [r["code"], r.get("name", ""), f"{r.get('last_close','')}",
+                        f"{r.get('pred_close','')}", f"{r.get('pred_change_pct','')}",
+                        f"{r.get('DA','')}", f"{r.get('UP_P','')}", str(r.get("risk_n", "")),
+                        r.get("risk_top", "")]
+                for c, v in enumerate(vals):
+                    it = QTableWidgetItem(str(v))
+                    if c == 7 and r.get("risk_n", 0) > 0:
+                        it.setForeground(Qt.red)
+                    self.batch_table.setItem(i, c, it)
+            self.batch_table.resizeColumnsToContents()
+            self._oplog(f"批量扫描完成：{sum(1 for r in rows if not r.get('error'))} 只成功。")
+
+        def _on_batch_export(self):
+            if not self._batch_rows:
+                QMessageBox.information(self, "提示", "请先运行批量扫描。"); return
+            default = os.path.join(BASE_DIR, f"批量扫描_{dt.datetime.now():%Y%m%d_%H%M}.csv")
+            path, _ = QFileDialog.getSaveFileName(self, "导出批量扫描结果", default, "CSV (*.csv)")
+            if not path:
+                return
+            try:
+                pd.DataFrame(self._batch_rows).to_csv(path, index=False, encoding="utf-8-sig")
+                QMessageBox.information(self, "导出成功", f"已导出：\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "导出失败", str(e))
 
         # ---- 9.2.1f 策略回测标签页 ----
         def _build_backtest_tab(self) -> QWidget:
