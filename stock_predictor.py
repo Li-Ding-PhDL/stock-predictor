@@ -180,7 +180,7 @@ try:
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
         QFileDialog
     )
-    from PySide6.QtCore import Qt, QThread, Signal, QDate
+    from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
     from PySide6.QtGui import QFont
     matplotlib.use("QtAgg")     # 让 matplotlib 使用 Qt 后端，方便嵌入 PySide6 界面
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -622,6 +622,36 @@ class StockDataFetcher:
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def fetch_realtime(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
+        """实时盘口快照(用于盘中监控)：akshare stock_bid_ask_em，数据源=东方财富。
+        返回字典(现价/涨跌幅/今开最高最低/量比/换手/成交量额 + 买卖5档)。仅监控展示，不作历史训练。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            d = StockDataFetcher._retry(lambda: ak.stock_bid_ask_em(symbol=code), tries=2, delay=0.8)
+        # d 为两列(item/value)
+        m = {}
+        try:
+            m = d.set_index(d.columns[0])[d.columns[1]].to_dict()
+        except Exception:
+            pass
+        def g(*keys):
+            for k in keys:
+                if k in m and m[k] not in ("", "-", None):
+                    return m[k]
+            return None
+        # 买卖5档
+        bids = [(g(f"buy_{i}"), g(f"buy_{i}_vol")) for i in range(1, 6)]
+        asks = [(g(f"sell_{i}"), g(f"sell_{i}_vol")) for i in range(1, 6)]
+        return {
+            "price": g("最新"), "pct": g("涨幅"), "chg": g("涨跌"),
+            "open": g("今开"), "high": g("最高"), "low": g("最低"), "prev": g("昨收"),
+            "avg": g("均价"), "vol": g("总手"), "amount": g("金额"),
+            "turnover": g("换手"), "vol_ratio": g("量比"),
+            "limit_up": g("涨停"), "limit_down": g("跌停"),
+            "bids": bids, "asks": asks, "raw": m,
+        }
 
     # ---------- 3.2 缓存文件路径 ----------
     def _cache_path(self, code: str, start_date: str, end_date: str, adjust: str) -> str:
@@ -2474,6 +2504,21 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
 
 
 # ==================== 第八部分补充2：未来走势预测（多周期直接预测，不递归、不造假） ====================
+def is_trading_now(now: Optional[dt.datetime] = None) -> Tuple[bool, str]:
+    """判断当前是否 A 股交易时段(9:30-11:30 / 13:00-15:00，工作日)。返回(是否交易中, 状态文字)。"""
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False, "周末休市"
+    t = now.time()
+    if dt.time(9, 30) <= t <= dt.time(11, 30) or dt.time(13, 0) <= t <= dt.time(15, 0):
+        return True, "交易中"
+    if t < dt.time(9, 30):
+        return False, "未开盘(集合竞价9:15-9:25)"
+    if dt.time(11, 30) < t < dt.time(13, 0):
+        return False, "午间休市"
+    return False, "已收盘"
+
+
 # ==================== 第八部分补充3：风险提示（全部基于真实数据，绝不臆造） ====================
 # 风险关键词表：命中真实新闻标题时提示。只做"关键词命中提醒"，不做情绪打分、不下结论。
 RISK_KEYWORDS = {
@@ -2663,6 +2708,9 @@ if HAS_PYSIDE6:
 
             # 综合报告：把前面所有图表+数据汇总，可预览、可导出自包含 HTML 报告
             self.tabs.addTab(self._build_report_tab(), "综合报告")
+
+            # 实时监控：交易时段定时刷新真实盘口 + 预测参考
+            self.tabs.addTab(self._build_monitor_tab(), "实时监控")
 
             main_layout.addWidget(self.tabs, stretch=1)
 
@@ -3236,6 +3284,130 @@ if HAS_PYSIDE6:
                                        f"报告已导出：\n{path}\n\n图表已内嵌为图片，双击即可用浏览器打开(离线可看)。")
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", str(e))
+
+        # ---- 9.2.1i 实时监控标签页 ----
+        def _build_monitor_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("刷新间隔:"))
+            self.mon_interval = QComboBox(); self.mon_interval.addItems(["3 秒", "5 秒", "10 秒", "30 秒"])
+            self.mon_interval.setCurrentIndex(1)
+            top.addWidget(self.mon_interval)
+            self.mon_start_btn = QPushButton("▶ 开始监控")
+            self.mon_start_btn.setStyleSheet("font-weight:bold; padding:6px; background:#1e8449; color:white;")
+            self.mon_start_btn.clicked.connect(self._on_start_monitor)
+            top.addWidget(self.mon_start_btn)
+            self.mon_stop_btn = QPushButton("■ 停止")
+            self.mon_stop_btn.clicked.connect(self._on_stop_monitor); self.mon_stop_btn.setEnabled(False)
+            top.addWidget(self.mon_stop_btn)
+            self.mon_fc_btn = QPushButton("🔮 预测明日/一周/一月")
+            self.mon_fc_btn.clicked.connect(self._on_monitor_forecast)
+            top.addWidget(self.mon_fc_btn)
+            top.addStretch()
+            layout.addLayout(top)
+            self.mon_view = QTextBrowser()
+            layout.addWidget(self.mon_view, stretch=1)
+            self._mon_fc_html = ""
+            self._monitor_timer = QTimer(self)
+            self._monitor_timer.timeout.connect(self._refresh_monitor)
+            return panel
+
+        def _on_start_monitor(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "实时监控需真实数据源，请把数据源切换为「真实数据」。")
+                return
+            sec = int(self.mon_interval.currentText().split()[0])
+            self._monitor_timer.start(sec * 1000)
+            self.mon_start_btn.setEnabled(False); self.mon_stop_btn.setEnabled(True)
+            self._oplog(f"开始实时监控 {self.code_edit.text().strip()}，每 {sec} 秒刷新。")
+            self._refresh_monitor()
+
+        def _on_stop_monitor(self):
+            self._monitor_timer.stop()
+            self.mon_start_btn.setEnabled(True); self.mon_stop_btn.setEnabled(False)
+            self._oplog("停止实时监控。")
+
+        def _refresh_monitor(self):
+            code = self.code_edit.text().strip()
+            trading, status = is_trading_now()
+            try:
+                q = StockDataFetcher.fetch_realtime(code)
+            except Exception as e:
+                self.mon_view.setHtml(f"<p style='color:#c0392b'>实时行情获取失败：{e}</p>"
+                                      "<p>可能是网络/接口波动，会在下次刷新重试；或先确认代码正确。</p>")
+                return
+
+            def num(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+            price, prev = num(q.get("price")), num(q.get("prev"))
+            pct = num(q.get("pct"))
+            col = "#c0392b" if (pct or 0) >= 0 else "#1a9d5a"
+            now = dt.datetime.now().strftime("%H:%M:%S")
+            st_col = "#1e8449" if trading else "#888"
+            head = (f"<h2>{code} 实时监控　<span style='color:{st_col}'>[{status}]</span>"
+                    f"　<span style='color:#888;font-size:12px'>更新 {now}</span></h2>"
+                    f"<div style='font-size:22px;color:{col}'><b>{q.get('price','-')}</b>　"
+                    f"{('%+.2f%%' % pct) if pct is not None else ''}　"
+                    f"{('(%+.2f)' % (price-prev)) if (price is not None and prev is not None) else ''}</div>")
+            info = ("<table border=0 cellpadding=3><tr>"
+                    f"<td>今开 {q.get('open','-')}</td><td>最高 <span style='color:#c0392b'>{q.get('high','-')}</span></td>"
+                    f"<td>最低 <span style='color:#1a9d5a'>{q.get('low','-')}</span></td><td>昨收 {q.get('prev','-')}</td></tr>"
+                    f"<tr><td>量比 {q.get('vol_ratio','-')}</td><td>换手 {q.get('turnover','-')}%</td>"
+                    f"<td>成交量 {q.get('vol','-')}手</td><td>成交额 {q.get('amount','-')}</td></tr></table>")
+            # 盘口五档（买卖手）
+            def _lvl(rows, label, color):
+                out = []
+                for i, (p, v) in enumerate(rows):
+                    out.append(f"<tr><td style='color:#888'>{label}{i+1}</td>"
+                               f"<td style='color:{color}'>{p if p is not None else '-'}</td><td>{v if v is not None else '-'}</td></tr>")
+                return "".join(out)
+            pankou = ("<h3>盘口五档（买卖手）</h3><table border=1 cellpadding=3 cellspacing=0>"
+                      "<tr bgcolor=#eef><th>档位</th><th>价</th><th>量(手)</th></tr>"
+                      + _lvl(list(reversed(q.get("asks", []))), "卖", "#1a9d5a")
+                      + "<tr><td colspan=3 bgcolor=#f6f6f6></td></tr>"
+                      + _lvl(q.get("bids", []), "买", "#c0392b") + "</table>")
+            note = ("<p style='color:#888;font-size:12px'>盘口为实时快照(东方财富)；"
+                    "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。"
+                    "下方为模型对未来的预测参考，点上方按钮更新。</p>")
+            self.mon_view.setHtml(head + info + pankou + note + (self._mon_fc_html or ""))
+
+        def _on_monitor_forecast(self):
+            code = self.code_edit.text().strip()
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "预测需真实数据，请切换数据源为「真实数据」。"); return
+            self.mon_fc_btn.setEnabled(False); self.mon_fc_btn.setText("预测中...")
+            QApplication.processEvents()
+            try:
+                start = self.start_date.date().toString("yyyyMMdd")
+                end = self.end_date.date().toString("yyyyMMdd")
+                df = StockDataFetcher().fetch(code, start, end)
+                if self.chk_val.isChecked() or self.chk_idx.isChecked() or self.chk_mf.isChecked():
+                    df, _ = StockDataFetcher.enrich(df, code, self.chk_val.isChecked(),
+                                                    self.chk_idx.isChecked(), self.chk_mf.isChecked())
+                tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+                algo = self.fc_model_combo.currentText() if hasattr(self, "fc_model_combo") else "Lasso"
+                fc = forecast_curve(algo, df, target_mode=tm, horizons=(1, 5, 20, 60), progress_cb=self._log)
+                nm = {1: "明日", 5: "1周后", 20: "1个月后", 60: "3个月后"}
+                rows = "".join(
+                    f"<tr><td>{nm.get(p['horizon'], str(p['horizon'])+'日后')}</td>"
+                    f"<td><b>{p['pred_close']:.2f}</b></td>"
+                    f"<td style='color:{'#c0392b' if p['change_pct']>=0 else '#1a9d5a'}'>{p['change_pct']:+.2f}%</td></tr>"
+                    for p in fc["points"] if "pred_close" in p)
+                self._mon_fc_html = (
+                    f"<hr><h3>模型预测参考（{algo}，基于截至 {fc['last_date']} 的数据）</h3>"
+                    "<table border=1 cellpadding=4 cellspacing=0><tr bgcolor=#eef><th>时点</th><th>预测价</th><th>涨跌</th></tr>"
+                    + rows + "</table>"
+                    "<p style='color:#c0392b;font-size:12px'>⚠ 预测越往后越不可靠，绝不构成投资建议。</p>")
+                self._refresh_monitor() if self._monitor_timer.isActive() else self.mon_view.setHtml(
+                    self.mon_view.toHtml() + self._mon_fc_html)
+            except Exception as e:
+                QMessageBox.critical(self, "预测失败", str(e))
+            finally:
+                self.mon_fc_btn.setEnabled(True); self.mon_fc_btn.setText("🔮 预测明日/一周/一月")
 
         # ---- 9.2.1f 策略回测标签页 ----
         def _build_backtest_tab(self) -> QWidget:
