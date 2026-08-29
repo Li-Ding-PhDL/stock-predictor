@@ -178,7 +178,7 @@ try:
         QGroupBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton, QLabel,
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
-        QFileDialog
+        QFileDialog, QDialog
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
     from PySide6.QtGui import QFont
@@ -2980,6 +2980,54 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
     }
 
 
+# ==================== 第八部分补充7：名词解释（大白话，给不懂金融/机器学习的用户） ====================
+GLOSSARY = {
+    "金融名词（看盘/选股）": [
+        ("PE 市盈率(TTM)", "股价是公司「每股年利润」的多少倍。打比方：开个店，PE=20 就是按现在的赚钱速度约 20 年回本。一般越低越便宜；公司亏损时没有 PE。"),
+        ("PB 市净率", "股价是公司「每股净资产(账面身家)」的多少倍。PB<1 表示比公司账面身家还便宜。"),
+        ("PS 市销率", "股价对「每股营业收入」的倍数，常用于还没盈利的成长公司。"),
+        ("总市值", "公司所有股票加起来值多少钱 = 股价 × 总股本。越大公司越大。"),
+        ("换手率", "当天成交的股数占「流通股」的百分比。高=买卖很频繁/很活跃。"),
+        ("量比", "当天成交量 ÷ 最近几天的平均成交量。>1 是放量(比平时活跃)，<1 是缩量。"),
+        ("主力资金净流入", "当天「大单」(机构、大户)是净买入还是净卖出。正数=大资金在买，负数=在卖。"),
+        ("北向资金", "通过沪深港通进来的外资(港/外资)，常被叫「聪明钱」，是外资对 A 股的态度。"),
+        ("隔夜美股(纳斯达克)", "昨晚美股涨跌。美股和 A 股有些板块联动，昨夜美股大跌，A 股今天开盘可能承压。"),
+        ("前复权", "把「除权除息」(送股/分红)造成的价格跳空抹平，让不同时间的股价能公平比较。"),
+        ("ST / *ST", "被交易所「特别处理/风险警示」的股票，通常是连续亏损等，<b>有退市风险，很危险</b>。"),
+        ("面值退市", "股价连续 20 个交易日低于 1 元，会被强制退市。"),
+        ("涨跌幅 / 收益率", "(今天价格 − 昨天价格) ÷ 昨天价格，就是涨了或跌了百分之几。"),
+        ("盘口 / 买卖五档", "当前排队等着买/卖的前 5 个价位和挂单量(买手/卖手)。"),
+    ],
+    "模型与评估名词（判断准不准）": [
+        ("DA 方向准确率", "预测「涨还是跌」猜对的比例。<b>50% = 抛硬币</b>，只有明显 >50% 才算真有本事。"),
+        ("UP_P 上涨精确率", "模型说「会涨」的那些次里，真的涨了的比例。你只在它说涨时买，所以这个最实用。"),
+        ("R² 决定系数", "模型解释了多少波动，越接近 1 越好。<b>但预测「价格」时会虚高到 0.9+，是假象，别被骗</b>——所以我们默认预测涨跌幅。"),
+        ("MAE 平均绝对误差", "预测平均差多少(元或%)，越小越好。"),
+        ("RMSE 均方根误差", "和 MAE 类似但对「大错」惩罚更重，越小越好。"),
+        ("过拟合", "模型在「训练集」上很准、到「测试集」就拉胯——像死记硬背、不会举一反三。看训练误差远小于测试误差就是过拟合。"),
+        ("训练 / 验证 / 测试集", "学习用 / 调参用 / 最终考试用，分开来防作弊(不能拿考题当练习)。"),
+        ("策略回测", "用历史数据模拟「跟着模型预测买卖」到底能赚多少，还扣手续费。跑不赢「一直持有」就说明没用。"),
+        ("夏普比率", "每承担一分风险换来多少收益，越高越好(>1 算不错)。"),
+        ("最大回撤", "从最高点跌到最低点的最大跌幅，衡量「最坏能亏多少」。"),
+        ("均线 MA5/10/20", "最近 5/10/20 天收盘价的平均线，看趋势。"),
+        ("区间平均线(虚线)", "所选整段时间收盘价的平均，一条水平参考线。"),
+        ("因子(价值/动量/资金)", "选股打分用的几个角度：价值=便不便宜，动量=近期涨势强不强，资金=大钱在不在买。"),
+    ],
+}
+
+
+def glossary_html() -> str:
+    parts = ["<h2>名词解释（大白话）</h2>",
+             "<p style='color:#888'>看不懂的名词在这里找。都是尽量通俗的解释，仅帮助理解，不构成投资建议。</p>"]
+    for section, items in GLOSSARY.items():
+        parts.append(f"<h3 style='color:#2c6fbb'>{section}</h3>"
+                     "<table border=1 cellpadding=5 cellspacing=0 width=100%>")
+        for term, expl in items:
+            parts.append(f"<tr><td width=22% valign=top><b>{term}</b></td><td>{expl}</td></tr>")
+        parts.append("</table>")
+    return "".join(parts)
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -4553,7 +4601,24 @@ if HAS_PYSIDE6:
             self.horizon_combo.setToolTip("预测未来多少个交易日后的涨跌。方向准确率/基准对所有周期都已算对。")
             layout.addWidget(self.horizon_combo, 5, 1)
 
+            self.glossary_btn = QPushButton("❓ 名词解释（PE/PB/DA 看不懂就点这）")
+            self.glossary_btn.setStyleSheet("padding:5px;")
+            self.glossary_btn.clicked.connect(self._show_glossary)
+            layout.addWidget(self.glossary_btn, 6, 0, 1, 2)
+
             return box
+
+        def _show_glossary(self):
+            """弹出「名词解释」对话框(大白话解释金融+模型名词)。"""
+            dlg = QDialog(self)
+            dlg.setWindowTitle("名词解释（大白话）")
+            dlg.resize(720, 640)
+            lay = QVBoxLayout(dlg)
+            view = QTextBrowser()
+            view.setHtml(glossary_html())
+            lay.addWidget(view)
+            self._oplog("查看名词解释。")
+            dlg.exec()
 
         # ---- 9.2.2b 外部数据接入区（真实来源，可勾选；仅真实数据模式生效）----
         def _build_external_group(self) -> QGroupBox:
@@ -4563,14 +4628,20 @@ if HAS_PYSIDE6:
             self.chk_weekly.setChecked(True); self.chk_weekly.setEnabled(False)
             self.chk_val = QCheckBox("财报估值：PE/PB/总市值 (日频 · 乐咕乐股或百度，自动适配)")
             self.chk_val.setChecked(True)
+            self.chk_val.setToolTip("PE市盈率=股价是每股年利润的多少倍(越低越便宜)；PB市净率=股价对每股净资产的倍数；"
+                                    "总市值=公司总价值。看不懂点下方「名词解释」。")
             self.chk_idx = QCheckBox("大盘环境：沪深300 涨跌/均线偏离 (东方财富)")
             self.chk_idx.setChecked(True)
+            self.chk_idx.setToolTip("沪深300是A股最有代表性的300只大盘股指数，代表「大盘」整体强弱。")
             self.chk_mf = QCheckBox("主力资金流向：主力/超大单/大单净流入 + 进场/洗盘代理 (东方财富)")
             self.chk_mf.setChecked(True)
+            self.chk_mf.setToolTip("主力=机构/大户的大单。净流入为正=大资金在买入，为负=在卖出。")
             self.chk_us = QCheckBox("隔夜美股：昨夜纳斯达克涨跌 (新浪，日期+1对齐无泄露)")
             self.chk_us.setChecked(True)
+            self.chk_us.setToolTip("昨晚美股(纳斯达克)的涨跌。昨夜美股大跌，A股今天开盘常承压。")
             self.chk_nb = QCheckBox("北向资金：沪深股通每日净流入 (东方财富)")
             self.chk_nb.setChecked(True)
+            self.chk_nb.setToolTip("通过沪深港通进来的外资，常被称为「聪明钱」，看外资态度。")
             self.chk_news = QCheckBox("个股新闻：真实标题+链接，仅在\"机器学习内部\"页展示 (东方财富)")
             self.chk_news.setChecked(True)
             for c in (self.chk_weekly, self.chk_val, self.chk_idx, self.chk_mf,
