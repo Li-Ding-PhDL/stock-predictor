@@ -178,7 +178,7 @@ try:
         QGroupBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton, QLabel,
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
-        QFileDialog, QDialog
+        QFileDialog, QDialog, QProgressDialog
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
     from PySide6.QtGui import QFont
@@ -3423,7 +3423,7 @@ if HAS_PYSIDE6:
         # ---- 9.2.1c 点击"获取 K 线"后：拉数据并画图 ----
         def _on_fetch_kline(self):
             self.kline_btn.setEnabled(False); self.kline_hint.setText("⏳ 正在拉取行情并绘制 K 线 ...")
-            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 if use_synthetic:
@@ -3452,7 +3452,7 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "K 线获取失败", str(e))
                 self.kline_hint.setText("获取失败，详见弹窗。若是代理/网络问题，可先用合成数据。")
             finally:
-                QApplication.restoreOverrideCursor(); self.kline_btn.setEnabled(True)
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.kline_btn.setEnabled(True)
 
         # ---- 9.2.1d 画蜡烛图（价格 + 均线 + 成交量）----
         @staticmethod
@@ -3578,7 +3578,7 @@ if HAS_PYSIDE6:
 
         def _on_build_mldata(self):
             self.mldata_btn.setEnabled(False); self.mldata_hint.setText("⏳ 正在拉取数据并生成透视 ...")
-            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 enrich_status, news = {}, None
@@ -3631,7 +3631,7 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "数据透视失败", str(e))
                 self.mldata_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
             finally:
-                QApplication.restoreOverrideCursor(); self.mldata_btn.setEnabled(True)
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.mldata_btn.setEnabled(True)
 
         def _draw_mldata_trend(self, code, sample_dates, close_target, a, b, target_mode):
             self.mldata_figure.clear()
@@ -3971,6 +3971,21 @@ if HAS_PYSIDE6:
                 "<li>数据来自公开接口，请仅作个人研究：勿高频抓取、勿售卖/再分发数据、"
                 "勿无牌荐股或收费、勿大规模转发实时行情。</li>"
                 "</ul></div>",
+                # 大白话导读：把界面里讲的几件事一并写进报告，报告可独立阅读
+                "<div style='background:#f4f8ff;border:1px solid #2c6fbb;padding:8px;margin:6px 0'>"
+                "<b style='color:#2c6fbb'>📖 如何看懂本报告(写给不懂金融的你)</b>"
+                "<ul style='margin:4px 0'>"
+                "<li><b>「预测结果对比图」两条线几乎重合 ≠ 预测神准</b>。因为股票『明天价≈今天价』，"
+                "把昨天的价格照抄过来(Naive基准)也会几乎重合。真正该看的是<b>方向准确率DA</b>"
+                "(猜涨跌方向对的比例，50%≈抛硬币)和<b>策略回测</b>能不能真赚钱。</li>"
+                "<li><b>策略回测</b>：假设『模型说涨就买、说跌就空仓』走一遍历史(已扣手续费)，"
+                "看最后赚多少，并和『一直持有不动』比。<b>跑不赢一直持有，就说明这个模型没用</b>。</li>"
+                "<li><b>市盈率PE(TTM)</b>=股价÷每股年利润；<b>为负数=公司在亏损</b>(没有利润)，"
+                "并非越低越好，负数要警惕。其余名词见软件「❓名词解释」按钮。</li>"
+                "<li><b>「模型对后市的机械倾向」表里的『偏涨/偏跌』只是模型按历史算出的机械方向，"
+                "不是预言、更不是买卖建议</b>；每行都并列了它的可信度(DA)，"
+                "DA≈50%就等于抛硬币、请直接忽略。最终买不买由你自己判断。</li>"
+                "</ul></div>",
             ]
             # 综合研判卡放最前(客观事实汇总，非建议)
             if getattr(self, "_html_card", ""):
@@ -4015,7 +4030,7 @@ if HAS_PYSIDE6:
             tm = "return" if self.target_combo.currentIndex() == 0 else "price"
             horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
             self.rcard_btn.setEnabled(False); self.report_hint.setText("⏳ 正在生成综合研判卡 ...")
-            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
                 start = self.start_date.date().toString("yyyyMMdd")
                 end = self.end_date.date().toString("yyyyMMdd")
@@ -4030,7 +4045,7 @@ if HAS_PYSIDE6:
             except Exception as e:
                 QMessageBox.critical(self, "研判卡生成失败", str(e))
             finally:
-                QApplication.restoreOverrideCursor(); self.rcard_btn.setEnabled(True)
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.rcard_btn.setEnabled(True)
 
         def _on_gen_report(self):
             if not self.results and not getattr(self, "_html_analysis", "") \
@@ -4038,16 +4053,33 @@ if HAS_PYSIDE6:
                 QMessageBox.information(self, "提示",
                                         "报告为空。请先在各页生成内容：\n"
                                         "① 行情K线图→获取K线  ② 运行模型  ③ 未来预测/策略回测  ④ 机器学习内部→数据透视\n"
+                                        "(真实数据下生成报告时会自动补一张含『模型心情/倾向』的综合研判卡)\n"
                                         "然后回来点「生成/刷新 报告预览」。")
                 return
             self.report_btn.setEnabled(False); self.report_hint.setText("⏳ 正在生成报告(含K线图) ...")
-            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
+                # 落实"全部弄进综合报告"：缺研判卡(含模型对后市的心情/倾向)但已用真实数据时，自动补一张
+                if not getattr(self, "_html_card", "") and self.data_source_combo.currentIndex() != 1:
+                    code0 = self.code_edit.text().strip()
+                    if code0:
+                        try:
+                            self._prog_open("⏳ 报告缺研判卡，正在自动生成(含模型心情/倾向) ……")
+                            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+                            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+                            start0 = self.start_date.date().toString("yyyyMMdd")
+                            end0 = self.end_date.date().toString("yyyyMMdd")
+                            card0 = research_card(code0, start0, end0, target_mode=tm, horizon=horizon,
+                                                  models=("SVR", "Lasso"), progress_cb=self._log)
+                            self._html_card = research_card_html(card0)
+                            self._prog_open("⏳ 正在生成报告(含K线图) ……")
+                        except Exception as e:
+                            self._log(f"报告自动补研判卡失败(跳过，不影响其余内容)：{e}")
                 self.report_view.setHtml(self._build_report_html())
                 self.report_hint.setText("报告已生成，可上下滚动查看；点「导出 HTML 报告」保存为网页。")
                 self._oplog("生成综合报告预览。")
             finally:
-                QApplication.restoreOverrideCursor(); self.report_btn.setEnabled(True)
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.report_btn.setEnabled(True)
 
         def _on_export_report(self):
             html = self._build_report_html()
@@ -4329,6 +4361,7 @@ if HAS_PYSIDE6:
             self.batch_run_btn.setEnabled(False); self.batch_run_btn.setText("扫描中...")
             self._oplog(f"批量扫描 {len(codes)} 只：{', '.join(codes)}（模型{self.batch_algo.currentText()}，周期{horizon}日）")
             self.batch_hint.setText("⏳ 正在批量扫描(每只都要训练模型，请耐心)... 进度见下方；也可切到「运行日志」看细节。")
+            self._prog_open("⏳ 批量扫描进行中：逐只训练模型，请稍候 ……")
             self.batch_worker = BatchWorker(codes, self.batch_algo.currentText(), start, end, tm, horizon, flags)
             self.batch_worker.progress_signal.connect(self._log)
             self.batch_worker.progress_signal.connect(self.batch_hint.setText)   # 进度也显示在本页
@@ -4338,6 +4371,7 @@ if HAS_PYSIDE6:
             self.batch_worker.start()
 
         def _batch_reset_btn(self):
+            self._prog_close()
             self.batch_run_btn.setEnabled(True); self.batch_run_btn.setText("▶ 预测扫描")
             self.factor_run_btn.setEnabled(True); self.factor_run_btn.setText("🏆 因子打分选股")
 
@@ -4354,6 +4388,7 @@ if HAS_PYSIDE6:
             self.batch_run_btn.setEnabled(False)
             self._oplog(f"因子打分选股 {len(codes)} 只：{', '.join(codes)}")
             self.batch_hint.setText("⏳ 正在因子打分选股(逐只采集因子)... 进度见下方；也可切到「运行日志」看细节。")
+            self._prog_open("⏳ 因子打分进行中：逐只采集因子并排名，请稍候 ……")
             self.factor_worker = FactorWorker(codes, start, end)
             self.factor_worker.progress_signal.connect(self._log)
             self.factor_worker.progress_signal.connect(self.batch_hint.setText)
@@ -4674,7 +4709,7 @@ if HAS_PYSIDE6:
 
         def _on_run_forecast(self):
             self.fc_btn.setEnabled(False); self.fc_hint.setText("⏳ 正在训练多周期预测模型 ...")
-            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
                 use_synthetic = self.data_source_combo.currentIndex() == 1
                 if use_synthetic:
@@ -4702,7 +4737,7 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "未来预测失败", str(e))
                 self.fc_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
             finally:
-                QApplication.restoreOverrideCursor(); self.fc_btn.setEnabled(True)
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.fc_btn.setEnabled(True)
 
         def _draw_forecast(self, code, df, fc):
             self.fc_figure.clear()
@@ -5018,6 +5053,7 @@ if HAS_PYSIDE6:
                         f"训练比例={train_ratio}；HPO={hpo_method}；外部数据={'+'.join(ext) or '无'}；"
                         f"算法({len(selected_algos)})={', '.join(selected_algos)}")
             self.progress_bar.show()
+            self._prog_open(f"⏳ 正在训练 {len(selected_algos)} 个模型，请稍候 ……")
             self._log(f"开始训练，共 {len(selected_algos)} 个模型：{', '.join(selected_algos)}")
             self.worker = TrainingWorker(config, self.raw_df, selected_algos)
             self.worker.progress_signal.connect(self._log)
@@ -5027,7 +5063,7 @@ if HAS_PYSIDE6:
 
         # ---- 9.4 训练完成回调：更新表格 + 图表 ----
         def _on_training_finished(self, results: List[ModelResult]):
-            self.progress_bar.hide()
+            self.progress_bar.hide(); self._prog_close()
             self.results = results
             self._log("全部模型训练完成。")
             self._update_result_table()
@@ -5124,7 +5160,7 @@ if HAS_PYSIDE6:
                     ("<details><summary>展开数据溯源链接</summary>" + links + "</details>" if links else ""))
 
         def _on_training_error(self, msg: str):
-            self.progress_bar.hide()
+            self.progress_bar.hide(); self._prog_close()
             QMessageBox.critical(self, "训练出错", msg)
 
         # ---- 9.5 结果表格 ----
@@ -5204,16 +5240,49 @@ if HAS_PYSIDE6:
             if btn is not None:
                 btn.setEnabled(False)
             QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._prog_open(msg)                      # 明显的模态"进程界面"
             QApplication.processEvents()             # 先把"加载中"画出来再干活
             try:
                 yield
             finally:
                 QApplication.restoreOverrideCursor()
+                self._prog_close()
                 if btn is not None:
                     btn.setEnabled(True)
                 # 提示文字不强制还原(各处会自己设完成后的文案)；仅当调用方没改时保留原文
                 if label is not None and label.text() == msg and old is not None:
                     label.setText(old)
+
+        # ---- 明显可见的"进程界面"(模态忙碌弹窗) ----
+        def _prog_open(self, msg="⏳ 正在运行，请稍候 ……"):
+            """弹出一个居中的模态"运行中"窗口，比等待光标醒目得多。
+            range=(0,0) 表示忙碌指示(来回滚动的进度条)。同步耗时操作里它至少会"弹出来"，
+            后台线程操作里它还会持续滚动。重复调用只更新文字，不叠开多个。"""
+            try:
+                dlg = getattr(self, "_prog_dlg", None)
+                if dlg is None:
+                    dlg = QProgressDialog(msg, None, 0, 0, self)   # 无取消按钮
+                    dlg.setWindowTitle("请稍候")
+                    dlg.setWindowModality(Qt.ApplicationModal)
+                    dlg.setCancelButton(None)
+                    dlg.setMinimumDuration(0)       # 立刻显示，不等 4 秒
+                    dlg.setAutoClose(False); dlg.setAutoReset(False)
+                    dlg.setMinimumWidth(320)
+                    self._prog_dlg = dlg
+                dlg.setLabelText(msg)
+                dlg.show(); dlg.raise_()
+                QApplication.processEvents()
+            except Exception:
+                pass                                # 进程窗只是提示，绝不因它中断主流程
+
+        def _prog_close(self):
+            try:
+                dlg = getattr(self, "_prog_dlg", None)
+                if dlg is not None:
+                    dlg.reset(); dlg.hide()
+                QApplication.processEvents()
+            except Exception:
+                pass
 
 
 # ==================== 第十部分：可编程 API（供脚本 / 其它 AI 调用） ====================
