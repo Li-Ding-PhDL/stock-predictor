@@ -3082,9 +3082,17 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
             if base and base.metrics:
                 up_rate = base.metrics.get("DA")
             mr = next((r for r in res if r.algo_name == m and not r.error), None)
+            # 模型对未来该周期的"机械倾向"：预测涨跌幅的方向(不是建议，需配可信度看)
+            pred_chg = None
+            try:
+                fc = TrainingPipeline(cfg).predict_next(m, df)
+                pred_chg = fc.get("pred_change_pct")
+            except Exception:
+                pass
             da_rows.append({"model": m,
                             "DA": (mr.metrics.get("DA") if mr else None),
-                            "UP_P": (mr.metrics.get("UP_P") if mr else None)})
+                            "UP_P": (mr.metrics.get("UP_P") if mr else None),
+                            "pred_change": pred_chg})
         except Exception as e:
             da_rows.append({"model": m, "error": str(e)})
     warns = assess_risks(code, name, df, news=None)
@@ -3125,6 +3133,28 @@ def research_card_html(card: Dict[str, Any]) -> str:
                else "<span style='color:#c0392b'>≈基准/偏弱</span>")
         da_body += (f"<tr><td>{r['model']}</td><td>{f(da,'%',1)}</td>"
                     f"<td>{f(r.get('UP_P'),'%',1)}</td><td>{tag}</td></tr>")
+    # 模型「机械倾向」+ 可信度（回答"模型对后市的看法"，但绝不当建议：可信度低就明说≈抛硬币）
+    lean_rows = ""
+    for r in card["da_rows"]:
+        if r.get("error"):
+            continue
+        pc, da = r.get("pred_change"), r.get("DA")
+        if pc is None:
+            lean = "-"
+        else:
+            lean = ("<span style='color:#c0392b'>偏涨</span>" if pc > 0.2 else
+                    ("<span style='color:#1a9d5a'>偏跌</span>" if pc < -0.2 else "中性"))
+        reliable = (up is not None and da is not None and da >= up + 3 and da >= 52)
+        cred = ("<span style='color:#1e8449'>可信度尚可(仍非建议)</span>" if reliable
+                else "<span style='color:#c0392b'>≈抛硬币，基本不可信</span>")
+        lean_rows += (f"<tr><td>{r['model']}</td><td>{lean}</td>"
+                      f"<td>{f(pc,'%',2)}</td><td>DA {f(da,'%',1)} → {cred}</td></tr>")
+    lean_html = (f"<h3>模型对后市的「机械倾向」（{card['horizon']}日，<b style='color:#c0392b'>非预言、非建议</b>）</h3>"
+                 "<p style='color:#888'>下面是模型按数据算出的方向倾向，但<b>必须连着右边的可信度一起看</b>："
+                 "DA≈50% 时这个倾向就等于抛硬币，别当真。</p>"
+                 "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+                 "<tr bgcolor=#eef><th>模型</th><th>倾向</th><th>预测涨跌</th><th>可信度</th></tr>"
+                 + lean_rows + "</table>")
     # 客观判读(描述性，非建议)
     reads = []
     if card["pe"] is not None:
@@ -3153,6 +3183,7 @@ def research_card_html(card: Dict[str, Any]) -> str:
         "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
         "<tr bgcolor=#eef><th>模型</th><th>DA方向准确率</th><th>UP_P上涨精确率</th><th>对比基准</th></tr>"
         + da_body + "</table>"
+        + lean_html +
         "<h3>关键数据现状（真实来源，见数据溯源）</h3>" + ctx +
         "<h3>客观判读（描述事实，非建议）</h3><p>" + "；".join(reads) + "。</p>"
         "<p style='color:#888;font-size:12px'>提示：市场接近有效，单模型方向预测大多≈50%；"
@@ -4297,8 +4328,10 @@ if HAS_PYSIDE6:
                             self.chk_us.isChecked(), self.chk_nb.isChecked())
             self.batch_run_btn.setEnabled(False); self.batch_run_btn.setText("扫描中...")
             self._oplog(f"批量扫描 {len(codes)} 只：{', '.join(codes)}（模型{self.batch_algo.currentText()}，周期{horizon}日）")
+            self.batch_hint.setText("⏳ 正在批量扫描(每只都要训练模型，请耐心)... 进度见下方；也可切到「运行日志」看细节。")
             self.batch_worker = BatchWorker(codes, self.batch_algo.currentText(), start, end, tm, horizon, flags)
             self.batch_worker.progress_signal.connect(self._log)
+            self.batch_worker.progress_signal.connect(self.batch_hint.setText)   # 进度也显示在本页
             self.batch_worker.finished_signal.connect(self._on_batch_finished)
             self.batch_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "批量出错", m),
                                                               self._batch_reset_btn()))
@@ -4320,8 +4353,10 @@ if HAS_PYSIDE6:
             self.factor_run_btn.setEnabled(False); self.factor_run_btn.setText("打分中...")
             self.batch_run_btn.setEnabled(False)
             self._oplog(f"因子打分选股 {len(codes)} 只：{', '.join(codes)}")
+            self.batch_hint.setText("⏳ 正在因子打分选股(逐只采集因子)... 进度见下方；也可切到「运行日志」看细节。")
             self.factor_worker = FactorWorker(codes, start, end)
             self.factor_worker.progress_signal.connect(self._log)
+            self.factor_worker.progress_signal.connect(self.batch_hint.setText)
             self.factor_worker.finished_signal.connect(self._on_factor_finished)
             self.factor_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "因子选股出错", m),
                                                                self._batch_reset_btn()))
@@ -4549,6 +4584,11 @@ if HAS_PYSIDE6:
             top.addStretch()
             layout.addLayout(top)
 
+            intro = QLabel("💡 什么是策略回测：假设你「模型说涨就买、说跌就空仓」，用过去的真实行情走一遍(还扣手续费)，"
+                           "看最后赚了多少，再和「一直持有不动」对比。红线(策略)明显在蓝线(买入持有)之上才算有用；"
+                           "跑不赢就说明这个预测不值得跟。这是检验预测能不能赚钱的照妖镜。")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555; background:#f6f8fb; padding:6px;")
+            layout.addWidget(intro)
             self.bt_stat = QLabel("先在左侧运行模型，再来这里选模型回测。")
             self.bt_stat.setWordWrap(True)
             self.bt_stat.setStyleSheet("padding:4px;")
@@ -4879,9 +4919,20 @@ if HAS_PYSIDE6:
             grid = QGridLayout(box)
             metric_names = ["R2", "MAE", "RMSE", "DA", "UP_P", "MAPE", "MSE", "CE", "NSE", "R", "KGE", "SMAPE", "WI", "SI"]
             default_on = {"R2", "MAE", "RMSE", "DA", "UP_P"}
+            tips = {
+                "R2": "解释了多少波动，越接近1越好；但预测价格时会虚高，是假象",
+                "MAE": "平均绝对误差，预测平均差多少，越小越好",
+                "RMSE": "均方根误差，对大错更敏感，越小越好",
+                "DA": "方向准确率：涨跌猜对的比例，50%=抛硬币，>50%才有意义(最重要)",
+                "UP_P": "上涨精确率：模型说涨时真的涨了的比例，最实用",
+                "MAPE": "平均绝对百分比误差", "MSE": "均方误差", "CE": "效率系数(=NSE)",
+                "NSE": "纳什效率系数", "R": "皮尔逊相关系数", "KGE": "KG效率系数",
+                "SMAPE": "对称百分比误差", "WI": "一致性指数", "SI": "散布指数",
+            }
             for i, name in enumerate(metric_names):
                 cb = QCheckBox(name)
                 cb.setChecked(name in default_on)
+                cb.setToolTip(tips.get(name, "") + "（详见「名词解释」）")
                 self.metric_checkboxes[name] = cb
                 grid.addWidget(cb, i // 4, i % 4)
             return box
@@ -5122,8 +5173,15 @@ if HAS_PYSIDE6:
                 ax.plot(r.test_dates, r.y_test_pred, label=f"{r.algo_name} 预测", alpha=0.8)
 
             ax.set_xlabel("日期"); ax.set_ylabel("收盘价")
-            ax.set_title("测试集：预测值 vs 真实值")
+            ax.set_title("测试集：预测值 vs 真实值（这条线『很贴合』是假象，别被骗！）")
             ax.legend(loc="best", fontsize=8)
+            # 关键诚实提示：价格预测的线总是紧贴真实值，是因为"明天价≈今天价"，连Naive基准都贴合，
+            # 并不代表模型厉害。真本事看 DA 方向准确率，不是看这条线贴不贴。
+            ax.text(0.5, -0.22,
+                    "⚠️ 别被这张图骗了：明天价≈今天价，所以连『Naive前值』基准都紧贴真实值——线贴合≠预测准。\n"
+                    "真本事请看『指标结果表格』的 DA 方向准确率(≈50%就是没用)，和『策略回测』能不能赚钱。",
+                    transform=ax.transAxes, ha="center", va="top", fontsize=9, color="#c0392b")
+            self.figure.subplots_adjust(bottom=0.30)
             self.figure.autofmt_xdate()
             self.canvas.draw()
 
