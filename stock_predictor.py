@@ -2745,6 +2745,75 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
     return rows
 
 
+def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
+                      w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
+    """
+    批量"因子打分选股"(横截面)：对一篮子股票，各算真实因子——
+      价值(低PE/PB更好)、动量(近3月涨幅更高更好)、资金(近5日主力净流入更多更好)，
+      在这一篮子里做百分位排名后加权成综合分，并扣除风险(ST/亏损/暴跌)惩罚，最后排序。
+
+    诚实说明：因子投资长期**统计上**有小优势(尤其价值+动量)，但**不是保证、不是择时**，
+    篮子越小排名越不稳；本工具是研究筛查、**不是荐股**。排在前面≠该买。
+    """
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    recs = []
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        log(f"[因子扫描 {i}/{len(codes)}] {code} 采集因子 ...")
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            df, _ = StockDataFetcher.enrich(df, code, True, False, True, False, False)  # 估值+资金
+            name = StockDataFetcher.fetch_stock_name(code)
+            close = pd.to_numeric(df["close"], errors="coerce")
+            lc = float(close.iloc[-1])
+            def last(col):
+                if col in df.columns:
+                    s = pd.to_numeric(df[col], errors="coerce").dropna()
+                    return float(s.iloc[-1]) if len(s) else None
+                return None
+            mom1 = lc / float(close.iloc[-21]) - 1 if len(close) > 21 else None
+            mom3 = lc / float(close.iloc[-63]) - 1 if len(close) > 63 else None
+            mf5 = None
+            if "mf_main_net" in df.columns:
+                mf5 = float(pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0).tail(5).sum())
+            warns = assess_risks(code, name, df, news=None)
+            recs.append({"code": code, "name": name, "last_close": round(lc, 2),
+                         "pe": last("val_pe_ttm"), "pb": last("val_pb"),
+                         "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
+                         "risk_n": len(warns), "risk_hi": sum(1 for w in warns if w["level"] == "高"),
+                         "risk_top": (warns[0]["category"] if warns else ""), "error": None})
+        except Exception as e:
+            recs.append({"code": code, "name": "", "error": str(e)})
+
+    ok = [r for r in recs if not r.get("error")]
+    if ok:
+        def pct(vals, higher_better=True):
+            s = pd.Series(vals, dtype="float64")
+            r = s.rank(pct=True, na_option="keep") * 100
+            if not higher_better:
+                r = 100 - r
+            return r
+        pe = [r["pe"] if (r["pe"] and r["pe"] > 0) else np.nan for r in ok]     # 亏损/无PE不参与价值分
+        pb = [r["pb"] if (r["pb"] and r["pb"] > 0) else np.nan for r in ok]
+        v_pe, v_pb = pct(pe, False), pct(pb, False)                            # PE/PB 越低越好
+        s_val = pd.concat([v_pe, v_pb], axis=1).mean(axis=1)
+        s_mom = pct([r["mom3m"] for r in ok], True)                            # 动量越高越好
+        s_mon = pct([r["mf5"] for r in ok], True)                             # 资金流入越多越好
+        for k, r in enumerate(ok):
+            comps, wts = [], []
+            for sc, wt in [(s_val.iloc[k], w_value), (s_mom.iloc[k], w_momentum), (s_mon.iloc[k], w_money)]:
+                if pd.notna(sc):
+                    comps.append(sc * wt); wts.append(wt)
+            base = (sum(comps) / sum(wts)) if wts else 0.0
+            r["value_score"] = None if pd.isna(s_val.iloc[k]) else round(float(s_val.iloc[k]), 1)
+            r["mom_score"] = None if pd.isna(s_mom.iloc[k]) else round(float(s_mom.iloc[k]), 1)
+            r["money_score"] = None if pd.isna(s_mon.iloc[k]) else round(float(s_mon.iloc[k]), 1)
+            r["score"] = round(float(base) - 12.0 * r["risk_hi"] - 3.0 * (r["risk_n"] - r["risk_hi"]), 1)
+    recs.sort(key=lambda r: (r.get("score") if r.get("score") is not None else -1e9), reverse=True)
+    return recs
+
+
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "target_date",
@@ -2958,6 +3027,24 @@ if HAS_PYSIDE6:
                                   use_valuation=self.flags[0], use_index=self.flags[1],
                                   use_fundflow=self.flags[2],
                                   progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(rows)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class FactorWorker(QThread):
+        """批量因子打分选股后台线程。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(list)
+        error_signal = Signal(str)
+
+        def __init__(self, codes, start, end):
+            super().__init__()
+            self.codes = codes; self.start = start; self.end = end
+
+        def run(self):
+            try:
+                rows = batch_factor_scan(self.codes, start=self.start, end=self.end,
+                                         progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(rows)
             except Exception as e:
                 self.error_signal.emit(str(e))
@@ -3964,10 +4051,14 @@ if HAS_PYSIDE6:
             self.batch_algo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
             self.batch_algo.setCurrentText("Lasso")
             top.addWidget(self.batch_algo)
-            self.batch_run_btn = QPushButton("▶ 开始批量扫描")
+            self.batch_run_btn = QPushButton("▶ 预测扫描")
             self.batch_run_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2c6fbb; color:white;")
             self.batch_run_btn.clicked.connect(self._on_batch_run)
             top.addWidget(self.batch_run_btn)
+            self.factor_run_btn = QPushButton("🏆 因子打分选股")
+            self.factor_run_btn.setStyleSheet("font-weight:bold; padding:6px; background:#8e44ad; color:white;")
+            self.factor_run_btn.clicked.connect(self._on_factor_run)
+            top.addWidget(self.factor_run_btn)
             self.batch_export_btn = QPushButton("💾 导出CSV")
             self.batch_export_btn.clicked.connect(self._on_batch_export)
             top.addWidget(self.batch_export_btn)
@@ -4003,7 +4094,56 @@ if HAS_PYSIDE6:
             self.batch_worker.start()
 
         def _batch_reset_btn(self):
-            self.batch_run_btn.setEnabled(True); self.batch_run_btn.setText("▶ 开始批量扫描")
+            self.batch_run_btn.setEnabled(True); self.batch_run_btn.setText("▶ 预测扫描")
+            self.factor_run_btn.setEnabled(True); self.factor_run_btn.setText("🏆 因子打分选股")
+
+        def _on_factor_run(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "因子选股需真实数据，请把数据源切换为「真实数据」。"); return
+            raw = self.batch_codes.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if len(codes) < 2:
+                QMessageBox.warning(self, "提示", "因子选股是横截面排名，至少填 2 只股票(越多排名越有意义)。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            self.factor_run_btn.setEnabled(False); self.factor_run_btn.setText("打分中...")
+            self.batch_run_btn.setEnabled(False)
+            self._oplog(f"因子打分选股 {len(codes)} 只：{', '.join(codes)}")
+            self.factor_worker = FactorWorker(codes, start, end)
+            self.factor_worker.progress_signal.connect(self._log)
+            self.factor_worker.finished_signal.connect(self._on_factor_finished)
+            self.factor_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "因子选股出错", m),
+                                                               self._batch_reset_btn()))
+            self.factor_worker.start()
+
+        def _on_factor_finished(self, rows):
+            self._batch_rows = rows                 # 复用导出
+            self._batch_reset_btn()
+            headers = ["排名", "代码", "名称", "最新价", "综合分", "价值分", "动量分", "资金分",
+                       "近3月%", "风险数", "主要风险"]
+            self.batch_table.setColumnCount(len(headers))
+            self.batch_table.setHorizontalHeaderLabels(headers)
+            self.batch_table.setRowCount(len(rows))
+            rank = 0
+            for i, r in enumerate(rows):
+                if r.get("error"):
+                    self.batch_table.setItem(i, 1, QTableWidgetItem(r["code"]))
+                    self.batch_table.setItem(i, 2, QTableWidgetItem(f"失败: {r['error'][:30]}"))
+                    continue
+                rank += 1
+                m3 = r.get("mom3m")
+                vals = [str(rank), r["code"], r.get("name", ""), f"{r.get('last_close','')}",
+                        f"{r.get('score','')}", f"{r.get('value_score','') or '-'}",
+                        f"{r.get('mom_score','') or '-'}", f"{r.get('money_score','') or '-'}",
+                        (f"{m3*100:+.1f}%" if m3 is not None else "-"),
+                        str(r.get("risk_n", "")), r.get("risk_top", "")]
+                for c, v in enumerate(vals):
+                    it = QTableWidgetItem(str(v))
+                    if c == 9 and r.get("risk_n", 0) > 0:
+                        it.setForeground(Qt.red)
+                    self.batch_table.setItem(i, c, it)
+            self.batch_table.resizeColumnsToContents()
+            self._oplog(f"因子打分完成：{sum(1 for r in rows if not r.get('error'))} 只已排名。")
 
         def _on_batch_finished(self, rows):
             self._batch_rows = rows
