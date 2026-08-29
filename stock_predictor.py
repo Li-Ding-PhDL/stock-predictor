@@ -3032,6 +3032,72 @@ GLOSSARY = {
 }
 
 
+# 算法简称 → 全称 + 大白话（用于勾选框悬停提示 & 名词解释）
+ALGO_EXPLAIN = {
+    "BP/ANN":     "BP 神经网络：最经典的多层神经网络，靠反向传播误差来拟合复杂关系。",
+    "SVR":        "支持向量回归：找一条「容忍小误差」的最优曲线，样本少也稳，快，常用作基准。",
+    "LSSVM":      "最小二乘支持向量机：SVR 的快速版(解线性方程组代替二次规划)。",
+    "GPR":        "高斯过程回归：不但给预测值还给「不确定度」，小数据好用但较慢。",
+    "ElasticNet": "弹性网：Lasso + Ridge 的结合，兼顾自动选特征和稳定。",
+    "RidgeReg":   "岭回归：带 L2 惩罚的线性回归，防止系数过大、抗特征共线性。",
+    "Lasso":      "套索回归：带 L1 惩罚的线性回归，能把没用的特征系数压成 0(自动选特征)，快且稳，常用作基准。",
+    "PLSR":       "偏最小二乘回归：先把很多相关特征压缩成几个主成分再回归。",
+    "KNN":        "K 近邻：找历史上最像的 K 天，取它们的平均来预测。",
+    "Kstar":      "K*：基于熵距离的近邻法(本软件为近似实现)。",
+    "ELM":        "极限学习机：单隐层神经网络，随机权重、训练极快。",
+    "DTR":        "回归决策树：一层层 if-else 把数据切开做预测，直观但易过拟合。",
+    "DT":         "决策树：同上一类的树模型，直观但单棵易过拟合。",
+    "M5Rules":    "M5 规则：基于模型树的规则学习(本软件为近似实现)。",
+    "RF":         "随机森林：很多棵决策树投票取平均，抗过拟合、稳，常用主力模型。",
+    "Bagging":    "自助聚合：对数据反复抽样训练多个模型再平均，降低波动。",
+    "ExtraTrees": "极端随机树：比随机森林切分更随机，更快、更抗过拟合。",
+    "AdaBoost":   "自适应提升：一轮轮重点补做错的样本，串行叠加。",
+    "GBRT":       "梯度提升回归树：一棵接一棵纠正上一棵的残差，精度高，常用主力模型。",
+    "XGBoost":    "极致梯度提升：GBRT 的高效工程实现，比赛常胜(需装 xgboost)。",
+    "LightGBM":   "微软高速梯度提升：大数据更快(需装 lightgbm)。",
+    "CatBoost":   "Yandex 梯度提升：对类别特征友好、默认参数就不错(需装 catboost)。",
+    "LSTM":       "长短期记忆网络：专门记时间序列的长期依赖，深度学习经典时序模型(需装 torch)。",
+    "GRU":        "门控循环单元：LSTM 的精简版，更快(需装 torch)。",
+    "Transformer":"自注意力网络：让每个时间点关注全序列的关键处(需装 torch)。",
+    "TabNet":     "表格注意力网络：为表格数据设计(需装 pytorch-tabnet，缺则用 DNN 近似)。",
+    "CNN":        "卷积神经网络：用滑动窗口捕捉近几日的价量局部形态(需装 torch)。",
+    "DNN":        "深度全连接网络(多层感知机)：通用非线性拟合(需装 torch)。",
+    "ResNet":     "残差网络：加跳跃连接让深层网络更好训练(需装 torch)。",
+    "BPNet":      "BP 网络(神经网络的另一种实现，需装 torch)。",
+    "RBFNet":     "径向基函数网络：用「离中心多远」做非线性映射(需装 torch)。",
+    "SR":         "符号回归：直接进化出一个数学公式来拟合，可解释(需装 gplearn)。",
+    "GEP":        "基因表达式编程：用进化算法搜数学公式(本软件为近似实现)。",
+    "MEP":        "多表达式编程：同类的进化公式搜索(本软件为近似实现)。",
+    "ARIMA":      "差分自回归移动平均：最经典的统计时序模型，只用价格自身的历史规律(需装 statsmodels)。",
+}
+
+# 评价指标简称 → 全称 + 大白话（用于勾选框悬停提示 & 名词解释）
+METRIC_EXPLAIN = {
+    "R2":   "R² 决定系数：模型解释了多少波动，越接近 1 越好。预测「价格」时会虚高到 0.9+ 是假象，故默认预测涨跌幅。",
+    "MAE":  "平均绝对误差：预测平均差多少，越小越好。",
+    "MSE":  "均方误差：误差平方后的平均，对「大错」惩罚更重，越小越好。",
+    "RMSE": "均方根误差：MSE 开根号，单位与原数据一致，越小越好。",
+    "MAPE": "平均绝对百分比误差：平均差百分之几，越小越好(真实值接近 0 时会失真)。",
+    "SMAPE":"对称平均绝对百分比误差：MAPE 的改良版，越小越好。",
+    "R":    "相关系数：预测与真实的线性相关程度，越接近 1 越好。",
+    "NSE":  "纳什效率系数：1 为完美，0 相当于「只用均值预测」，越接近 1 越好。",
+    "CE":   "效率系数(与 NSE 同类)：越接近 1 越好。",
+    "KGE":  "Kling-Gupta 效率：综合相关性/偏差/变率的评分，越接近 1 越好。",
+    "WI":   "Willmott 一致性指数：0~1，越接近 1 越好。",
+    "SI":   "散度指数：RMSE ÷ 均值，越小越好。",
+    "DA":   "方向准确率：预测「涨还是跌」猜对的比例。50% = 抛硬币，只有明显 >50% 才算真有本事。",
+    "UP_P": "上涨精确率：模型说「会涨」的那些次里真的涨了的比例。你只在它说涨时买，所以这个最实用。",
+}
+
+# 把算法与指标简称并入名词解释总表（自动生成两个新板块）
+GLOSSARY["算法简称（模型 = 35 种不同的预测方法）"] = [
+    (name, ALGO_EXPLAIN[name]) for name in ALGO_EXPLAIN
+]
+GLOSSARY["评价指标简称（判断准不准的 14 个数）"] = [
+    (name, METRIC_EXPLAIN[name]) for name in METRIC_EXPLAIN
+]
+
+
 def glossary_html() -> str:
     parts = ["<h2>名词解释（大白话）</h2>",
              "<p style='color:#888'>看不懂的名词在这里找。都是尽量通俗的解释，仅帮助理解，不构成投资建议。</p>"]
@@ -3227,12 +3293,13 @@ if HAS_PYSIDE6:
 
         def __init__(self, codes, algo, start, end, target_mode, horizon, flags):
             super().__init__()
-            self.codes = codes; self.algo = algo; self.start = start; self.end = end
+            # 注意：不能叫 self.start / self.end，会覆盖 QThread.start() 方法导致无法启动线程
+            self.codes = codes; self.algo = algo; self.d_start = start; self.d_end = end
             self.target_mode = target_mode; self.horizon = horizon; self.flags = flags
 
         def run(self):
             try:
-                rows = batch_scan(self.codes, algo=self.algo, start=self.start, end=self.end,
+                rows = batch_scan(self.codes, algo=self.algo, start=self.d_start, end=self.d_end,
                                   target_mode=self.target_mode, horizon=self.horizon,
                                   use_valuation=self.flags[0], use_index=self.flags[1],
                                   use_fundflow=self.flags[2],
@@ -3249,11 +3316,12 @@ if HAS_PYSIDE6:
 
         def __init__(self, codes, start, end):
             super().__init__()
-            self.codes = codes; self.start = start; self.end = end
+            # 同上：避免 self.start 覆盖 QThread.start()
+            self.codes = codes; self.d_start = start; self.d_end = end
 
         def run(self):
             try:
-                rows = batch_factor_scan(self.codes, start=self.start, end=self.end,
+                rows = batch_factor_scan(self.codes, start=self.d_start, end=self.d_end,
                                          progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(rows)
             except Exception as e:
@@ -4909,11 +4977,15 @@ if HAS_PYSIDE6:
                 algos_in_cat = [name for name, cls in ALGO_REGISTRY.items() if cls.category == cat]
                 for i, name in enumerate(algos_in_cat):
                     cb = QCheckBox(name)
+                    explain = ALGO_EXPLAIN.get(name, "")   # 悬停显示全称+大白话
                     if not ALGO_AVAILABILITY.get(name, True):
                         cb.setEnabled(False)
-                        cb.setToolTip("缺少对应依赖库，暂不可用（详见文件顶部依赖说明）")
-                    elif name in default_on:
-                        cb.setChecked(True)               # 默认勾选，无需用户从零开始
+                        cb.setToolTip((explain + "\n" if explain else "")
+                                      + "⚠ 缺少对应依赖库，暂不可用（详见文件顶部依赖说明；也可在「名词解释」查全部算法）")
+                    else:
+                        cb.setToolTip(explain + "（更多见「名词解释」）" if explain else "")
+                        if name in default_on:
+                            cb.setChecked(True)               # 默认勾选，无需用户从零开始
                     self.algo_checkboxes[name] = cb
                     grid.addWidget(cb, i // 4, i % 4)
                 outer.addWidget(cat_box)
@@ -4954,20 +5026,10 @@ if HAS_PYSIDE6:
             grid = QGridLayout(box)
             metric_names = ["R2", "MAE", "RMSE", "DA", "UP_P", "MAPE", "MSE", "CE", "NSE", "R", "KGE", "SMAPE", "WI", "SI"]
             default_on = {"R2", "MAE", "RMSE", "DA", "UP_P"}
-            tips = {
-                "R2": "解释了多少波动，越接近1越好；但预测价格时会虚高，是假象",
-                "MAE": "平均绝对误差，预测平均差多少，越小越好",
-                "RMSE": "均方根误差，对大错更敏感，越小越好",
-                "DA": "方向准确率：涨跌猜对的比例，50%=抛硬币，>50%才有意义(最重要)",
-                "UP_P": "上涨精确率：模型说涨时真的涨了的比例，最实用",
-                "MAPE": "平均绝对百分比误差", "MSE": "均方误差", "CE": "效率系数(=NSE)",
-                "NSE": "纳什效率系数", "R": "皮尔逊相关系数", "KGE": "KG效率系数",
-                "SMAPE": "对称百分比误差", "WI": "一致性指数", "SI": "散布指数",
-            }
             for i, name in enumerate(metric_names):
                 cb = QCheckBox(name)
                 cb.setChecked(name in default_on)
-                cb.setToolTip(tips.get(name, "") + "（详见「名词解释」）")
+                cb.setToolTip(METRIC_EXPLAIN.get(name, "") + "（详见「名词解释」）")
                 self.metric_checkboxes[name] = cb
                 grid.addWidget(cb, i // 4, i % 4)
             return box
