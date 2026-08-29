@@ -3044,6 +3044,121 @@ def glossary_html() -> str:
     return "".join(parts)
 
 
+# ==================== 第八部分补充8：综合研判卡（只汇总客观事实，绝不下买卖结论/荐股） ====================
+def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
+                  target_mode: str = "return", horizon: int = 5,
+                  models=("SVR", "Lasso"),
+                  progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """
+    把一只股票的**客观信号**汇总成一张"研判卡"：风险、模型方向准确率(DA)对比基准、估值、
+    主力资金、大盘/外盘、近期涨跌。**只陈列事实，不给买卖建议、不荐股**——判断留给用户。
+    """
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    log(f"[研判卡] {code} 取数+评估 ...")
+    df = StockDataFetcher().fetch(code, start, end)
+    df, status = StockDataFetcher.enrich(df, code, True, True, True, True, True)
+    name = StockDataFetcher.fetch_stock_name(code)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    lc = float(close.iloc[-1])
+
+    def last(col):
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            return float(s.iloc[-1]) if len(s) else None
+        return None
+
+    def chg(w):
+        return (lc / float(close.iloc[-1 - w]) - 1) * 100 if len(close) > w else None
+
+    # 各模型在该周期的测试 DA + "总是涨"基准
+    da_rows, up_rate = [], None
+    for m in models:
+        try:
+            cfg = TrainConfig(horizon=horizon, target_mode=target_mode, hpo_method="关闭",
+                              metrics=["DA", "UP_P"])
+            res = TrainingPipeline(cfg).run_batch([m], df)
+            base = next((r for r in res if r.algo_name == "总是涨(方向基准)"), None)
+            if base and base.metrics:
+                up_rate = base.metrics.get("DA")
+            mr = next((r for r in res if r.algo_name == m and not r.error), None)
+            da_rows.append({"model": m,
+                            "DA": (mr.metrics.get("DA") if mr else None),
+                            "UP_P": (mr.metrics.get("UP_P") if mr else None)})
+        except Exception as e:
+            da_rows.append({"model": m, "error": str(e)})
+    warns = assess_risks(code, name, df, news=None)
+    return {
+        "code": code, "name": name, "last_close": round(lc, 2), "horizon": horizon,
+        "ret_1w": chg(5), "ret_1m": chg(20), "ret_1q": chg(60),
+        "pe": last("val_pe_ttm"), "pb": last("val_pb"),
+        "mf5": (float(pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0).tail(5).sum())
+                if "mf_main_net" in df.columns else None),
+        "idx_ret": last("idx_ret_1d"), "us_ret": last("us_ret"), "nb_net": last("nb_net"),
+        "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
+    }
+
+
+def research_card_html(card: Dict[str, Any]) -> str:
+    """把研判卡渲染成 HTML。全程只陈述客观事实 + 一句客观判读，无买卖结论。"""
+    def f(v, suf="", nd=2):
+        return f"{v:.{nd}f}{suf}" if isinstance(v, (int, float)) else "-"
+    title = f"{card['name']}（{card['code']}）" if card.get("name") else card["code"]
+    # 风险
+    if card["warns"]:
+        ri = "".join(f"<li><b style='color:#c0392b'>[{w['level']}·{w['category']}]</b> {w['msg']}"
+                     f"<span style='color:#888'>（{w['source']}）</span></li>" for w in card["warns"])
+        risk = (f"<div style='background:#fff4f4;border:1px solid #f0b0b0;padding:6px'>"
+                f"<b style='color:#c0392b'>⚠️ 风险提示（{len(card['warns'])}条）</b><ul>{ri}</ul></div>")
+    else:
+        risk = ("<div style='background:#f2fbf2;border:1px solid #b7e0b7;padding:6px'>"
+                "<b style='color:#1e8449'>✅ 未发现明显风险信号</b>（自动筛查，不代表无风险）</div>")
+    # 模型 DA 对比基准
+    up = card.get("up_rate")
+    da_body = ""
+    for r in card["da_rows"]:
+        if r.get("error"):
+            da_body += f"<tr><td>{r['model']}</td><td colspan=3>失败</td></tr>"; continue
+        da = r.get("DA")
+        good = (up is not None and da is not None and da >= up + 3 and da >= 52)
+        tag = ("<span style='color:#1e8449'>高于基准</span>" if good
+               else "<span style='color:#c0392b'>≈基准/偏弱</span>")
+        da_body += (f"<tr><td>{r['model']}</td><td>{f(da,'%',1)}</td>"
+                    f"<td>{f(r.get('UP_P'),'%',1)}</td><td>{tag}</td></tr>")
+    # 客观判读(描述性，非建议)
+    reads = []
+    if card["pe"] is not None:
+        reads.append("财务亏损(无有效市盈率)" if card["pe"] <= 0 else f"市盈率{f(card['pe'],'',1)}")
+    if card["ret_1m"] is not None:
+        reads.append(f"近1月{f(card['ret_1m'],'%',1)}")
+    if card["mf5"] is not None:
+        reads.append(f"主力近5日净{'流入' if card['mf5']>=0 else '流出'}{abs(card['mf5'])/1e4:.0f}万")
+    best_da = max((r.get("DA") or 0) for r in card["da_rows"]) if card["da_rows"] else 0
+    reads.append(f"模型方向准确率最高{f(best_da,'%',1)}"
+                 + (f"(基准{f(up,'%',1)})" if up is not None else "")
+                 + ("，有一定判别力" if (up and best_da >= up + 3) else "，≈抛硬币、判别力弱"))
+    ctx = ("<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+           f"<tr><td>最新收盘</td><td>{f(card['last_close'])} 元</td>"
+           f"<td>近1周/1月/1季</td><td>{f(card['ret_1w'],'%',1)} / {f(card['ret_1m'],'%',1)} / {f(card['ret_1q'],'%',1)}</td></tr>"
+           f"<tr><td>市盈率/市净率</td><td>{f(card['pe'],'',1)} / {f(card['pb'],'',2)}</td>"
+           f"<td>主力近5日净流入</td><td>{(f(card['mf5']/1e4,'万',0) if card['mf5'] is not None else '-')}</td></tr>"
+           f"<tr><td>沪深300最新</td><td>{f((card['idx_ret'] or 0)*100,'%',2) if card['idx_ret'] is not None else '-'}</td>"
+           f"<td>隔夜纳指/北向</td><td>{f((card['us_ret'] or 0)*100,'%',2) if card['us_ret'] is not None else '-'}"
+           f" / {f(card['nb_net'],'',1) if card['nb_net'] is not None else '-'}</td></tr></table>")
+    return (
+        f"<h2>综合研判卡 · {title}</h2>"
+        "<p style='color:#c0392b'><b>本卡只汇总客观事实，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
+        + risk +
+        f"<h3>模型方向准确率（{card['horizon']}日，测试集真实表现）</h3>"
+        "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+        "<tr bgcolor=#eef><th>模型</th><th>DA方向准确率</th><th>UP_P上涨精确率</th><th>对比基准</th></tr>"
+        + da_body + "</table>"
+        "<h3>关键数据现状（真实来源，见数据溯源）</h3>" + ctx +
+        "<h3>客观判读（描述事实，非建议）</h3><p>" + "；".join(reads) + "。</p>"
+        "<p style='color:#888;font-size:12px'>提示：市场接近有效，单模型方向预测大多≈50%；"
+        "以上为客观体检，买不买、仓位多少由你决定，风险自负。</p>")
+
+
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
 # 界面布局参考截图"一键式科研软件 MIMO 多输入多输出研究平台"的设计思路：
 #   左侧：数据配置（股票代码/日期区间/数据源）
@@ -3749,6 +3864,10 @@ if HAS_PYSIDE6:
             panel = QWidget()
             layout = QVBoxLayout(panel)
             top = QHBoxLayout()
+            self.rcard_btn = QPushButton("🧭 综合研判卡(单只·只给事实不荐股)")
+            self.rcard_btn.setStyleSheet("font-weight:bold; padding:6px; background:#8e44ad; color:white;")
+            self.rcard_btn.clicked.connect(self._on_research_card)
+            top.addWidget(self.rcard_btn)
             self.report_btn = QPushButton("🧾 生成/刷新 报告预览")
             self.report_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.report_btn.clicked.connect(self._on_gen_report)
@@ -3822,7 +3941,10 @@ if HAS_PYSIDE6:
                 "勿无牌荐股或收费、勿大规模转发实时行情。</li>"
                 "</ul></div>",
             ]
-            # 风险提示优先级最高 —— 放最前
+            # 综合研判卡放最前(客观事实汇总，非建议)
+            if getattr(self, "_html_card", ""):
+                parts.append(self._html_card)
+            # 风险提示
             if getattr(self, "_html_risk", ""):
                 parts.append("<h2>⚠️ 风险提示</h2>" + self._html_risk)
             # 模型推荐与预测依据
@@ -3855,8 +3977,33 @@ if HAS_PYSIDE6:
                      "a{color:#2c6fbb;word-break:break-all}</style>")
             return f"<html><head><meta charset='utf-8'>{style}</head><body>{body}</body></html>"
 
+        def _on_research_card(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "综合研判卡需真实数据，请把数据源切到「真实数据」。"); return
+            code = self.code_edit.text().strip()
+            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            self.rcard_btn.setEnabled(False); self.report_hint.setText("⏳ 正在生成综合研判卡 ...")
+            QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            try:
+                start = self.start_date.date().toString("yyyyMMdd")
+                end = self.end_date.date().toString("yyyyMMdd")
+                card = research_card(code, start, end, target_mode=tm, horizon=horizon,
+                                     models=("SVR", "Lasso"), progress_cb=self._log)
+                self._html_card = research_card_html(card)
+                # 研判卡后面附上数据溯源链接，方便逐条核对
+                links = self._source_links_html(code)
+                self.report_view.setHtml(self._html_card + links)
+                self.report_hint.setText("研判卡已生成(只给客观事实、不荐股)；它也会出现在「生成报告预览」的最前面。")
+                self._oplog(f"生成综合研判卡：{code}。")
+            except Exception as e:
+                QMessageBox.critical(self, "研判卡生成失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self.rcard_btn.setEnabled(True)
+
         def _on_gen_report(self):
-            if not self.results and not getattr(self, "_html_analysis", ""):
+            if not self.results and not getattr(self, "_html_analysis", "") \
+                    and not getattr(self, "_html_card", ""):
                 QMessageBox.information(self, "提示",
                                         "报告为空。请先在各页生成内容：\n"
                                         "① 行情K线图→获取K线  ② 运行模型  ③ 未来预测/策略回测  ④ 机器学习内部→数据透视\n"
