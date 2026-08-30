@@ -2600,7 +2600,9 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
                          horizon: int = 1, cost_bps: float = 0.2,
                          ann_days: int = 252, bar_info: Optional[Dict[str, np.ndarray]] = None,
                          code: Optional[str] = None, is_st: bool = False,
-                         bench_close=None, rf_annual: float = 0.0) -> Dict[str, Any]:
+                         bench_close=None, rf_annual: float = 0.0,
+                         vol_target_annual: float = 0.0, vol_lookback: int = 20,
+                         stop_loss_pct: float = 0.0) -> Dict[str, Any]:
     """
     "跟着预测做多/空仓"策略回测（贴合 A 股真实交易制度）：每一段(周期=horizon)开始时，若模型预测
     **上涨**(pred>基准价)就买入满仓，持有到该段结束(≥1 日，天然满足 T+1)，否则空仓。
@@ -2643,11 +2645,29 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
         stuck_sell = (pos > 0) & (x_lock > 0) & (x_ret <= -limit + eps)  # 一字跌停卖不出(仅统计提示)
         n_stuck_sell = int(stuck_sell.sum())
 
-    gross = np.where(pos > 0, seg_ret, 0.0)          # 毛收益(未扣成本)
+    # ---- 风控①：波动率目标仓位(高波动少下注/低波动多下注；只用过去已实现收益，无泄漏) ----
+    size = np.ones_like(pos)
+    if vol_target_annual and vol_target_annual > 0:
+        tgt_seg = vol_target_annual * np.sqrt(max(1, horizon) / ann_days)   # 折算到每段的目标波动
+        for k in range(len(pos)):
+            past = seg_ret[max(0, k - vol_lookback):k]                      # 只看该段之前的已实现波动
+            tv = float(np.std(past)) if len(past) >= 3 else 0.0
+            size[k] = min(1.0, tgt_seg / (tv + 1e-9)) if tv > 0 else 1.0    # 只减仓不加杠杆(上限1)
+    # ---- 风控②：单段止损(该段实际跌幅超过阈值则这段收益按止损位截断) ----
+    seg_eff = seg_ret.copy()
+    n_stop = 0
+    if stop_loss_pct and stop_loss_pct > 0:
+        sl = -abs(stop_loss_pct) / 100.0
+        hit = (pos > 0) & (seg_ret < sl)
+        n_stop = int(hit.sum())
+        seg_eff = np.where(hit, sl, seg_ret)          # 触发止损：这段亏损截断在止损位(近似,未计跳空穿透)
+
+    expo = pos * size                                # 有效敞口(0~1)，含仓位缩放
+    gross = np.where(pos > 0, seg_eff * size, 0.0)   # 毛收益(未扣成本)，含仓位缩放
     oneway = (cost_bps / 100.0) / 2.0
-    prev_pos = np.concatenate([[0.0], pos[:-1]])
-    cost_arr = np.abs(pos - prev_pos) * oneway       # 只在仓位变化时扣单边成本
-    cost_arr[-1] += pos[-1] * oneway                 # 末段若仍持有，结束时清仓再扣一次单边
+    prev_expo = np.concatenate([[0.0], expo[:-1]])
+    cost_arr = np.abs(expo - prev_expo) * oneway     # 按有效敞口变化扣单边成本(调仓也计费)
+    cost_arr[-1] += expo[-1] * oneway                # 末段若仍持有，结束时清仓再扣一次单边
     strat_ret = gross - cost_arr
 
     eq_strat = np.cumprod(1.0 + strat_ret)
@@ -2656,7 +2676,7 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
     def _ann(total): return (1.0 + total) ** (1.0 / years) - 1.0
     total = float(eq_strat[-1] - 1.0); total_bh = float(eq_bh[-1] - 1.0)
     peak = np.maximum.accumulate(eq_strat); mdd = float((eq_strat / peak - 1.0).min())
-    n_trades = int(((pos - prev_pos) > 0).sum())
+    n_trades = int((pos > np.concatenate([[0.0], pos[:-1]])).sum())   # 新建仓次数
     held = pos > 0
     win_rate = float(np.mean(strat_ret[held] > 0) * 100) if held.sum() > 0 else 0.0
     # 夏普：扣每段无风险利率后再年化(rf_annual 折算到每段)
@@ -2673,6 +2693,7 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
         "max_drawdown_pct": round(mdd * 100, 2), "win_rate_pct": round(win_rate, 2),
         "sharpe": round(sharpe, 3), "cost_bps": cost_bps, "limit_pct": round(limit * 100, 1),
         "n_block_buy": n_block_buy, "n_suspend": n_suspend, "n_stuck_sell": n_stuck_sell,
+        "n_stop": n_stop, "avg_position": round(float(np.mean(expo[pos > 0])) if (pos > 0).any() else 0.0, 3),
         "eq_strat": eq_strat, "eq_bh": eq_bh,
         "seg_dates": pd.Series(dates).reset_index(drop=True).iloc[idx].reset_index(drop=True),
     }
@@ -4887,6 +4908,16 @@ if HAS_PYSIDE6:
             self.bt_cost_edit.setFixedWidth(60)
             self.bt_cost_edit.setToolTip("一次买入+卖出的总成本：佣金+印花税+滑点。A股大致 0.15%~0.3%。")
             top.addWidget(self.bt_cost_edit)
+            top.addWidget(QLabel("波动率目标(年化%,0=关):"))
+            self.bt_voltgt_edit = QLineEdit("0")
+            self.bt_voltgt_edit.setFixedWidth(46)
+            self.bt_voltgt_edit.setToolTip("风控：把仓位缩放到目标年化波动。如填20，则高波动时自动减仓、低波动时满仓(不加杠杆)。0=不启用。")
+            top.addWidget(self.bt_voltgt_edit)
+            top.addWidget(QLabel("止损(%,0=关):"))
+            self.bt_stop_edit = QLineEdit("0")
+            self.bt_stop_edit.setFixedWidth(40)
+            self.bt_stop_edit.setToolTip("风控：单段跌幅超过此值就止损离场(近似)。0=不启用。")
+            top.addWidget(self.bt_stop_edit)
             self.bt_btn = QPushButton("▶ 回测")
             self.bt_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.bt_btn.clicked.connect(self._on_run_backtest)
@@ -4936,9 +4967,18 @@ if HAS_PYSIDE6:
                         bench = merged["idx_px"].to_numpy(float)
                 except Exception as e:
                     self._log(f"[回测] 沪深300基准对齐失败(跳过)：{e}")
+            try:
+                voltgt = float(self.bt_voltgt_edit.text()) / 100.0
+            except ValueError:
+                voltgt = 0.0
+            try:
+                stoploss = float(self.bt_stop_edit.text())
+            except ValueError:
+                stoploss = 0.0
             bt = backtest_directional(r.prev_close, r.y_test_true, r.y_test_pred,
                                       r.test_dates, horizon=horizon, cost_bps=cost,
-                                      bar_info=r.bar_info, code=code, is_st=is_st, bench_close=bench)
+                                      bar_info=r.bar_info, code=code, is_st=is_st, bench_close=bench,
+                                      vol_target_annual=voltgt, stop_loss_pct=stoploss)
             if "error" in bt:
                 QMessageBox.warning(self, "提示", bt["error"]); return
             self._draw_backtest(r.algo_name, bt)
@@ -4960,9 +5000,14 @@ if HAS_PYSIDE6:
             # A 股制度真实化统计
             inst = (f" · 涨停买不进{bt['n_block_buy']}段/停牌{bt['n_suspend']}段/跌停卖不出{bt['n_stuck_sell']}段"
                     f"(涨跌停幅{bt['limit_pct']}%)")
+            risk_txt = ""
+            if bt.get("avg_position", 1) < 0.999:
+                risk_txt += f" · 平均仓位{bt['avg_position']*100:.0f}%(波动率目标)"
+            if bt.get("n_stop", 0) > 0:
+                risk_txt += f" · 触发止损{bt['n_stop']}段"
             self.bt_stat.setText(
                 f"【{algo}】周期{getattr(self,'_last_horizon',1)}日 · 往返成本{bt['cost_bps']}% · "
-                f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%{inst}　||　"
+                f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%{inst}{risk_txt}　||　"
                 f"策略 {bt['total_return_pct']}%(年化{bt['annual_return_pct']}%) vs "
                 f"买入持有 {bt['buyhold_return_pct']}%(年化{bt['buyhold_annual_pct']}%) · "
                 f"超额 {bt['excess_vs_buyhold_pct']}%{bench_txt} · 最大回撤 {bt['max_drawdown_pct']}% · "
