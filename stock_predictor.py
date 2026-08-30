@@ -3573,11 +3573,18 @@ def prediction_postmortem() -> Dict[str, Any]:
     return out
 
 
+# 预测跟踪支持的 8 个周期(交易日) → 中文标签，按顺序展示
+PRED_HORIZONS = [1, 3, 5, 10, 20, 30, 40, 60]
+PRED_HZ_LABEL = {1: "一天(1日)", 3: "三天(3日)", 5: "一周(5日)", 10: "两周(10日)",
+                 20: "一个月(20日)", 30: "一个半月(30日)", 40: "两个月(40日)", 60: "三个月(60日)"}
+
+
 def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
-    """按预测周期统计**真实**方向准确率(只用已验证的记录)。返回 {周期标签: {n, dir_acc, mae_ret}}。"""
+    """按预测周期统计**真实**方向准确率与误差分布(只用已验证记录，全部真实到期对比)。
+    误差% = |预测涨跌% − 实际涨跌%|(收益率口径的绝对误差)。返回每周期:
+    {n, dir_acc(方向准确率%), err_max/err_mean/err_median/err_min(误差%), coverage(区间覆盖率%)}。"""
     df = load_pred_log()
     v = df[df["status"] == "verified"].copy()
-    label = {"1": "每天(1日)", "3": "三天", "5": "每周(5日)", "20": "每月(20日)", "60": "每季(60日)"}
     out = {}
     if len(v) == 0:
         return out
@@ -3585,13 +3592,20 @@ def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
     v["ae"] = (pd.to_numeric(v["pred_change_pct"], errors="coerce") -
                pd.to_numeric(v["actual_change_pct"], errors="coerce")).abs()
     v["in_interval"] = pd.to_numeric(v.get("in_interval"), errors="coerce") if "in_interval" in v.columns else np.nan
-    for hz, g in v.groupby("horizon"):
+    v["hz_int"] = pd.to_numeric(v["horizon"], errors="coerce")
+    for hz in PRED_HORIZONS:                                # 固定顺序，只列有数据的周期
+        g = v[v["hz_int"] == hz]
+        ae = g["ae"].dropna()
+        if len(g) == 0:
+            continue
         gi = g["in_interval"].dropna()
-        out[label.get(str(hz), f"{hz}日")] = {
-            "n": int(len(g)),
+        out[PRED_HZ_LABEL[hz]] = {
+            "hz": hz, "n": int(len(g)),
             "dir_acc": round(float(g["hit_dir"].mean() * 100), 1),
-            "mae_ret": round(float(g["ae"].mean()), 2),
-            # 区间覆盖率：真实价落在"约80%置信区间"的比例。健康值≈80%；远低=区间过窄/过度自信
+            "err_max": (round(float(ae.max()), 2) if len(ae) else None),
+            "err_mean": (round(float(ae.mean()), 2) if len(ae) else None),
+            "err_median": (round(float(ae.median()), 2) if len(ae) else None),
+            "err_min": (round(float(ae.min()), 2) if len(ae) else None),
             "coverage": (round(float(gi.mean() * 100), 1) if len(gi) else None),
             "n_cov": int(len(gi)),
         }
@@ -5793,7 +5807,7 @@ if HAS_PYSIDE6:
             self.trk_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
             self.trk_model_combo.setCurrentText("Lasso")
             top.addWidget(self.trk_model_combo)
-            b1 = QPushButton("📌 记录当前预测(1/3/5/20/60日)")
+            b1 = QPushButton("📌 记录当前预测(1/3/5/10/20/30/40/60日)")
             b1.setStyleSheet("font-weight:bold; padding:6px;")
             b1.clicked.connect(self._on_record_prediction)
             top.addWidget(b1)
@@ -5835,7 +5849,7 @@ if HAS_PYSIDE6:
             model = self.trk_model_combo.currentText()
             target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
             try:
-                self.trk_summary.setHtml(f"<p>正在用 {model} 为 {code} 生成 1/3/5/20/60 日预测并记录 ...</p>")
+                self.trk_summary.setHtml(f"<p>正在用 {model} 为 {code} 生成 1/3/5/10/20/30/40/60 日预测并记录 ...</p>")
                 QApplication.processEvents()
                 df = StockDataFetcher().fetch(code, self.start_date.date().toString("yyyyMMdd"),
                                               self.end_date.date().toString("yyyyMMdd"))
@@ -5846,7 +5860,7 @@ if HAS_PYSIDE6:
                 name = StockDataFetcher.fetch_stock_name(code)
                 # 为每个周期先算一次"记录时的模型测试DA"(方向准确率)，随预测一起存档，增加可信力
                 da_by_h = {}
-                for h in (1, 3, 5, 20, 60):
+                for h in PRED_HORIZONS:
                     try:
                         cfg = TrainConfig(horizon=h, target_mode=target_mode, hpo_method="关闭",
                                           metrics=["DA"])
@@ -5856,7 +5870,7 @@ if HAS_PYSIDE6:
                     except Exception:
                         da_by_h[h] = ""
                 fc = forecast_curve(model, df, target_mode=target_mode,
-                                    horizons=(1, 3, 5, 20, 60), progress_cb=self._log)
+                                    horizons=tuple(PRED_HORIZONS), progress_cb=self._log)
                 base_date = fc["last_date"]; base_close = fc["last_close"]
                 tgt_days = next_trading_days(pd.to_datetime(base_date), 60, progress_cb=self._log)
                 rows = []
@@ -5899,24 +5913,30 @@ if HAS_PYSIDE6:
             # 顶部：真实准确率(仅已验证)
             acc = prediction_accuracy()
             if acc:
-                def _cov_cell(v):
+                def _cov(v):
                     c = v.get("coverage")
                     if c is None:
-                        return "<td>-</td>"
-                    # 健康≈80%；<65% 说明区间过窄/过度自信，标红
+                        return "-"
                     col = "#1e8449" if c >= 72 else ("#c0392b" if c < 65 else "#e0a030")
-                    return f"<td style='color:{col}'><b>{c}%</b>(n={v['n_cov']})</td>"
-                rows = "".join(f"<tr><td>{k}</td><td>{v['n']}</td>"
-                               f"<td><b>{v['dir_acc']}%</b></td><td>{v['mae_ret']}%</td>{_cov_cell(v)}</tr>"
-                               for k, v in acc.items())
-                html = ("<h3>真实预测准确率（仅统计已到期、已用真实股价验证的记录）</h3>"
-                        "<table border=1 cellpadding=3 cellspacing=0>"
+                    return f"<span style='color:{col}'>{c}%</span>"
+                def _fmt(x):
+                    return f"{x}%" if x is not None else "-"
+                rows = "".join(
+                    f"<tr><td>{k}</td><td>{v['n']}</td>"
+                    f"<td><b>{v['dir_acc']}%</b></td>"
+                    f"<td>{_fmt(v['err_max'])}</td><td>{_fmt(v['err_mean'])}</td>"
+                    f"<td>{_fmt(v['err_median'])}</td><td>{_fmt(v['err_min'])}</td>"
+                    f"<td>{_cov(v)}</td></tr>"
+                    for k, v in acc.items())
+                html = ("<h3>真实预测准确率与误差统计（仅统计已到期、已用真实股价验证的记录）</h3>"
+                        "<table border=1 cellpadding=3 cellspacing=0 width=100%>"
                         "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th>"
-                        "<th>涨跌幅平均误差</th><th>区间覆盖率(目标≈80%)</th></tr>"
+                        "<th>最大误差</th><th>平均误差</th><th>中位数误差</th><th>最小误差</th>"
+                        "<th>区间覆盖率(≈80%)</th></tr>"
                         f"{rows}</table>"
-                        "<p style='color:#c0392b'>方向准确率需明显&gt;50%才有意义。"
-                        "<b>区间覆盖率</b>=真实价落在『约80%置信区间』的比例：接近80%才说明区间靠谱；"
-                        "明显偏低=区间过窄/模型过度自信(别信那个窄区间)。样本少仅供参考，不构成投资建议。</p>")
+                        "<p style='color:#c0392b'>误差% = |预测涨跌% − 实际涨跌%|(收益率口径，越小越准)。"
+                        "方向准确率需明显&gt;50%才有意义；区间覆盖率接近80%才说明置信区间靠谱。"
+                        "全部用真实到期股价验算；样本少仅供参考，不构成投资建议。</p>")
             else:
                 html = ("<h3>真实预测准确率</h3><p style='color:#888'>还没有已验证的预测。"
                         "先「记录当前预测」，等目标日期到了再「验证并刷新」——这样得到的才是<b>真实的未来对比</b>，"
