@@ -2456,7 +2456,19 @@ def run_hpo(method: str, model_cls: Callable[..., BaseModel],
 
     optimizer_cls = HPO_REGISTRY.get(method, BayesianOptimizer)
     optimizer = optimizer_cls(n_trials=n_trials) if method == "BO" else optimizer_cls(n_iter=n_trials)
-    best_x, _ = optimizer.optimize(objective, bounds)
+    best_x, best_loss = optimizer.optimize(objective, bounds)
+
+    # ---- 借鉴 RS5 的『默认超参兜底』：寻优结果若不优于该模型默认超参，就回退默认 ----
+    # 目的：杜绝小样本下 HPO 过拟合验证集、反而让测试更差(RS5 有同款安全阀)。
+    def _default_loss() -> float:
+        try:
+            m = model_cls(**model_kwargs)                 # 完全用默认超参
+            m.fit(X_train, y_train)
+            return float(np.sqrt(np.mean((y_val - m.predict(X_val)) ** 2)))
+        except Exception:
+            return 1e9
+    if not (np.isfinite(best_loss) and best_loss < _default_loss()):
+        return {}                                         # 默认不比寻优差 → 用默认(返回空=调用方用默认)
     return dict(zip(param_names, best_x))
 
 
