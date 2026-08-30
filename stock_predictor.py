@@ -3247,6 +3247,72 @@ def basket_correlation(codes: List[str], start: str = "20230101", end: Optional[
             "avg_corr": avg_corr, "n_obs": int(len(R)), "errors": errs}
 
 
+def factor_ic_test(codes: List[str], start: str = "20220101", end: Optional[str] = None,
+                   fwd: int = 20, step: int = 20,
+                   progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """**因子有效性检验(IC/ICIR)**——验证选股因子到底有没有用(而不是拍脑袋加因子)。
+    对一篮子股票，在多个历史调仓日算每个『纯价格因子』的横截面值，与未来 fwd 日收益做 **Spearman 秩相关(RankIC)**，
+    再对所有调仓日求 IC 均值、ICIR=均值/标准差、t 值、IC>0 胜率。
+    只用价格可算的因子(动量/反转/低波动)——**无 flaky 财报、无未来泄漏**(未来收益严格取调仓日之后)。
+    经验参考：|IC 均值|>0.03 且 |ICIR|>0.5 才算有点用；这是历史统计、不保证未来、非投资建议。"""
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    px = {}
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        log(f"[IC {i}/{len(codes)}] {code} 取价 ...")
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            s = pd.to_numeric(df.set_index(pd.to_datetime(df["date"]))["close"], errors="coerce").dropna()
+            if len(s) >= 120:
+                px[code] = s
+        except Exception:
+            pass
+    if len(px) < 5:
+        return {"error": f"有效股票仅 {len(px)} 只(<5)，横截面 IC 需要更多股票才有意义。"}
+    P = pd.DataFrame(px).dropna()                       # 共同交易日的价格面板
+    dates = P.index
+    if len(dates) < 120 + fwd:
+        return {"error": "共同历史太短，无法做 IC 检验(建议起始日更早、股票交易日更齐)。"}
+    # 因子定义(调仓日 t 当天即可算，方向已统一为『越大越应涨』)
+    def factors_at(t_idx):
+        c = P.iloc[t_idx]
+        c20 = P.iloc[t_idx - 20]; c60 = P.iloc[t_idx - 60]; c5 = P.iloc[t_idx - 5]
+        rets = P.iloc[t_idx - 60:t_idx].pct_change()
+        vol = rets.std()
+        return {
+            "动量20日": c / c20 - 1,
+            "动量60日": c / c60 - 1,
+            "短期反转5日": -(c / c5 - 1),               # 近5日跌得多的反而后续偏涨→取负
+            "低波动60日": -vol,                          # 波动越低越好→取负
+        }
+    ic_series = {k: [] for k in ["动量20日", "动量60日", "短期反转5日", "低波动60日"]}
+    n_periods = 0
+    for t_idx in range(60, len(dates) - fwd, step):
+        fwd_ret = P.iloc[t_idx + fwd] / P.iloc[t_idx] - 1        # 严格未来收益(无泄漏)
+        facs = factors_at(t_idx)
+        for k, fv in facs.items():
+            pair = pd.concat([fv, fwd_ret], axis=1).dropna()
+            if len(pair) >= 5:
+                ic = pair.iloc[:, 0].rank().corr(pair.iloc[:, 1].rank())  # Spearman=秩的Pearson
+                if pd.notna(ic):
+                    ic_series[k].append(float(ic))
+        n_periods += 1
+    rows = []
+    for k, arr in ic_series.items():
+        if len(arr) < 3:
+            rows.append({"factor": k, "n": len(arr), "mean_ic": None}); continue
+        a = np.array(arr)
+        mean_ic = float(a.mean()); std_ic = float(a.std() + 1e-12)
+        icir = mean_ic / std_ic
+        t_stat = icir * (len(a) ** 0.5)
+        hit = float((a > 0).mean() * 100)
+        useful = abs(mean_ic) > 0.03 and abs(icir) > 0.5
+        rows.append({"factor": k, "n": len(a), "mean_ic": round(mean_ic, 4),
+                     "icir": round(icir, 3), "t": round(t_stat, 2),
+                     "hit": round(hit, 1), "useful": useful})
+    return {"rows": rows, "n_stocks": P.shape[1], "n_periods": n_periods, "fwd": fwd, "step": step}
+
+
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
@@ -5229,8 +5295,20 @@ if HAS_PYSIDE6:
             row1.addWidget(self.pf_corr_btn)
             layout.addLayout(row1)
             self.pf_corr_view = QTextBrowser(); self.pf_corr_view.setOpenExternalLinks(True)
-            self.pf_corr_view.setMinimumHeight(240)
+            self.pf_corr_view.setMinimumHeight(200)
             layout.addWidget(self.pf_corr_view, stretch=1)
+
+            # --- 因子有效性检验 IC/ICIR ---
+            row2 = QHBoxLayout()
+            self.pf_ic_btn = QPushButton("▶ 因子有效性检验 (IC/ICIR)")
+            self.pf_ic_btn.setStyleSheet("font-weight:bold;padding:5px;")
+            self.pf_ic_btn.setToolTip("验证『动量/反转/低波动』等选股因子在这批股票上历史到底有没有用(纯价格因子,无泄漏)。")
+            self.pf_ic_btn.clicked.connect(self._on_factor_ic)
+            row2.addWidget(self.pf_ic_btn); row2.addStretch()
+            layout.addLayout(row2)
+            self.pf_ic_view = QTextBrowser()
+            self.pf_ic_view.setMinimumHeight(160)
+            layout.addWidget(self.pf_ic_view, stretch=1)
 
             # --- 凯利仓位计算器 ---
             box = QGroupBox("凯利公式仓位计算器（胜率 + 赔率 → 最优仓位）")
@@ -5301,6 +5379,46 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "组合分析失败", str(e))
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.pf_corr_btn.setEnabled(True)
+
+        def _on_factor_ic(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "因子有效性检验需真实数据，请把数据源切到「真实数据」。"); return
+            raw = self.pf_codes.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if len(codes) < 5:
+                QMessageBox.warning(self, "提示", "IC 是横截面统计，至少填 5 只股票(越多越可靠)。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            self.pf_ic_btn.setEnabled(False); self.pf_ic_view.setHtml("<p>⏳ 正在多期计算各因子 IC…</p>")
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open("⏳ 因子有效性(IC/ICIR)计算中…"); QApplication.processEvents()
+            try:
+                res = factor_ic_test(codes, start, end, progress_cb=self._log)
+                if "error" in res:
+                    self.pf_ic_view.setHtml(f"<p style='color:#c0392b'>{res['error']}</p>"); return
+                trs = ""
+                for r in res["rows"]:
+                    if r.get("mean_ic") is None:
+                        trs += f"<tr><td>{r['factor']}</td><td colspan=5>样本不足</td></tr>"; continue
+                    col = "#1e8449" if r["useful"] else "#c0392b"
+                    verdict = "✅有效" if r["useful"] else "❌基本无效"
+                    trs += (f"<tr><td>{r['factor']}</td><td>{r['mean_ic']}</td><td>{r['icir']}</td>"
+                            f"<td>{r['t']}</td><td>{r['hit']}%</td>"
+                            f"<td style='color:{col}'><b>{verdict}</b></td></tr>")
+                html = (
+                    f"<h3>因子有效性检验 IC/ICIR（{res['n_stocks']} 只股票 × {res['n_periods']} 个调仓期，"
+                    f"未来 {res['fwd']} 日收益）</h3>"
+                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+                    "<tr bgcolor=#eef><th>因子</th><th>IC均值</th><th>ICIR</th><th>t值</th><th>IC&gt;0胜率</th><th>结论</th></tr>"
+                    + trs + "</table>"
+                    "<p style='color:#888;font-size:12px'>IC=每期因子排名与未来收益排名的相关；ICIR=IC均值/IC波动(稳定性)。"
+                    "经验：|IC均值|&gt;0.03 且 |ICIR|&gt;0.5 才算有点用。<b>这是历史统计、不保证未来</b>，"
+                    "样本少/时间短时不可靠，非投资建议。</p>")
+                self.pf_ic_view.setHtml(html)
+                self._oplog(f"因子IC检验：{res['n_stocks']}只×{res['n_periods']}期完成。")
+            except Exception as e:
+                QMessageBox.critical(self, "IC检验失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.pf_ic_btn.setEnabled(True)
 
         def _on_kelly(self):
             try:
