@@ -3018,8 +3018,34 @@ def next_trading_days(last_date, n: int,
     return out[:n]
 
 
+def estimate_daily_vol(returns, method: str = "ewma", lam: float = 0.94) -> float:
+    """估计"当前"日波动率(供预测置信区间)。借鉴 volatility-modeling skill：
+    - ewma(默认, RiskMetrics λ=0.94)：近期波动权重更大、更贴合当下(半衰期~11天)，比整段历史 std 更准；
+    - garch：若装了 arch 库用 GARCH(1,1) 一步预测，否则自动退回 ewma；
+    - hist：整段历史标准差(旧口径)。
+    返回日波动率(小数)。数据太少时退回简单 std。"""
+    r = pd.to_numeric(pd.Series(returns), errors="coerce").dropna().to_numpy(float)
+    if len(r) < 10:
+        return float(np.std(r)) if len(r) else 0.0
+    if method == "hist":
+        return float(np.std(r))
+    if method == "garch":
+        try:
+            from arch import arch_model
+            am = arch_model(r * 100, vol="Garch", p=1, q=1, mean="Zero")
+            res = am.fit(disp="off")
+            fv = res.forecast(horizon=1, reindex=False)
+            return float(np.sqrt(fv.variance.values[-1, 0])) / 100.0
+        except Exception:
+            pass                                   # 无 arch 库或拟合失败 → 退回 EWMA
+    # EWMA(RiskMetrics)：对 r² 做 λ 衰减递归 = ewm(alpha=1-λ, adjust=False)
+    ew_var = pd.Series(r ** 2).ewm(alpha=1 - lam, adjust=False).mean().iloc[-1]
+    return float(np.sqrt(ew_var))
+
+
 def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "return",
                    horizons=(1, 5, 10, 20, 40, 60), window: int = 20,
+                   vol_method: str = "ewma",
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     预测"未来走势"的诚实做法：对每个周期 h（1日/1周/2周/1月/2月/3月）**分别**训练一个
@@ -3031,10 +3057,10 @@ def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "ret
     """
     log = progress_cb or (lambda m: None)
     points, last_close, last_date = [], None, None
-    # 历史日收益率波动率 σ(用于给预测加不确定区间；不是精确分布，只作量级参考)
+    # 当前日波动率 σ(EWMA 默认，比整段历史 std 更贴合当下；用于给预测加不确定区间)
     try:
         rr = pd.to_numeric(raw_df["close"], errors="coerce").pct_change().dropna()
-        sigma_d = float(rr.std())
+        sigma_d = estimate_daily_vol(rr, method=vol_method)
     except Exception:
         sigma_d = 0.0
     Z80 = 1.2816                                    # 80% 双侧置信的正态分位数
@@ -3769,8 +3795,8 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
             rs_1q = ret_1q - idx_ret_1q                # 相对强弱：个股近3月涨幅 − 沪深300近3月涨幅
     except Exception:
         pass
-    # 主预测(给普通人的"结论")：取有预测、且DA最高的模型，配区间(历史波动 σ·√h)与可信度
-    sigma_d = float(close.pct_change().dropna().std()) if len(close) > 5 else 0.0
+    # 主预测(给普通人的"结论")：取有预测、且DA最高的模型，配区间(EWMA 当前波动 σ·√h)与可信度
+    sigma_d = estimate_daily_vol(close.pct_change().dropna(), method="ewma") if len(close) > 5 else 0.0
     cand = [r for r in da_rows if not r.get("error") and r.get("pred_close") is not None]
     verdict = None
     if cand:
@@ -5737,6 +5763,11 @@ if HAS_PYSIDE6:
             self.fc_range_combo.setToolTip("『未来一周·逐日』：对下 1~5 个交易日分别直接预测，"
                                            "得到约周一~周五每天的预测价(法定节假日会顺延)。")
             top.addWidget(self.fc_range_combo)
+            top.addWidget(QLabel("波动率:"))
+            self.fc_vol_combo = QComboBox()
+            self.fc_vol_combo.addItems(["EWMA(推荐)", "GARCH(需arch库)", "历史std"])
+            self.fc_vol_combo.setToolTip("置信区间用的波动率估计：EWMA 更贴合近期波动；GARCH 需装 arch 库(否则自动退回EWMA)。")
+            top.addWidget(self.fc_vol_combo)
             self.fc_btn = QPushButton("🔮 预测未来走势")
             self.fc_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.fc_btn.clicked.connect(self._on_run_forecast)
@@ -5784,8 +5815,9 @@ if HAS_PYSIDE6:
                 self.fc_hint.setText(f"正在用 {algo} 训练 {len(horizons)} 个"
                                      f"{'交易日' if weekly else '周期'}的直接预测模型（稍候）...")
                 QApplication.processEvents()
+                vm = ("ewma", "garch", "hist")[self.fc_vol_combo.currentIndex()]
                 fc = forecast_curve(algo, df, target_mode=target_mode,
-                                    horizons=horizons, progress_cb=self._log)
+                                    horizons=horizons, vol_method=vm, progress_cb=self._log)
                 self._draw_forecast(code, df, fc, weekly=weekly)
                 self._oplog(f"未来预测：{code}，模型{algo}。")
             except Exception as e:
