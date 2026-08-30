@@ -3602,6 +3602,46 @@ def walk_forward_eval(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "
             "up_rate": up_rate, "beat_base": overall["DA"] > up_rate + 3}
 
 
+def ablation_experiment(code: str, start: str = "20200101", end: Optional[str] = None,
+                        target_mode: str = "return", horizon: int = 1, model: str = "Lasso",
+                        n_folds: int = 4,
+                        progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """**一键因子消融实验**(落实《多因子量化特征设计》第七节)：先用纯价格因子建基线，
+    再逐类加入『资金流/估值/大盘/外盘北向』，每个特征集都用 Walk-Forward 算样本外方向准确率(DA)，
+    看**每类因子到底有没有带来提升**——没提升就是噪音，不是信号(诚实、防过拟合式堆因子)。"""
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    log(f"[消融] 取数+外部增强 {code} ...")
+    df = StockDataFetcher().fetch(code, start, end)
+    df, _ = StockDataFetcher.enrich(df, code, True, True, True, True, True)   # 全外部
+    ext_pref = ("val_", "idx_", "mf_", "us_", "nb_")
+
+    def subset(keep_prefs):
+        drop = [c for c in df.columns
+                if c.startswith(ext_pref) and not any(c.startswith(p) for p in keep_prefs)]
+        return df.drop(columns=drop)
+
+    sets = [("纯价格(基线)", ()), ("+资金流", ("mf_",)), ("+估值", ("val_",)),
+            ("+大盘", ("idx_",)), ("+隔夜美股/北向", ("us_", "nb_")), ("+全部外部", ext_pref)]
+    rows, base_da = [], None
+    for name, keep in sets:
+        log(f"[消融] 评估特征集：{name} ...")
+        try:
+            wf = walk_forward_eval(model, subset(keep), target_mode=target_mode,
+                                   horizon=horizon, n_folds=n_folds)
+            if "error" in wf:
+                rows.append({"set": name, "error": wf["error"]}); continue
+            da = wf["overall_DA"]
+            if name.startswith("纯价格"):
+                base_da = da
+            rows.append({"set": name, "DA": da, "n": wf["n_oos"],
+                         "up_rate": wf["up_rate"], "sig": wf["sig"]["text"],
+                         "delta": (round(da - base_da, 1) if base_da is not None else 0.0)})
+        except Exception as e:
+            rows.append({"set": name, "error": str(e)})
+    return {"code": code, "model": model, "horizon": horizon, "rows": rows, "base_da": base_da}
+
+
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
@@ -4782,6 +4822,11 @@ if HAS_PYSIDE6:
                                    "拼起来算样本外DA。比单次train/test更接近实盘、更难自欺。")
             self.wf_btn.clicked.connect(self._on_walk_forward)
             mrow.addWidget(self.wf_btn)
+            self.abl_btn = QPushButton("🧪 因子消融实验(带图)")
+            self.abl_btn.setToolTip("先纯价格建基线，再逐类加资金流/估值/大盘/外盘，看每类因子到底有没有"
+                                    "带来样本外方向准确率提升——没提升就是噪音。结果出柱状图。")
+            self.abl_btn.clicked.connect(self._on_ablation)
+            mrow.addWidget(self.abl_btn)
             self.mldata_model_view = QLabel("先在左侧「运行」训练模型，这里就能选模型看它的训练/验证/测试误差与最看重的特征。")
             self.mldata_model_view.setWordWrap(True)
             self.mldata_model_view.setStyleSheet("padding:4px;background:#f6f8fb;")
@@ -4858,6 +4903,77 @@ if HAS_PYSIDE6:
             if r.formula:
                 parts.append(f"公式：{r.formula}")
             self.mldata_model_view.setText("　｜　".join(parts))
+
+        def _show_fig_dialog(self, fig, title):
+            """把一个 matplotlib Figure 弹在独立对话框里显示(可缩放/保存)，用于消融等图表。"""
+            dlg = QDialog(self); dlg.setWindowTitle(title); dlg.resize(820, 520)
+            lay = QVBoxLayout(dlg)
+            canvas = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(canvas, dlg))
+            lay.addWidget(canvas)
+            dlg.show()
+            self._abl_dlg = dlg          # 持有引用防被回收
+
+        def _on_ablation(self):
+            name = self.mldata_model_combo.currentText() if hasattr(self, "mldata_model_combo") else ""
+            model = name or "Lasso"
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "消融实验需真实数据，请把数据源切到「真实数据」。"); return
+            code = self.code_edit.text().strip()
+            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            self.abl_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._prog_open(f"⏳ 因子消融实验({model})：逐个特征集跑 Walk-Forward，较慢请稍候 …")
+            QApplication.processEvents()
+            try:
+                res = ablation_experiment(code, self.start_date.date().toString("yyyyMMdd"),
+                                          self.end_date.date().toString("yyyyMMdd"),
+                                          target_mode=tm, horizon=horizon, model=model, progress_cb=self._log)
+                ok = [r for r in res["rows"] if "DA" in r]
+                if not ok:
+                    QMessageBox.warning(self, "提示", "消融实验没有可用结果(可能数据太短/外部数据未接入)。"); return
+                # 画柱状图：各特征集样本外DA + 基线线 + "总是涨"基准线
+                fig = Figure(figsize=(8, 4.6)); ax = fig.add_subplot(111)
+                labels = [r["set"] for r in ok]; das = [r["DA"] for r in ok]
+                base_da = res.get("base_da")
+                up_rate = ok[0].get("up_rate")
+                colors = ["#4a90d9" if r["set"].startswith("纯价格")
+                          else ("#1e8449" if r.get("delta", 0) >= 1.5 else
+                                ("#c0392b" if r.get("delta", 0) <= -1.5 else "#e0a030")) for r in ok]
+                bars = ax.bar(range(len(labels)), das, color=colors)
+                for i, r in enumerate(ok):
+                    d = r.get("delta", 0)
+                    tag = f"{das[i]:.1f}%" + (f"\n({d:+.1f})" if not r["set"].startswith("纯价格") else "")
+                    ax.text(i, das[i] + 0.3, tag, ha="center", va="bottom", fontsize=8)
+                if base_da is not None:
+                    ax.axhline(base_da, color="#4a90d9", ls="--", lw=1, label=f"纯价格基线 {base_da:.1f}%")
+                if up_rate is not None:
+                    ax.axhline(up_rate, color="#999", ls=":", lw=1, label=f"总是涨基准 {up_rate:.1f}%")
+                ax.axhline(50, color="#c0392b", ls=":", lw=0.8, label="抛硬币 50%")
+                ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+                ax.set_ylabel("样本外方向准确率 DA (%)")
+                ax.set_title(f"{code} 因子消融实验（模型 {model}，周期 {horizon}日，Walk-Forward）")
+                ax.legend(loc="best", fontsize=8); ax.grid(True, axis="y", alpha=0.25)
+                fig.tight_layout()
+                self._show_fig_dialog(fig, f"因子消融实验 · {code}")
+                # 文字结论
+                lines = []
+                for r in ok:
+                    if r["set"].startswith("纯价格"):
+                        lines.append(f"{r['set']}: DA={r['DA']}% (n={r['n']}, {r['sig']})")
+                    else:
+                        verdict = "✅有提升" if r.get("delta", 0) >= 1.5 else ("❌反而变差" if r.get("delta", 0) <= -1.5 else "≈无变化")
+                        lines.append(f"{r['set']}: DA={r['DA']}% (Δ{r['delta']:+.1f} {verdict})")
+                self._oplog("因子消融：" + "；".join(f"{r['set']}={r.get('DA','失败')}" for r in res["rows"]))
+                QMessageBox.information(self, f"因子消融实验 · {model}",
+                    "\n".join(lines) +
+                    "\n\n判读：只有某类因子让 DA 比『纯价格基线』明显提升(且显著)，才说明它带来了真信号；"
+                    "Δ≈0 或变差=噪音，别硬加。这就是《多因子设计》第七节要求的分批消融验证。非投资建议。")
+            except Exception as e:
+                QMessageBox.critical(self, "消融实验失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.abl_btn.setEnabled(True)
 
         def _on_walk_forward(self):
             name = self.mldata_model_combo.currentText() if hasattr(self, "mldata_model_combo") else ""
