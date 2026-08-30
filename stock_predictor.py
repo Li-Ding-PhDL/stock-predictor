@@ -4293,18 +4293,28 @@ if HAS_PYSIDE6:
                             self.chk_us.isChecked(), self.chk_nb.isChecked())
                 tm = "return" if self.target_combo.currentIndex() == 0 else "price"
                 algo = self.fc_model_combo.currentText() if hasattr(self, "fc_model_combo") else "Lasso"
-                fc = forecast_curve(algo, df, target_mode=tm, horizons=(1, 5, 20, 60), progress_cb=self._log)
-                nm = {1: "明日", 5: "1周后", 20: "1个月后", 60: "3个月后"}
-                rows = "".join(
-                    f"<tr><td>{nm.get(p['horizon'], str(p['horizon'])+'日后')}</td>"
-                    f"<td><b>{p['pred_close']:.2f}</b></td>"
-                    f"<td style='color:{'#c0392b' if p['change_pct']>=0 else '#1a9d5a'}'>{p['change_pct']:+.2f}%</td></tr>"
-                    for p in fc["points"] if "pred_close" in p)
+                # 未来一周逐日(下1~5交易日) + 1月/3月锚点
+                fc = forecast_curve(algo, df, target_mode=tm, horizons=(1, 2, 3, 4, 5, 20, 60),
+                                    progress_cb=self._log)
+                last_d = pd.to_datetime(fc["last_date"])
+                nm = {20: "1个月后", 60: "3个月后"}
+                def _row(p):
+                    if p["horizon"] <= 5:
+                        fd = last_d + pd.tseries.offsets.BDay(p["horizon"])
+                        label = f"下{('一二三四五')[p['horizon']-1]}({self._cn_weekday(fd)} {fd.strftime('%m-%d')})"
+                    else:
+                        label = nm.get(p["horizon"], f"{p['horizon']}日后")
+                    col = '#c0392b' if p['change_pct'] >= 0 else '#1a9d5a'
+                    return (f"<tr><td>{label}</td><td><b>{p['pred_close']:.2f}</b></td>"
+                            f"<td style='color:{col}'>{p['change_pct']:+.2f}%</td></tr>")
+                rows = "".join(_row(p) for p in fc["points"] if "pred_close" in p)
                 self._mon_fc_html = (
                     f"<hr><h3>模型预测参考（{algo}，基于截至 {fc['last_date']} 的数据）</h3>"
+                    "<p style='font-size:12px;color:#555'>未来一周逐日(下1~5交易日，约周一~周五)每天各一个独立直接预测。</p>"
                     "<table border=1 cellpadding=4 cellspacing=0><tr bgcolor=#eef><th>时点</th><th>预测价</th><th>涨跌</th></tr>"
                     + rows + "</table>"
-                    "<p style='color:#c0392b;font-size:12px'>⚠ 预测越往后越不可靠，绝不构成投资建议。</p>")
+                    "<p style='color:#c0392b;font-size:12px'>⚠ 日期按工作日推算(节假日顺延)；每天独立直接预测(非递归)，"
+                    "越往后越不可靠，请对照 DA 判断，绝不构成投资建议。</p>")
                 self._refresh_monitor() if self._monitor_timer.isActive() else self.mon_view.setHtml(
                     self.mon_view.toHtml() + self._mon_fc_html)
             except Exception as e:
@@ -4753,11 +4763,19 @@ if HAS_PYSIDE6:
             self.fc_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
             self.fc_model_combo.setCurrentText("Lasso")
             top.addWidget(self.fc_model_combo)
+            top.addWidget(QLabel("范围:"))
+            self.fc_range_combo = QComboBox()
+            # 默认"未来一周·逐日"：下 1~5 个交易日(约下周一~周五)每天各一个预测
+            self.fc_range_combo.addItems(["未来一周·逐日 (下1~5交易日)",
+                                          "多周期 (1日/1周/2周/1月/2月/3月)"])
+            self.fc_range_combo.setToolTip("『未来一周·逐日』：对下 1~5 个交易日分别直接预测，"
+                                           "得到约周一~周五每天的预测价(法定节假日会顺延)。")
+            top.addWidget(self.fc_range_combo)
             self.fc_btn = QPushButton("🔮 预测未来走势")
             self.fc_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.fc_btn.clicked.connect(self._on_run_forecast)
             top.addWidget(self.fc_btn)
-            self.fc_hint = QLabel("对多个周期分别直接预测(不递归、不造假)。可用图下方工具条放大看每日价格。")
+            self.fc_hint = QLabel("默认『未来一周·逐日』：下1~5交易日(约周一~周五)每天各一个直接预测(不递归、不造假)。")
             self.fc_hint.setStyleSheet("color:#666;")
             top.addWidget(self.fc_hint, stretch=1)
             layout.addLayout(top)
@@ -4795,11 +4813,14 @@ if HAS_PYSIDE6:
                             self.chk_us.isChecked(), self.chk_nb.isChecked())
                 target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
                 algo = self.fc_model_combo.currentText()
-                self.fc_hint.setText(f"正在用 {algo} 训练 6 个周期的直接预测模型（稍候）...")
+                weekly = self.fc_range_combo.currentIndex() == 0
+                horizons = (1, 2, 3, 4, 5) if weekly else (1, 5, 10, 20, 40, 60)
+                self.fc_hint.setText(f"正在用 {algo} 训练 {len(horizons)} 个"
+                                     f"{'交易日' if weekly else '周期'}的直接预测模型（稍候）...")
                 QApplication.processEvents()
                 fc = forecast_curve(algo, df, target_mode=target_mode,
-                                    horizons=(1, 5, 10, 20, 40, 60), progress_cb=self._log)
-                self._draw_forecast(code, df, fc)
+                                    horizons=horizons, progress_cb=self._log)
+                self._draw_forecast(code, df, fc, weekly=weekly)
                 self._oplog(f"未来预测：{code}，模型{algo}。")
             except Exception as e:
                 QMessageBox.critical(self, "未来预测失败", str(e))
@@ -4807,54 +4828,98 @@ if HAS_PYSIDE6:
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.fc_btn.setEnabled(True)
 
-        def _draw_forecast(self, code, df, fc):
+        @staticmethod
+        def _cn_weekday(d):
+            """把日期转成中文星期(周一~周日)。"""
+            return "周" + "一二三四五六日"[pd.Timestamp(d).weekday()]
+
+        def _draw_forecast(self, code, df, fc, weekly=False):
             self.fc_figure.clear()
             ax = self.fc_figure.add_subplot(111)
-            # 最近 ~120 个交易日的真实收盘
-            hist = df.tail(120).reset_index(drop=True)
+            # 历史真实收盘：逐日模式只看最近 ~40 天(看得清)，多周期看 ~120 天
+            hist = df.tail(40 if weekly else 120).reset_index(drop=True)
             hd = pd.to_datetime(hist["date"]); hc = hist["close"].to_numpy(float)
-            ax.plot(hd, hc, color="#333", linewidth=1.2, label="历史真实收盘")
+            ax.plot(hd, hc, color="#333", linewidth=1.2, marker=("o" if weekly else None),
+                    markersize=3, label="历史真实收盘")
             last_date = pd.to_datetime(fc["last_date"]); last_close = fc["last_close"]
 
-            # 未来锚点：每个周期 h -> 未来第 h 个交易日
-            fut_dates = [last_date] + [(last_date + pd.tseries.offsets.BDay(p["horizon"]))
-                                       for p in fc["points"] if "pred_close" in p]
-            fut_prices = [last_close] + [p["pred_close"] for p in fc["points"] if "pred_close" in p]
+            # 未来锚点：每个周期 h -> 未来第 h 个交易日(用工作日近似，法定节假日会顺延)
+            ok_points = [p for p in fc["points"] if "pred_close" in p]
+            fut_dates = [last_date] + [last_date + pd.tseries.offsets.BDay(p["horizon"]) for p in ok_points]
+            fut_prices = [last_close] + [p["pred_close"] for p in ok_points]
+            lbl = "未来一周·逐日预测(每日直接预测)" if weekly else "未来预测(各周期直接预测)"
             ax.plot(fut_dates, fut_prices, color="#c0392b", linewidth=1.6, linestyle="--",
-                    marker="o", markersize=4, label="未来预测(各周期直接预测)")
-            # 高亮 1个月/3个月
-            label_map = {20: ("1个月", "#1e8449"), 60: ("3个月", "#d35400")}
-            for p in fc["points"]:
-                if "pred_close" not in p:
-                    continue
-                fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
-                if p["horizon"] in label_map:
-                    name, col = label_map[p["horizon"]]
-                    ax.scatter([fdate], [p["pred_close"]], color=col, s=60, zorder=5)
-                    ax.annotate(f"{name}\n{p['pred_close']:.2f}", (fdate, p["pred_close"]),
-                                textcoords="offset points", xytext=(6, 8), color=col, fontsize=9)
+                    marker="o", markersize=5, label=lbl)
+            if weekly:
+                # 逐日模式：每个交易日都标注(周几 + 预测价 + 相对最新收盘涨跌)
+                for p in ok_points:
+                    fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                    chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
+                    ax.scatter([fdate], [p["pred_close"]], color=col, s=45, zorder=5)
+                    ax.annotate(f"{self._cn_weekday(fdate)}\n{p['pred_close']:.2f}\n{chg:+.1f}%",
+                                (fdate, p["pred_close"]), textcoords="offset points",
+                                xytext=(0, 10), ha="center", color=col, fontsize=8)
+            else:
+                label_map = {20: ("1个月", "#1e8449"), 60: ("3个月", "#d35400")}
+                for p in ok_points:
+                    fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                    if p["horizon"] in label_map:
+                        name, col = label_map[p["horizon"]]
+                        ax.scatter([fdate], [p["pred_close"]], color=col, s=60, zorder=5)
+                        ax.annotate(f"{name}\n{p['pred_close']:.2f}", (fdate, p["pred_close"]),
+                                    textcoords="offset points", xytext=(6, 8), color=col, fontsize=9)
             ax.axvline(last_date, color="#aaa", linestyle=":", linewidth=1)
-            ax.set_ylabel("收盘价"); ax.set_title(f"{code} 未来走势预测（{fc['algo']}，1日~3个月）")
+            ttl = "未来一周·逐日" if weekly else "1日~3个月"
+            ax.set_ylabel("收盘价"); ax.set_title(f"{code} 未来走势预测（{fc['algo']}，{ttl}）")
             ax.legend(loc="best", fontsize=8); ax.grid(True, alpha=0.25)
             self.fc_figure.autofmt_xdate(); self.fc_canvas.draw()
 
             # 右侧：每股预测价
             name_map = {1: "明日", 5: "1周后", 10: "2周后", 20: "1个月后", 40: "2个月后", 60: "3个月后"}
+            title = "未来一周·逐日预测" if weekly else "未来多周期预测"
             rows = [f"<h3>{code} · {fc['algo']}</h3>",
+                    f"<p>{title}</p>",
                     f"<p>最新收盘（{fc['last_date']}）：<b>{last_close:.2f} 元</b></p>",
-                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>",
-                    "<tr bgcolor=#eef><th>时点</th><th>预测价(元)</th><th>涨跌</th></tr>"]
-            for p in fc["points"]:
-                nm = name_map.get(p["horizon"], f"{p['horizon']}日后")
-                if "pred_close" in p:
-                    chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
-                    rows.append(f"<tr><td>{nm}</td><td><b>{p['pred_close']:.2f}</b></td>"
-                                f"<td style='color:{col}'>{chg:+.2f}%</td></tr>")
-                else:
-                    rows.append(f"<tr><td>{nm}</td><td colspan=2>失败</td></tr>")
+                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>"]
+            if weekly:
+                rows.append("<tr bgcolor=#eef><th>交易日</th><th>日期(约)</th><th>预测价</th><th>较今涨跌</th></tr>")
+                prev = last_close
+                for p in fc["points"]:
+                    if "pred_close" in p:
+                        fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                        chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
+                        # 相邻日环比(仅供参考，各点都是独立直接预测、非递归)
+                        step = (p["pred_close"] - prev) / prev * 100 if prev else 0.0
+                        arrow = "↑" if step >= 0 else "↓"
+                        rows.append(f"<tr><td>下{('一二三四五')[p['horizon']-1]}({self._cn_weekday(fdate)})</td>"
+                                    f"<td>{fdate.strftime('%m-%d')}</td>"
+                                    f"<td><b>{p['pred_close']:.2f}</b></td>"
+                                    f"<td style='color:{col}'>{chg:+.2f}% {arrow}</td></tr>")
+                        prev = p["pred_close"]
+                    else:
+                        rows.append(f"<tr><td>下第{p['horizon']}日</td><td colspan=3>失败</td></tr>")
+            else:
+                rows.append("<tr bgcolor=#eef><th>时点</th><th>预测价(元)</th><th>涨跌</th></tr>")
+                for p in fc["points"]:
+                    nm = name_map.get(p["horizon"], f"{p['horizon']}日后")
+                    if "pred_close" in p:
+                        chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
+                        rows.append(f"<tr><td>{nm}</td><td><b>{p['pred_close']:.2f}</b></td>"
+                                    f"<td style='color:{col}'>{chg:+.2f}%</td></tr>")
+                    else:
+                        rows.append(f"<tr><td>{nm}</td><td colspan=2>失败</td></tr>")
             rows.append("</table>")
-            rows.append("<p style='color:#c0392b'>⚠ 每个点是对应周期的<b>直接</b>预测，中间为插值；"
-                        "预测越往后越不可靠，绝不构成投资建议。</p>")
+            if weekly:
+                ups = sum(1 for p in fc["points"] if p.get("change_pct", 0) > 0)
+                downs = sum(1 for p in fc["points"] if p.get("change_pct", 1) < 0)
+                rows.append(f"<p style='color:#555'>一周机械倾向：{ups} 天预测偏涨 / {downs} 天偏跌"
+                            "（仅是模型按历史算出的方向，<b>非预言、非建议</b>）。</p>")
+                rows.append("<p style='color:#c0392b'>⚠ 「日期(约)」按工作日推算，遇法定节假日会顺延；"
+                            "每天都是<b>独立直接预测</b>(不是拿前一天预测再滚动)，越往后越不可靠。"
+                            "务必对照测试集 DA(方向准确率)判断可信度，绝不构成投资建议。</p>")
+            else:
+                rows.append("<p style='color:#c0392b'>⚠ 每个点是对应周期的<b>直接</b>预测，中间为插值；"
+                            "预测越往后越不可靠，绝不构成投资建议。</p>")
             self.fc_side.setHtml("".join(rows))
 
         # ---- 9.2.2 数据配置区 ----
@@ -5485,6 +5550,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-index", action="store_true", help="不接入大盘环境(沪深300)")
     p.add_argument("--no-fundflow", action="store_true", help="不接入主力资金流向(主力/大单净流入+进场/洗盘代理)")
     p.add_argument("--forecast", action="store_true", help="额外输出用最新窗口预测的未来收盘价")
+    p.add_argument("--week", action="store_true",
+                   help="额外输出『未来一周·逐日』：下1~5交易日(约周一~周五)每天各一个直接预测")
     p.add_argument("--backtest", action="store_true", help="方向性收益回测(按预测涨跌做多/空仓，扣手续费)")
     p.add_argument("--cost", type=float, default=0.2, help="回测往返成本(%%)：佣金+印花税+滑点，默认 0.2")
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
@@ -5537,6 +5604,26 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"  {f['algo']:<12} 最后({f['last_date']})收盘={f['last_close']} "
                       f"-> 预测={f['pred_close']}  ({f['pred_change_pct']:+}%)")
         print("  ⚠ 单日单模型的点预测仅供研究参考，绝不构成任何投资建议。")
+
+    if getattr(args, "week", False):
+        print("\n【未来一周·逐日预测：下 1~5 个交易日(约周一~周五)每天各一个直接预测】")
+        if args.synthetic:
+            wdf = StockDataFetcher.generate_synthetic_data()
+        else:
+            wdf = StockDataFetcher().fetch(args.code, args.start, args.end)
+        algo1 = [a.strip() for a in args.algos.split(",") if a.strip()][0]
+        wfc = forecast_curve(algo1, wdf, target_mode=args.target, horizons=(1, 2, 3, 4, 5),
+                             progress_cb=print)
+        last_d = pd.to_datetime(wfc["last_date"])
+        print(f"  模型={algo1}  最新收盘({wfc['last_date']})={wfc['last_close']}")
+        for pt in wfc["points"]:
+            if pt.get("error"):
+                print(f"    下第{pt['horizon']}日  失败: {pt['error']}"); continue
+            fd = last_d + pd.tseries.offsets.BDay(pt["horizon"])
+            wd = "周" + "一二三四五六日"[fd.weekday()]
+            print(f"    下{('一二三四五')[pt['horizon']-1]}({wd} {fd.strftime('%Y-%m-%d')})  "
+                  f"预测={pt['pred_close']}  ({pt['change_pct']:+}%)")
+        print("  ⚠ 日期按工作日推算(节假日顺延)；每天独立直接预测(非递归)，越往后越不可靠，绝不构成投资建议。")
 
     if args.backtest:
         print(f"\n【方向性收益回测：按预测涨跌做多/空仓，往返成本 {args.cost}%】")
