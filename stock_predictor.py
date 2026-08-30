@@ -3540,6 +3540,39 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> i
     return n_ok
 
 
+def prediction_postmortem() -> Dict[str, Any]:
+    """预测复盘(借鉴 signal-postmortem skill)：从**已验证**的预测里找系统性规律/偏差——
+    整体真实DA、区间覆盖率、系统性乐观/悲观偏差(预测涨跌 − 实际涨跌的均值)、按方向拆分的命中率、最好/最差模型。
+    全部基于真实到期对比，帮你看清『模型到底错在哪、别一直被同一个坑坑』。非投资建议。"""
+    df = load_pred_log()
+    v = df[df["status"] == "verified"].copy()
+    if len(v) < 5:
+        return {"n": int(len(v)), "enough": False}
+    v["hit"] = pd.to_numeric(v["hit_dir"], errors="coerce")
+    v["pc"] = pd.to_numeric(v["pred_change_pct"], errors="coerce")
+    v["ac"] = pd.to_numeric(v["actual_change_pct"], errors="coerce")
+    v["dir"] = v["pred_dir"]
+    out = {"n": int(len(v)), "enough": True}
+    out["da"] = round(float(v["hit"].mean() * 100), 1)
+    bias = float((v["pc"] - v["ac"]).mean())                       # >0 预测比实际乐观
+    out["bias"] = round(bias, 2)
+    out["bias_text"] = (f"系统性<b>偏乐观</b> {bias:+.2f}%(预测涨幅普遍高于实际)" if bias > 0.3 else
+                        (f"系统性<b>偏悲观</b> {bias:+.2f}%" if bias < -0.3 else f"无明显系统偏差({bias:+.2f}%)"))
+    up = v[v["dir"] == "涨"]; dn = v[v["dir"] == "跌"]
+    out["up_hit"] = (round(float(up["hit"].mean() * 100), 1), int(len(up))) if len(up) else (None, 0)
+    out["dn_hit"] = (round(float(dn["hit"].mean() * 100), 1), int(len(dn))) if len(dn) else (None, 0)
+    # 按模型的真实 DA
+    md = []
+    for m, g in v.groupby("model"):
+        md.append((m, round(float(g["hit"].mean() * 100), 1), int(len(g))))
+    md.sort(key=lambda x: -x[1])
+    out["by_model"] = md
+    if "in_interval" in v.columns:
+        iv = pd.to_numeric(v["in_interval"], errors="coerce").dropna()
+        out["coverage"] = round(float(iv.mean() * 100), 1) if len(iv) else None
+    return out
+
+
 def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
     """按预测周期统计**真实**方向准确率(只用已验证的记录)。返回 {周期标签: {n, dir_acc, mae_ret}}。"""
     df = load_pred_log()
@@ -5290,13 +5323,32 @@ if HAS_PYSIDE6:
                       + _lvl(list(reversed(q.get("asks", []))), "卖", "#1a9d5a")
                       + "<tr><td colspan=3 bgcolor=#f6f6f6></td></tr>"
                       + _lvl(q.get("bids", []), "买", "#c0392b") + "</table>")
+            # 实时主力资金(今日累计，东财；有几秒延迟、可能被掐断，取不到就诚实标注)
+            def _wan(v):
+                return f"{v/1e4:.0f}万" if isinstance(v, (int, float)) else "-"
+            ff = StockDataFetcher.fetch_realtime_fundflow(code)
+            if ff.get("main_net") is not None:
+                mc = "#c0392b" if ff["main_net"] >= 0 else "#1a9d5a"
+                fundflow = (
+                    "<h3>实时主力资金（今日累计 · 东财，约几秒延迟）</h3>"
+                    "<table border=1 cellpadding=3 cellspacing=0><tr bgcolor=#eef>"
+                    "<th>主力净流入</th><th>净占比</th><th>超大单</th><th>大单</th><th>中单</th><th>小单</th></tr>"
+                    f"<tr><td style='color:{mc}'><b>{_wan(ff['main_net'])}</b></td>"
+                    f"<td>{(('%+.2f%%'%ff['main_pct']) if ff.get('main_pct') is not None else '-')}</td>"
+                    f"<td>{_wan(ff.get('xl_net'))}</td><td>{_wan(ff.get('l_net'))}</td>"
+                    f"<td>{_wan(ff.get('m_net'))}</td><td>{_wan(ff.get('s_net'))}</td></tr></table>"
+                    "<p style='color:#c0392b;font-size:12px'>⚠ 资金流是<b>用成交单大小估算的滞后数据</b>(非逐笔真实、有几秒延迟)；"
+                    "『主力流入=会涨』并不成立，主力也会骗线。仅作盘中参考，<b>不是买卖信号</b>。</p>")
+            else:
+                fundflow = ("<h3>实时主力资金</h3><p style='color:#888;font-size:12px'>"
+                            "本次取不到(东财该接口常被掐断/网络波动)，下次刷新自动重试；取不到就不显示，绝不编造。</p>")
             rec = getattr(self, "_mon_count", 0)
             recfile = os.path.basename(getattr(self, "_mon_file", "")) or "monitor_log/"
             note = ("<p style='color:#888;font-size:12px'>盘口为实时快照(东方财富)；"
                     "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。</p>"
                     f"<p style='color:#1e8449;font-size:12px'>📝 本次已记录 <b>{rec}</b> 条真实快照 → "
                     f"<b>{recfile}</b>（自采集的盘口/买卖手历史，长期积累后可供模型分析）。</p>")
-            self.mon_view.setHtml(head + info + pankou + note + (self._mon_fc_html or ""))
+            self.mon_view.setHtml(head + info + pankou + fundflow + note + (self._mon_fc_html or ""))
 
         def _on_monitor_forecast(self):
             code = self.code_edit.text().strip()
@@ -5766,7 +5818,7 @@ if HAS_PYSIDE6:
             filt.addStretch()
             layout.addLayout(filt)
             # 摘要放进可收起的 splitter，表格默认占大头
-            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(130)
+            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(240)
             layout.addWidget(self.trk_summary)
             self.trk_table = QTableWidget()
             self.trk_table.setMinimumHeight(430)              # 明细表更大、看得全
@@ -5869,6 +5921,21 @@ if HAS_PYSIDE6:
                 html = ("<h3>真实预测准确率</h3><p style='color:#888'>还没有已验证的预测。"
                         "先「记录当前预测」，等目标日期到了再「验证并刷新」——这样得到的才是<b>真实的未来对比</b>，"
                         "不是回测假象。</p>")
+            # 预测复盘(signal-postmortem)：找系统性偏差
+            pm = prediction_postmortem()
+            if pm.get("enough"):
+                uh, un = pm["up_hit"]; dh, dn = pm["dn_hit"]
+                mdl = "、".join(f"{m}{da}%(n={n})" for m, da, n in pm["by_model"][:5])
+                cov = f"、区间覆盖率 {pm['coverage']}%" if pm.get("coverage") is not None else ""
+                html += (
+                    "<h3>📋 预测复盘（从已验证记录找规律）</h3>"
+                    f"<p>共 {pm['n']} 条已验证 · 真实方向准确率 <b>{pm['da']}%</b>{cov}</p>"
+                    f"<p>偏差：{pm['bias_text']}</p>"
+                    f"<p>按方向：预测『涨』命中 {uh}%(n={un})　|　预测『跌』命中 {dh}%(n={dn})"
+                    + ("　→ <b>对某个方向明显更靠谱/更差，值得注意</b>" if (uh is not None and dh is not None and abs((uh or 0)-(dh or 0))>=15) else "")
+                    + f"</p><p>各模型真实DA：{mdl}</p>"
+                    "<p style='color:#888;font-size:12px'>复盘用来看『模型系统性错在哪』(比如总偏乐观、只会猜涨)，"
+                    "帮你别一直踩同一个坑。样本少时不稳，非投资建议。</p>")
             self.trk_summary.setHtml(html)
             # 下：预测明细表
             df = load_pred_log()
