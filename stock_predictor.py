@@ -621,6 +621,40 @@ class StockDataFetcher:
         return ix[["date", "idx_ret_1d", "idx_madev20"]].dropna()
 
     @staticmethod
+    def fetch_quality(code: str, bypass_proxy: bool = True) -> Dict[str, Optional[float]]:
+        """优雅获取基本面『质量/成长』因子：ROE(净资产收益率) 与 营收同比增长率。
+        取数失败(无网络/接口变动/该股无数据)时返回空 → 因子缺失、绝不编造。"""
+        out: Dict[str, Optional[float]] = {"roe": None, "rev_growth": None}
+        if not HAS_AKSHARE:
+            return out
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx:
+                fi = StockDataFetcher._retry(
+                    lambda: ak.stock_financial_analysis_indicator(symbol=code), tries=2)
+            if fi is None or len(fi) == 0:
+                return out
+            fi = fi.sort_index()
+            row = fi.iloc[-1]                                # 最近一期财报
+            for key in fi.columns:
+                k = str(key)
+                if out["roe"] is None and ("净资产收益率" in k) and ("加权" in k or "摊薄" in k or k.endswith("(%)")):
+                    out["roe"] = pd.to_numeric(row[key], errors="coerce")
+                if out["rev_growth"] is None and ("主营业务收入增长率" in k or "营业收入增长率" in k):
+                    out["rev_growth"] = pd.to_numeric(row[key], errors="coerce")
+            # 兜底：若上面没匹配到 ROE，取第一列含"净资产收益率"的
+            if out["roe"] is None:
+                for key in fi.columns:
+                    if "净资产收益率" in str(key):
+                        out["roe"] = pd.to_numeric(row[key], errors="coerce"); break
+            for k in out:
+                if out[k] is not None and (pd.isna(out[k]) or np.isinf(out[k])):
+                    out[k] = None
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
     def fetch_index_close(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
         """拉大盘指数(默认沪深300)的日期+收盘价，供回测做『相对大盘超额』基准。失败抛异常由调用方跳过。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
@@ -2930,14 +2964,16 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
 
 def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
                       w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
+                      w_quality: float = 1.0, w_lowvol: float = 1.0, use_quality: bool = True,
                       progress_cb: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
     """
     批量"因子打分选股"(横截面)：对一篮子股票，各算真实因子——
-      价值(低PE/PB更好)、动量(近3月涨幅更高更好)、资金(近5日主力净流入更多更好)，
+      价值(低PE/PB)、动量(近3月涨幅)、资金(近5日主力净流入)、
+      质量/成长(ROE高、营收同比高更好)、低波动(近60日波动率低更好，低波动异象)，
       在这一篮子里做百分位排名后加权成综合分，并扣除风险(ST/亏损/暴跌)惩罚，最后排序。
 
-    诚实说明：因子投资长期**统计上**有小优势(尤其价值+动量)，但**不是保证、不是择时**，
-    篮子越小排名越不稳；本工具是研究筛查、**不是荐股**。排在前面≠该买。
+    诚实说明：因子投资长期**统计上**有小优势(尤其价值+动量+质量)，但**不是保证、不是择时**，
+    篮子越小排名越不稳；质量因子依赖财报接口，取不到就自动缺省不参与。本工具是研究筛查、**不是荐股**。
     """
     log = progress_cb or (lambda m: None)
     end = end or dt.date.today().strftime("%Y%m%d")
@@ -2960,10 +2996,19 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             mf5 = None
             if "mf_main_net" in df.columns:
                 mf5 = float(pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0).tail(5).sum())
+            # 低波动因子：近60日日收益年化波动率(越低越好)
+            rr = close.pct_change().dropna()
+            vol60 = float(rr.tail(60).std() * np.sqrt(252)) if len(rr) >= 20 else None
+            # 质量/成长因子：ROE、营收同比(取不到即缺省，不编造)
+            roe = rev_g = None
+            if use_quality:
+                q = StockDataFetcher.fetch_quality(code)
+                roe, rev_g = q.get("roe"), q.get("rev_growth")
             warns = assess_risks(code, name, df, news=None)
             recs.append({"code": code, "name": name, "last_close": round(lc, 2),
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
                          "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
+                         "vol60": vol60, "roe": roe, "rev_growth": rev_g,
                          "risk_n": len(warns), "risk_hi": sum(1 for w in warns if w["level"] == "高"),
                          "risk_top": (warns[0]["category"] if warns else ""), "error": None})
         except Exception as e:
@@ -2983,15 +3028,24 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
         s_val = pd.concat([v_pe, v_pb], axis=1).mean(axis=1)
         s_mom = pct([r["mom3m"] for r in ok], True)                            # 动量越高越好
         s_mon = pct([r["mf5"] for r in ok], True)                             # 资金流入越多越好
+        # 质量：ROE 与 营收增速百分位取平均(有几个算几个)；低波动：波动率越低越好
+        s_roe = pct([r.get("roe") for r in ok], True)
+        s_revg = pct([r.get("rev_growth") for r in ok], True)
+        s_qual = pd.concat([s_roe, s_revg], axis=1).mean(axis=1)
+        s_lowvol = pct([r.get("vol60") for r in ok], False)                   # 波动越低分越高
         for k, r in enumerate(ok):
             comps, wts = [], []
-            for sc, wt in [(s_val.iloc[k], w_value), (s_mom.iloc[k], w_momentum), (s_mon.iloc[k], w_money)]:
+            for sc, wt in [(s_val.iloc[k], w_value), (s_mom.iloc[k], w_momentum),
+                           (s_mon.iloc[k], w_money), (s_qual.iloc[k], w_quality),
+                           (s_lowvol.iloc[k], w_lowvol)]:
                 if pd.notna(sc):
                     comps.append(sc * wt); wts.append(wt)
             base = (sum(comps) / sum(wts)) if wts else 0.0
             r["value_score"] = None if pd.isna(s_val.iloc[k]) else round(float(s_val.iloc[k]), 1)
             r["mom_score"] = None if pd.isna(s_mom.iloc[k]) else round(float(s_mom.iloc[k]), 1)
             r["money_score"] = None if pd.isna(s_mon.iloc[k]) else round(float(s_mon.iloc[k]), 1)
+            r["qual_score"] = None if pd.isna(s_qual.iloc[k]) else round(float(s_qual.iloc[k]), 1)
+            r["lowvol_score"] = None if pd.isna(s_lowvol.iloc[k]) else round(float(s_lowvol.iloc[k]), 1)
             r["score"] = round(float(base) - 12.0 * r["risk_hi"] - 3.0 * (r["risk_n"] - r["risk_hi"]), 1)
     recs.sort(key=lambda r: (r.get("score") if r.get("score") is not None else -1e9), reverse=True)
     return recs
@@ -3210,7 +3264,9 @@ GLOSSARY = {
         ("最大回撤", "从最高点跌到最低点的最大跌幅，衡量「最坏能亏多少」。"),
         ("均线 MA5/10/20", "最近 5/10/20 天收盘价的平均线，看趋势。"),
         ("区间平均线(虚线)", "所选整段时间收盘价的平均，一条水平参考线。"),
-        ("因子(价值/动量/资金)", "选股打分用的几个角度：价值=便不便宜，动量=近期涨势强不强，资金=大钱在不在买。"),
+        ("因子(价值/动量/资金/质量/低波动)", "选股打分的几个角度：价值=便不便宜(低PE/PB)，动量=近期涨势强不强，"
+         "资金=大钱在不在买，质量=公司好不好(ROE高、营收增速快)，低波动=波动小(低波动异象，长期风险调整后常更优)。"
+         "质量因子依赖财报接口，取不到就自动不参与、绝不编造。"),
     ],
 }
 
@@ -4696,7 +4752,7 @@ if HAS_PYSIDE6:
             self._batch_rows = rows                 # 复用导出
             self._batch_reset_btn()
             headers = ["排名", "代码", "名称", "最新价", "综合分", "价值分", "动量分", "资金分",
-                       "近3月%", "风险数", "主要风险"]
+                       "质量分", "低波动分", "近3月%", "风险数", "主要风险"]
             self.batch_table.setColumnCount(len(headers))
             self.batch_table.setHorizontalHeaderLabels(headers)
             self.batch_table.setRowCount(len(rows))
@@ -4711,11 +4767,12 @@ if HAS_PYSIDE6:
                 vals = [str(rank), r["code"], r.get("name", ""), f"{r.get('last_close','')}",
                         f"{r.get('score','')}", f"{r.get('value_score','') or '-'}",
                         f"{r.get('mom_score','') or '-'}", f"{r.get('money_score','') or '-'}",
+                        f"{r.get('qual_score','') or '-'}", f"{r.get('lowvol_score','') or '-'}",
                         (f"{m3*100:+.1f}%" if m3 is not None else "-"),
                         str(r.get("risk_n", "")), r.get("risk_top", "")]
                 for c, v in enumerate(vals):
                     it = QTableWidgetItem(str(v))
-                    if c == 9 and r.get("risk_n", 0) > 0:
+                    if c == 11 and r.get("risk_n", 0) > 0:      # "风险数"列
                         it.setForeground(Qt.red)
                     self.batch_table.setItem(i, c, it)
             self.batch_table.resizeColumnsToContents()
