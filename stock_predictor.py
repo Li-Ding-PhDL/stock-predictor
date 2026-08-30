@@ -2525,12 +2525,26 @@ class TrainingPipeline:
         self.fe = FeatureEngineer(window_size=config.window_size, horizon=config.horizon,
                                   target_mode=config.target_mode)
 
+    @staticmethod
+    def _clamp_extrap(pred: np.ndarray, y_ref: np.ndarray, frac: float = 0.3) -> np.ndarray:
+        """抗外推钳制(借鉴 RS5 b01Train)：把『目标空间』预测限制在训练目标范围 ±frac 内，
+        防止个别模型(尤其线性/PLSR)极端外推产生离谱值、把 R² 拖成负数。只夹极端值，正常预测不受影响。"""
+        pred = np.asarray(pred, float)
+        if y_ref is None or len(y_ref) == 0:
+            return pred
+        lo, hi = float(np.min(y_ref)), float(np.max(y_ref))
+        rng = max(hi - lo, 1e-9)
+        return np.clip(pred, lo - frac * rng, hi + frac * rng)
+
     def _to_price(self, pred_target: np.ndarray, prev_close: np.ndarray) -> np.ndarray:
         """把模型在"目标空间"的预测统一还原成"价格"：
-        return 模式: 预测价 = 基准日收盘 × (1 + 预测涨跌幅)；price 模式: 预测价 = 预测值本身。"""
+        return 模式: 预测价 = 基准日收盘 × (1 + 预测涨跌幅)；price 模式: 预测价 = 预测值本身。
+        末尾强制价格非负(股价不可能为负，借鉴 RS5 的物理非负约束)。"""
         if self.config.target_mode == "return":
-            return prev_close * (1.0 + pred_target)
-        return pred_target
+            price = prev_close * (1.0 + pred_target)
+        else:
+            price = np.asarray(pred_target, float)
+        return np.maximum(price, 0.0)
 
     @staticmethod
     def _dir_metrics(close_true, price_pred, prev_close) -> Dict[str, float]:
@@ -2603,7 +2617,8 @@ class TrainingPipeline:
         """在给定数据集上评估模型：预测→还原价格→算价格类+方向类指标(统一价格口径)。"""
         if X is None or len(X) == 0:
             return {}
-        pred_price = self._to_price(self.fe.inverse_y(model.predict(X)), prev_close)
+        pt = self._clamp_extrap(self.fe.inverse_y(model.predict(X)), getattr(self, "_y_ref", None))
+        pred_price = self._to_price(pt, prev_close)
         m = Metrics.calc_all(close_true, pred_price, self.config.metrics)
         self._apply_dir(m, close_true, pred_price, prev_close)
         return m
@@ -2639,9 +2654,10 @@ class TrainingPipeline:
             model = model_cls(**{**mk, **best_params})
             model.fit(X_train, y_train_s)
 
-            # ---- 8.2.4 训练/验证/测试三集分别评估（统一还原成价格口径）----
-            pred_price = self._to_price(self.fe.inverse_y(model.predict(X_test)),
-                                        pdata.prev_close_test)
+            # ---- 8.2.4 训练/验证/测试三集分别评估（统一还原成价格口径；带抗外推钳制）----
+            self._y_ref = y_train                       # 训练目标范围，供 _clamp_extrap/_eval 复用
+            pred_t = self._clamp_extrap(self.fe.inverse_y(model.predict(X_test)), y_train)
+            pred_price = self._to_price(pred_t, pdata.prev_close_test)
             metrics = Metrics.calc_all(close_test, pred_price, self.config.metrics)
             self._apply_dir(metrics, close_test, pred_price, pdata.prev_close_test)
             metrics_train = self._eval(model, X_train, pdata.prev_close_train, pdata.close_train)
@@ -2810,11 +2826,12 @@ class TrainingPipeline:
         last_window = df_ind[self.fe.feature_cols].values[-self.config.window_size:]
         x_new = self.fe.scaler_x.transform(last_window.flatten().reshape(1, -1))
         pred_target = float(self.fe.inverse_y(model.predict(x_new))[0])
+        pred_target = float(self._clamp_extrap(np.array([pred_target]), y)[0])   # 抗外推钳制(限训练范围±30%)
 
         last_close = float(df_ind["close"].iloc[-1])
-        # 按目标模式统一还原成"预测收盘价"
-        pred_close = float(last_close * (1.0 + pred_target)) \
-            if self.config.target_mode == "return" else pred_target
+        # 按目标模式统一还原成"预测收盘价"(价格非负)
+        pred_close = max(0.0, float(last_close * (1.0 + pred_target))
+                         if self.config.target_mode == "return" else pred_target)
         last_date = pd.to_datetime(df_ind["date"].iloc[-1]).strftime("%Y-%m-%d") \
             if "date" in df_ind.columns else ""
         return {
