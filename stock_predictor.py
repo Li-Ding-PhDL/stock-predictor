@@ -624,7 +624,8 @@ class StockDataFetcher:
     def fetch_quality(code: str, bypass_proxy: bool = True) -> Dict[str, Optional[float]]:
         """优雅获取基本面『质量/成长』因子：ROE(净资产收益率) 与 营收同比增长率。
         取数失败(无网络/接口变动/该股无数据)时返回空 → 因子缺失、绝不编造。"""
-        out: Dict[str, Optional[float]] = {"roe": None, "rev_growth": None}
+        out: Dict[str, Any] = {"roe": None, "rev_growth": None,
+                               "f_score": None, "f_available": 0, "f_detail": []}
         if not HAS_AKSHARE:
             return out
         try:
@@ -647,12 +648,60 @@ class StockDataFetcher:
                 for key in fi.columns:
                     if "净资产收益率" in str(key):
                         out["roe"] = pd.to_numeric(row[key], errors="coerce"); break
-            for k in out:
+            for k in ("roe", "rev_growth"):
                 if out[k] is not None and (pd.isna(out[k]) or np.isinf(out[k])):
                     out[k] = None
+            # 复用同一份财报指标算 Piotroski F-Score(客观质量分，借鉴 trading_skills)
+            pf = StockDataFetcher._piotroski_from_fi(fi)
+            out.update(pf)
         except Exception:
             pass
         return out
+
+    @staticmethod
+    def _piotroski_from_fi(fi: pd.DataFrame) -> Dict[str, Any]:
+        """从新浪财务指标表算 Piotroski 式 F-Score(0~9，越高质量越好；Joseph Piotroski 经典 9 项)。
+        用最近两期年报做同比。此表拿不到"是否增发"，故该项跳过，只评可评的、如实报告 available 数——绝不编。
+        返回 {f_score, f_available, f_detail(list)}。全部失败则返回空分。"""
+        try:
+            cols = list(fi.columns)
+            cur, prev = fi.iloc[-1], (fi.iloc[-2] if len(fi) >= 2 else None)
+
+            def num(row, *kws, avoid=None):
+                if row is None:
+                    return None
+                for c in cols:
+                    cs = str(c)
+                    if all(k in cs for k in kws) and (avoid is None or avoid not in cs):
+                        v = pd.to_numeric(row.get(c), errors="coerce")
+                        if v is not None and not pd.isna(v) and not np.isinf(v):
+                            return float(v)
+                return None
+
+            eps = num(cur, "每股收益")
+            roa = num(cur, "总资产利润率") or num(cur, "总资产净利润率")
+            cfo = num(cur, "每股经营现金流")
+            debt_c, debt_p = num(cur, "资产负债率"), num(prev, "资产负债率")
+            cr_c, cr_p = num(cur, "流动比率"), num(prev, "流动比率")
+            gm_c, gm_p = num(cur, "销售毛利率"), num(prev, "销售毛利率")
+            at_c, at_p = num(cur, "总资产周转率"), num(prev, "总资产周转率")
+
+            crit = [
+                ("盈利:净利润为正", None if eps is None else eps > 0),
+                ("盈利:总资产收益率ROA>0", None if roa is None else roa > 0),
+                ("盈利:经营现金流为正", None if cfo is None else cfo > 0),
+                ("质量:现金流>净利(应计低)", None if (cfo is None or eps is None) else cfo > eps),
+                ("杠杆:资产负债率下降", None if (debt_c is None or debt_p is None) else debt_c < debt_p),
+                ("流动:流动比率上升", None if (cr_c is None or cr_p is None) else cr_c > cr_p),
+                ("效率:毛利率上升", None if (gm_c is None or gm_p is None) else gm_c > gm_p),
+                ("效率:资产周转率上升", None if (at_c is None or at_p is None) else at_c > at_p),
+            ]
+            avail = [(n, bool(v)) for n, v in crit if v is not None]
+            f_score = sum(1 for _, v in avail if v)
+            return {"f_score": f_score, "f_available": len(avail),
+                    "f_detail": avail}
+        except Exception:
+            return {"f_score": None, "f_available": 0, "f_detail": []}
 
     @staticmethod
     def fetch_index_close(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
@@ -3000,15 +3049,15 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             rr = close.pct_change().dropna()
             vol60 = float(rr.tail(60).std() * np.sqrt(252)) if len(rr) >= 20 else None
             # 质量/成长因子：ROE、营收同比(取不到即缺省，不编造)
-            roe = rev_g = None
+            roe = rev_g = fscore = None
             if use_quality:
                 q = StockDataFetcher.fetch_quality(code)
-                roe, rev_g = q.get("roe"), q.get("rev_growth")
+                roe, rev_g, fscore = q.get("roe"), q.get("rev_growth"), q.get("f_score")
             warns = assess_risks(code, name, df, news=None)
             recs.append({"code": code, "name": name, "last_close": round(lc, 2),
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
                          "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
-                         "vol60": vol60, "roe": roe, "rev_growth": rev_g,
+                         "vol60": vol60, "roe": roe, "rev_growth": rev_g, "f_score": fscore,
                          "risk_n": len(warns), "risk_hi": sum(1 for w in warns if w["level"] == "高"),
                          "risk_top": (warns[0]["category"] if warns else ""), "error": None})
         except Exception as e:
@@ -3028,10 +3077,11 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
         s_val = pd.concat([v_pe, v_pb], axis=1).mean(axis=1)
         s_mom = pct([r["mom3m"] for r in ok], True)                            # 动量越高越好
         s_mon = pct([r["mf5"] for r in ok], True)                             # 资金流入越多越好
-        # 质量：ROE 与 营收增速百分位取平均(有几个算几个)；低波动：波动率越低越好
+        # 质量：ROE + 营收增速 + Piotroski F-Score 三者百分位取平均(有几个算几个)；低波动：波动率越低越好
         s_roe = pct([r.get("roe") for r in ok], True)
         s_revg = pct([r.get("rev_growth") for r in ok], True)
-        s_qual = pd.concat([s_roe, s_revg], axis=1).mean(axis=1)
+        s_fsc = pct([r.get("f_score") for r in ok], True)
+        s_qual = pd.concat([s_roe, s_revg, s_fsc], axis=1).mean(axis=1)
         s_lowvol = pct([r.get("vol60") for r in ok], False)                   # 波动越低分越高
         for k, r in enumerate(ok):
             comps, wts = [], []
@@ -3243,6 +3293,12 @@ GLOSSARY = {
         ("每股收益 EPS", "每一股股票分到多少利润。你手机上「中报每股收益 -0.89 元」就是每股亏 0.89 元。"),
         ("毛利率", "(营收 − 成本) ÷ 营收。反映产品本身赚不赚钱，越高越有竞争力。"),
         ("ROE 净资产收益率", "用股东的钱赚钱的效率，越高越好(巴菲特最看重的指标之一)。"),
+        ("Piotroski F-Score", "把公司财务健康拆成 9 个客观判断(盈利/现金流/杠杆/效率)，每满足一条得 1 分。"
+         "8~9 分很强、0~3 分弱。是**客观体检、不是预测**；本软件按可评项数如实给分(拿不到的项跳过)。"),
+        ("相对强弱 RS", "个股近期涨幅 减去 大盘(沪深300)同期涨幅。为正=跑赢大盘(强)，为负=跑输(弱)。"
+         "CANSLIM 选股讲究『买领涨、不买落后』，但强弱是历史事实、不保证未来。"),
+        ("大盘状态(牛/熊/震荡)", "看沪深300 相对 200 日均线的位置与均线方向：上方且上行=偏多，下方且下行=偏空，其余=震荡。"
+         "熊市里再好的个股信号也要打折——这是客观背景，不是买卖信号。"),
         ("资产负债率", "公司欠的钱占总资产的比例。太高(如 >70%)说明借钱多，有偿债/爆雷风险。"),
         ("现金流(经营)", "公司实际收进/付出的现金，比「利润」更难造假。经营现金流长期为负要警惕。"),
         ("商誉 / 商誉减值", "收购别人时多付的溢价叫商誉；若买来的公司变差，要「商誉减值」→ 可能一次性<b>巨亏</b>。"),
@@ -3350,6 +3406,35 @@ def glossary_html() -> str:
 
 
 # ==================== 第八部分补充8：综合研判卡（只汇总客观事实，绝不下买卖结论/荐股） ====================
+def market_regime(bypass_proxy: bool = True) -> Dict[str, Any]:
+    """判断当前**大盘状态**(牛市/熊市/震荡)——借鉴 CANSLIM/宏观 regime 思路，只看客观价格结构：
+    以沪深300 收盘 vs 200 日均线(MA200)及 MA200 斜率判断。取不到数据返回 unknown。
+    这是给"择时"的客观背景参考，**不是买卖信号**：熊市里再好的个股信号也要打折。"""
+    out = {"regime": "unknown", "text": "大盘状态未知(指数取数失败)", "idx_vs_ma200": None}
+    if not HAS_AKSHARE:
+        return out
+    try:
+        ix = StockDataFetcher.fetch_index_close(bypass_proxy)
+        c = pd.to_numeric(ix["idx_px"], errors="coerce").dropna()
+        if len(c) < 210:
+            return out
+        ma200 = c.rolling(200).mean()
+        last, m_last, m_prev = float(c.iloc[-1]), float(ma200.iloc[-1]), float(ma200.iloc[-21])
+        above = last > m_last
+        rising = m_last > m_prev                       # MA200 向上=多头结构
+        dev = (last / m_last - 1) * 100
+        out["idx_vs_ma200"] = round(dev, 1)
+        if above and rising:
+            out["regime"], out["text"] = "bull", f"大盘偏多(沪深300在200日线上{dev:+.1f}%、均线上行)"
+        elif (not above) and (not rising):
+            out["regime"], out["text"] = "bear", f"大盘偏空(沪深300在200日线下{dev:+.1f}%、均线下行)——个股信号需大打折扣"
+        else:
+            out["regime"], out["text"] = "range", f"大盘震荡/转折(沪深300与200日线{dev:+.1f}%、方向不明)"
+    except Exception:
+        pass
+    return out
+
+
 def da_significance(da_pct: Optional[float], n: int) -> Dict[str, Any]:
     """判断方向准确率 DA 是否**显著**高于 50%(抛硬币)。用单侧二项检验的正态近似算 p 值。
     返回 {p, sig, text}：p 越小越显著；sig=True 表示 p<0.05 可认为真比蒙的强。
@@ -3427,13 +3512,27 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         except Exception as e:
             da_rows.append({"model": m, "error": str(e)})
     warns = assess_risks(code, name, df, news=None)
+    # 借鉴交易 skill：基本面质量(Piotroski F-Score) + 相对大盘强弱(CANSLIM RS) + 大盘状态(regime)
+    q = StockDataFetcher.fetch_quality(code)
+    ret_1q = chg(60)
+    rs_1q = None
+    reg = market_regime()
+    try:
+        ixc = pd.to_numeric(StockDataFetcher.fetch_index_close()["idx_px"], errors="coerce").dropna()
+        if len(ixc) > 63 and ret_1q is not None:
+            idx_ret_1q = (float(ixc.iloc[-1]) / float(ixc.iloc[-64]) - 1) * 100
+            rs_1q = ret_1q - idx_ret_1q                # 相对强弱：个股近3月涨幅 − 沪深300近3月涨幅
+    except Exception:
+        pass
     return {
         "code": code, "name": name, "last_close": round(lc, 2), "horizon": horizon,
-        "ret_1w": chg(5), "ret_1m": chg(20), "ret_1q": chg(60),
+        "ret_1w": chg(5), "ret_1m": chg(20), "ret_1q": ret_1q,
         "pe": last("val_pe_ttm"), "pb": last("val_pb"),
         "mf5": (float(pd.to_numeric(df["mf_main_net"], errors="coerce").fillna(0).tail(5).sum())
                 if "mf_main_net" in df.columns else None),
         "idx_ret": last("idx_ret_1d"), "us_ret": last("us_ret"), "nb_net": last("nb_net"),
+        "f_score": q.get("f_score"), "f_available": q.get("f_available"), "f_detail": q.get("f_detail"),
+        "roe": q.get("roe"), "rs_1q": rs_1q, "regime": reg,
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
     }
 
@@ -3499,6 +3598,15 @@ def research_card_html(card: Dict[str, Any]) -> str:
         reads.append(f"近1月{f(card['ret_1m'],'%',1)}")
     if card["mf5"] is not None:
         reads.append(f"主力近5日净{'流入' if card['mf5']>=0 else '流出'}{abs(card['mf5'])/1e4:.0f}万")
+    # 基本面质量 F-Score / 相对强弱 RS / 大盘状态
+    fs, fa = card.get("f_score"), card.get("f_available")
+    if fs is not None and fa:
+        lvl = "强" if fs >= max(6, fa - 1) else ("弱" if fs <= 2 else "中")
+        reads.append(f"基本面质量 F-Score {fs}/{fa}({lvl})")
+    if card.get("rs_1q") is not None:
+        reads.append(f"相对大盘{'强' if card['rs_1q']>=0 else '弱'}{card['rs_1q']:+.1f}%(近3月超额)")
+    if card.get("regime", {}).get("regime", "unknown") != "unknown":
+        reads.append(card["regime"]["text"])
     best_da = max((r.get("DA") or 0) for r in card["da_rows"]) if card["da_rows"] else 0
     reads.append(f"模型方向准确率最高{f(best_da,'%',1)}"
                  + (f"(基准{f(up,'%',1)})" if up is not None else "")
@@ -3510,7 +3618,10 @@ def research_card_html(card: Dict[str, Any]) -> str:
            f"<td>主力近5日净流入</td><td>{(f(card['mf5']/1e4,'万',0) if card['mf5'] is not None else '-')}</td></tr>"
            f"<tr><td>沪深300最新</td><td>{f((card['idx_ret'] or 0)*100,'%',2) if card['idx_ret'] is not None else '-'}</td>"
            f"<td>隔夜纳指/北向</td><td>{f((card['us_ret'] or 0)*100,'%',2) if card['us_ret'] is not None else '-'}"
-           f" / {f(card['nb_net'],'',1) if card['nb_net'] is not None else '-'}</td></tr></table>")
+           f" / {f(card['nb_net'],'',1) if card['nb_net'] is not None else '-'}</td></tr>"
+           f"<tr><td>基本面质量 F-Score</td><td>{(str(card.get('f_score'))+'/'+str(card.get('f_available')) if card.get('f_score') is not None else '-')}</td>"
+           f"<td>相对大盘(近3月超额)</td><td>{f(card.get('rs_1q'),'%',1)}</td></tr>"
+           f"<tr><td>大盘状态</td><td colspan=3>{card.get('regime',{}).get('text','-')}</td></tr></table>")
     return (
         f"<h2>综合研判卡 · {title}</h2>"
         "<p style='color:#c0392b'><b>本卡只汇总客观事实，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
