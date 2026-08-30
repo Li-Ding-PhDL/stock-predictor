@@ -2392,21 +2392,28 @@ class TrainingPipeline:
                                 y_test_pred=np.full_like(close_test, np.nan, dtype=float),
                                 test_dates=pdata.d_test, error=str(e))
 
-    # ---------- 8.3 K 折交叉验证（时间序列友好版：仍然按时间顺序滚动切分，不随机打乱）----------
+    # ---------- 8.3 K 折交叉验证（时间序列专用：前扩窗口 walk-forward，只用过去预测未来，绝不泄漏）----------
     def _cross_validate(self, model_cls, best_params, X, y_scaled, y_raw,
                         model_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+        """时间序列交叉验证必须用『前扩窗口』：第 k 折只用它**之前**的数据训练、预测紧邻的下一折。
+        绝不能像普通 K 折那样把验证折之后的『未来』也拿去训练——那是用未来预测过去的数据泄漏。
+        (评估口径说明：DA/UP_P 需价格还原故此处略去；其余指标在目标空间 price/return 内计算，
+         与主结果表的价格空间口径不同，仅用于横向比较各折的稳定性。)"""
         model_kwargs = model_kwargs or {}
-        # 方向类指标(DA/UP_P)需要"价格还原"才有意义，而 CV 在目标空间(price/return)内评估，故此处略去
         cv_metric_names = [m for m in self.config.metrics if m not in ("DA", "UP_P")]
         n = len(X)
-        fold_size = n // self.config.cv_folds
+        folds = max(2, self.config.cv_folds)
+        # 把序列切成 folds+1 段：第 1 段作最初训练集，其后每段依次作一折验证(训练集不断向前扩张)
+        block = n // (folds + 1)
         fold_metrics = []
-        for k in range(self.config.cv_folds):
-            start, end = k * fold_size, (k + 1) * fold_size if k < self.config.cv_folds - 1 else n
-            if start >= end - 1:
+        if block < 1:
+            return {}
+        for k in range(1, folds + 1):
+            start, end = k * block, (k + 1) * block if k < folds else n
+            if start >= end - 1 or start < 1:
                 continue
-            X_tr = np.concatenate([X[:start], X[end:]], axis=0)
-            y_tr = np.concatenate([y_scaled[:start], y_scaled[end:]], axis=0)
+            X_tr = X[:start]                 # 只用验证折之前的数据(前扩窗口)，杜绝未来泄漏
+            y_tr = y_scaled[:start]
             X_va, y_va_raw = X[start:end], y_raw[start:end]
             try:
                 m = model_cls(**{**model_kwargs, **best_params})
@@ -2594,10 +2601,19 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
 
 # ==================== 第八部分补充2：未来走势预测（多周期直接预测，不递归、不造假） ====================
 def is_trading_now(now: Optional[dt.datetime] = None) -> Tuple[bool, str]:
-    """判断当前是否 A 股交易时段(9:30-11:30 / 13:00-15:00，工作日)。返回(是否交易中, 状态文字)。"""
+    """判断当前是否 A 股交易时段(9:30-11:30 / 13:00-15:00，且为真实交易日)。返回(是否交易中, 状态文字)。
+    优先用真实交易日历排除法定节假日；日历取不到时退回『仅排除周末』。"""
     now = now or dt.datetime.now()
     if now.weekday() >= 5:
         return False, "周末休市"
+    # 用真实交易日历排除法定节假日(清明/五一/国庆/春节等)；取不到则仅按周末判断
+    cal = _load_trade_calendar()
+    if cal is not None:
+        today = pd.Timestamp(now).normalize()
+        if today < cal[0] or today > cal[-1]:
+            pass                                  # 超出日历覆盖范围，无法判定节假日，按工作日继续
+        elif today not in cal:
+            return False, "节假日休市"
     t = now.time()
     if dt.time(9, 30) <= t <= dt.time(11, 30) or dt.time(13, 0) <= t <= dt.time(15, 0):
         return True, "交易中"
