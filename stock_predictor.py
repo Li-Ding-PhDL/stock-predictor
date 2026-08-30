@@ -621,6 +621,15 @@ class StockDataFetcher:
         return ix[["date", "idx_ret_1d", "idx_madev20"]].dropna()
 
     @staticmethod
+    def fetch_index_close(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
+        """拉大盘指数(默认沪深300)的日期+收盘价，供回测做『相对大盘超额』基准。失败抛异常由调用方跳过。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            ix = StockDataFetcher._retry(lambda: ak.stock_zh_index_daily(symbol=symbol))
+        ix["date"] = pd.to_datetime(ix["date"]).astype("datetime64[ns]")
+        return ix.sort_values("date")[["date", "close"]].rename(columns={"close": "idx_px"})
+
+    @staticmethod
     def _fetch_us_index(bypass_proxy: bool = True) -> pd.DataFrame:
         """隔夜美股(纳斯达克)涨跌：akshare index_us_stock_sina(.IXIC)。
         A股当日只能用"昨夜美股"(美股某日收盘在中国次日凌晨已知)，故把美股日期+1天再对齐，杜绝未来泄露。"""
@@ -901,9 +910,16 @@ class FeatureEngineer:
 
         values = df[feature_cols].values
         close = df["close"].values
+        openv = df["open"].values if "open" in df.columns else close
+        highv = df["high"].values if "high" in df.columns else close
+        lowv = df["low"].values if "low" in df.columns else close
+        volv = df["volume"].values if "volume" in df.columns else np.ones_like(close)
         dates = df["date"]
 
         X, y, sample_dates, prev_close, close_target = [], [], [], [], []
+        # 回测真实化所需的逐样本日线细节：基准日(买入日)与目标日(卖出日)的当日涨跌、是否一字板、成交量
+        base_ret, base_locked, base_vol = [], [], []
+        exit_ret, exit_locked, exit_vol = [], [], []
         n = len(df)
         for i in range(self.window_size, n - self.horizon + 1):
             window = values[i - self.window_size: i]          # 过去 window_size 天
@@ -918,9 +934,25 @@ class FeatureEngineer:
             else:
                 y.append(target)
             sample_dates.append(dates.iloc[i + self.horizon - 1])
+            # --- 基准日(准备买入的那天，df 行 i-1) ---
+            bi = i - 1
+            base_ret.append(close[bi] / (close[bi - 1] + 1e-12) - 1.0 if bi >= 1 else 0.0)
+            base_locked.append(1.0 if (highv[bi] - lowv[bi]) <= 1e-9 else 0.0)   # 最高==最低≈一字板
+            base_vol.append(volv[bi])
+            # --- 目标日(准备卖出的那天，df 行 i+horizon-1) ---
+            ti = i + self.horizon - 1
+            exit_ret.append(close[ti] / (close[ti - 1] + 1e-12) - 1.0 if ti >= 1 else 0.0)
+            exit_locked.append(1.0 if (highv[ti] - lowv[ti]) <= 1e-9 else 0.0)
+            exit_vol.append(volv[ti])
 
         self.prev_close_ = np.array(prev_close)
         self.close_target_ = np.array(close_target)
+        # 逐样本日线细节(供回测判断涨跌停买不进/卖不出、停牌)
+        self.bar_info_ = {
+            "base_ret": np.array(base_ret), "base_locked": np.array(base_locked),
+            "base_vol": np.array(base_vol), "exit_ret": np.array(exit_ret),
+            "exit_locked": np.array(exit_locked), "exit_vol": np.array(exit_vol),
+        }
         return np.array(X), np.array(y), pd.Series(sample_dates).reset_index(drop=True)
 
     # ---------- 4.3 标准化（在训练集上 fit，训练集/测试集上 transform，避免数据泄漏）----------
@@ -2212,6 +2244,7 @@ class ModelResult:
     metrics_train: Optional[Dict[str, float]] = None  # 训练集误差（看是否过拟合）
     metrics_val: Optional[Dict[str, float]] = None    # 独立验证集误差（不参与训练/测试/寻优）
     feature_importance: Optional[List[Tuple[str, float]]] = None  # 模型最看重的输入(按重要性排序)
+    bar_info: Optional[Dict[str, np.ndarray]] = None  # 测试段逐样本日线细节(涨跌停/停牌判断，供真实化回测)
 
 
 @dataclass
@@ -2234,6 +2267,7 @@ class PreparedData:
     close_train: np.ndarray            # 每个样本"真实未来"收盘价(价格空间)
     close_val: np.ndarray
     close_test: np.ndarray
+    bar_info_test: Optional[Dict[str, np.ndarray]] = None  # 测试段逐样本日线细节(供真实化回测)
 
 
 class TrainingPipeline:
@@ -2299,6 +2333,7 @@ class TrainingPipeline:
             d_test=d[b:].reset_index(drop=True),
             prev_close_train=pc[:a], prev_close_val=pc[a:b], prev_close_test=pc[b:],
             close_train=ct[:a], close_val=ct[a:b], close_test=ct[b:],
+            bar_info_test={k: v[b:] for k, v in getattr(self.fe, "bar_info_", {}).items()},
         )
 
     def _feature_importance(self, model, topn: int = 8):
@@ -2385,7 +2420,8 @@ class TrainingPipeline:
                                 cv_metrics=cv_metrics, formula=formula,
                                 prev_close=pdata.prev_close_test,
                                 metrics_train=metrics_train, metrics_val=metrics_val,
-                                feature_importance=self._feature_importance(model))
+                                feature_importance=self._feature_importance(model),
+                                bar_info=pdata.bar_info_test)
         except Exception as e:
             log(f"[{algo_name}] 训练失败：{e}")
             return ModelResult(algo_name=algo_name, metrics={}, y_test_true=close_test,
@@ -2547,17 +2583,38 @@ class TrainingPipeline:
 
 
 # ==================== 第八部分补充：方向性收益回测（带手续费的诚实检验） ====================
+def board_limit_pct(code: Optional[str], is_st: bool = False) -> float:
+    """按 A 股板块返回单日涨跌停幅度(小数)：主板±10%，创业板(30x)/科创板(688)±20%，
+    北交所(8/4 开头)±30%，ST/*ST ±5%。无法判断时按主板 10%。"""
+    c = (code or "").strip()
+    if is_st:
+        return 0.05
+    if c.startswith(("300", "301", "688")):
+        return 0.20
+    if c.startswith(("8", "4", "920")):        # 北交所
+        return 0.30
+    return 0.10
+
+
 def backtest_directional(prev_close, close_target, pred_price, dates,
                          horizon: int = 1, cost_bps: float = 0.2,
-                         ann_days: int = 252) -> Dict[str, Any]:
+                         ann_days: int = 252, bar_info: Optional[Dict[str, np.ndarray]] = None,
+                         code: Optional[str] = None, is_st: bool = False,
+                         bench_close=None, rf_annual: float = 0.0) -> Dict[str, Any]:
     """
-    "跟着预测做多/空仓"策略回测：每一段(周期=horizon)开始时，若模型预测**上涨**(pred>基准价)就满仓
-    持有到该段结束，否则空仓(收益 0)。每次真正持有(买入→卖出)扣一次**往返交易成本** cost_bps(%)
-    (含佣金+印花税+滑点)。用非重叠切段(步长=horizon)避免交易重叠。
+    "跟着预测做多/空仓"策略回测（贴合 A 股真实交易制度）：每一段(周期=horizon)开始时，若模型预测
+    **上涨**(pred>基准价)就买入满仓，持有到该段结束(≥1 日，天然满足 T+1)，否则空仓。
+    每次真正持有(买入→卖出)扣一次**往返成本** cost_bps(%)(佣金+印花税+滑点)。非重叠切段避免交易重叠。
 
-    这是检验"预测涨跌到底能不能赚钱"的终极诚实标准：策略净值必须明显跑赢"买入持有"，才算真有用。
+    真实化(需传入 bar_info)：
+      · 涨停买不进：预测该买、但基准日是**一字涨停**(最高==最低且当日≈+涨停幅)→ 无法买入，放弃该段。
+      · 跌停卖不出：持有中、但目标日是**一字跌停**→ 无法在收盘卖出，计为“卡跌停”段并提示(收益仍按目标价计，
+        属乐观口径，实盘可能更差)。
+      · 停牌：基准日成交量为 0 → 无法买入，放弃该段。
+    另可传入 bench_close(与各段对齐的沪深300收盘)得到**相对大盘超额**；rf_annual 为年化无风险利率(算夏普用)。
 
-    返回统计 + 净值曲线(策略 vs 买入持有)，可直接用于画图与 JSON。
+    这是检验"预测涨跌到底能不能赚钱"的终极诚实标准：策略净值须明显跑赢"买入持有"与"大盘"，才算真有用。
+    返回统计 + 净值曲线，可直接用于画图与 JSON。
     """
     prev_close = np.asarray(prev_close, float); close_target = np.asarray(close_target, float)
     pred_price = np.asarray(pred_price, float)
@@ -2567,36 +2624,69 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
     idx = np.arange(0, n, max(1, horizon))           # 非重叠取段
     pc, ct, pp = prev_close[idx], close_target[idx], pred_price[idx]
     seg_ret = ct / (pc + 1e-12) - 1.0                # 每段真实收益率
-    pos = (pp > pc).astype(float)                    # 仓位：预测涨=1(满仓)，否则=0(空仓)
+    pos = (pp > pc).astype(float)                    # 期望仓位：预测涨=1(满仓)，否则=0(空仓)
+
+    # ---- A 股制度真实化：涨停买不进 / 停牌不可买 / 跌停卖不出 ----
+    limit = board_limit_pct(code, is_st)
+    n_block_buy = n_suspend = n_stuck_sell = 0
+    if bar_info:
+        b_ret = np.asarray(bar_info.get("base_ret"), float)[idx]
+        b_lock = np.asarray(bar_info.get("base_locked"), float)[idx]
+        b_vol = np.asarray(bar_info.get("base_vol"), float)[idx]
+        x_ret = np.asarray(bar_info.get("exit_ret"), float)[idx]
+        x_lock = np.asarray(bar_info.get("exit_locked"), float)[idx]
+        eps = 0.005
+        buy_block = (pos > 0) & (b_lock > 0) & (b_ret >= limit - eps)   # 一字涨停买不进
+        suspend = (pos > 0) & (b_vol <= 0)                             # 停牌买不进
+        n_block_buy = int(buy_block.sum()); n_suspend = int(suspend.sum())
+        pos = np.where(buy_block | suspend, 0.0, pos)                  # 这些段无法建仓 → 空仓
+        stuck_sell = (pos > 0) & (x_lock > 0) & (x_ret <= -limit + eps)  # 一字跌停卖不出(仅统计提示)
+        n_stuck_sell = int(stuck_sell.sum())
+
     gross = np.where(pos > 0, seg_ret, 0.0)          # 毛收益(未扣成本)
-    # 只在"仓位变化"时扣成本(买入/卖出各扣一次单边)，连续持有不重复扣，更贴近实盘
     oneway = (cost_bps / 100.0) / 2.0
     prev_pos = np.concatenate([[0.0], pos[:-1]])
-    cost_arr = np.abs(pos - prev_pos) * oneway       # 每段开始时的买/卖成本
+    cost_arr = np.abs(pos - prev_pos) * oneway       # 只在仓位变化时扣单边成本
     cost_arr[-1] += pos[-1] * oneway                 # 末段若仍持有，结束时清仓再扣一次单边
     strat_ret = gross - cost_arr
 
     eq_strat = np.cumprod(1.0 + strat_ret)
     eq_bh = np.cumprod(1.0 + seg_ret)                # 买入持有(全程持有)
-    years = max(n / ann_days, 1e-9)                  # 测试期约 n 个交易日
+    years = max(n / ann_days, 1e-9)
     def _ann(total): return (1.0 + total) ** (1.0 / years) - 1.0
     total = float(eq_strat[-1] - 1.0); total_bh = float(eq_bh[-1] - 1.0)
     peak = np.maximum.accumulate(eq_strat); mdd = float((eq_strat / peak - 1.0).min())
-    n_trades = int(((pos - prev_pos) > 0).sum())     # 买入次数=交易次数
+    n_trades = int(((pos - prev_pos) > 0).sum())
     held = pos > 0
     win_rate = float(np.mean(strat_ret[held] > 0) * 100) if held.sum() > 0 else 0.0
-    sharpe = float(np.mean(strat_ret) / (np.std(strat_ret) + 1e-12) *
+    # 夏普：扣每段无风险利率后再年化(rf_annual 折算到每段)
+    rf_seg = (1.0 + rf_annual) ** (max(1, horizon) / ann_days) - 1.0
+    excess_ret = strat_ret - rf_seg
+    sharpe = float(np.mean(excess_ret) / (np.std(strat_ret) + 1e-12) *
                    np.sqrt(ann_days / max(1, horizon))) if len(strat_ret) > 1 else 0.0
-    return {
+
+    out = {
         "n_segments": int(len(idx)), "n_trades": n_trades,
         "total_return_pct": round(total * 100, 2), "annual_return_pct": round(_ann(total) * 100, 2),
         "buyhold_return_pct": round(total_bh * 100, 2), "buyhold_annual_pct": round(_ann(total_bh) * 100, 2),
         "excess_vs_buyhold_pct": round((total - total_bh) * 100, 2),
         "max_drawdown_pct": round(mdd * 100, 2), "win_rate_pct": round(win_rate, 2),
-        "sharpe": round(sharpe, 3), "cost_bps": cost_bps,
+        "sharpe": round(sharpe, 3), "cost_bps": cost_bps, "limit_pct": round(limit * 100, 1),
+        "n_block_buy": n_block_buy, "n_suspend": n_suspend, "n_stuck_sell": n_stuck_sell,
         "eq_strat": eq_strat, "eq_bh": eq_bh,
         "seg_dates": pd.Series(dates).reset_index(drop=True).iloc[idx].reset_index(drop=True),
     }
+    # ---- 相对大盘(沪深300)超额 ----
+    if bench_close is not None:
+        bench = np.asarray(bench_close, float)
+        if len(bench) >= 2 and np.all(bench[:1] > 0):
+            bench_total = float(bench[-1] / bench[0] - 1.0)
+            eq_bench = bench / bench[0]
+            out["bench_return_pct"] = round(bench_total * 100, 2)
+            out["bench_annual_pct"] = round(_ann(bench_total) * 100, 2)
+            out["excess_vs_bench_pct"] = round((total - bench_total) * 100, 2)
+            out["eq_bench"] = eq_bench
+    return out
 
 
 # ==================== 第八部分补充2：未来走势预测（多周期直接预测，不递归、不造假） ====================
@@ -4665,12 +4755,13 @@ if HAS_PYSIDE6:
                 fc = forecast_curve(model, df, target_mode=target_mode,
                                     horizons=(1, 3, 5, 20, 60), progress_cb=self._log)
                 base_date = fc["last_date"]; base_close = fc["last_close"]
+                tgt_days = next_trading_days(pd.to_datetime(base_date), 60, progress_cb=self._log)
                 rows = []
                 for p in fc["points"]:
                     if "pred_close" not in p:
                         continue
                     h = p["horizon"]
-                    tgt = (pd.to_datetime(base_date) + pd.tseries.offsets.BDay(h)).strftime("%Y-%m-%d")
+                    tgt = tgt_days[h - 1].strftime("%Y-%m-%d")   # 真实交易日历定到期日(跳过周末+节假日)
                     rows.append({
                         "id": f"{code}_{model}_{h}_{base_date}",
                         "made_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -4786,30 +4877,62 @@ if HAS_PYSIDE6:
             except ValueError:
                 cost = 0.2
             horizon = getattr(self, "_last_horizon", 1)
+            code = self.code_edit.text().strip()
+            name = getattr(self, "_last_stock_name", "") or ""
+            is_st = "ST" in (name or "").upper()
+            # 相对大盘(沪深300)基准：按各段目标日期 asof 对齐指数收盘(取数失败则跳过，不报错)
+            bench = None
+            if self.data_source_combo.currentIndex() != 1 and HAS_AKSHARE:
+                try:
+                    segd = pd.to_datetime(pd.Series(r.test_dates).reset_index(drop=True))
+                    seg_idx = segd.iloc[np.arange(0, len(segd), max(1, horizon))].reset_index(drop=True)
+                    ixdf = StockDataFetcher.fetch_index_close()
+                    merged = pd.merge_asof(pd.DataFrame({"date": seg_idx}).sort_values("date"),
+                                           ixdf.sort_values("date"), on="date", direction="backward")
+                    if merged["idx_px"].notna().sum() >= 2:
+                        bench = merged["idx_px"].to_numpy(float)
+                except Exception as e:
+                    self._log(f"[回测] 沪深300基准对齐失败(跳过)：{e}")
             bt = backtest_directional(r.prev_close, r.y_test_true, r.y_test_pred,
-                                      r.test_dates, horizon=horizon, cost_bps=cost)
+                                      r.test_dates, horizon=horizon, cost_bps=cost,
+                                      bar_info=r.bar_info, code=code, is_st=is_st, bench_close=bench)
             if "error" in bt:
                 QMessageBox.warning(self, "提示", bt["error"]); return
             self._draw_backtest(r.algo_name, bt)
+            ex_b = f"，超大盘{bt['excess_vs_bench_pct']}%" if "excess_vs_bench_pct" in bt else ""
             self._oplog(f"回测：{r.algo_name}，成本{cost}%，策略{bt['total_return_pct']}% vs "
-                        f"买入持有{bt['buyhold_return_pct']}%，超额{bt['excess_vs_buyhold_pct']}%。")
+                        f"买入持有{bt['buyhold_return_pct']}%，超额{bt['excess_vs_buyhold_pct']}%{ex_b}"
+                        f"；涨停买不进{bt['n_block_buy']}/停牌{bt['n_suspend']}/跌停卖不出{bt['n_stuck_sell']}段。")
 
         def _draw_backtest(self, algo, bt):
-            verdict = "✅ 跑赢买入持有" if bt["excess_vs_buyhold_pct"] > 0 else "❌ 没跑赢买入持有"
+            beat_bh = bt["excess_vs_buyhold_pct"] > 0
+            beat_bench = bt.get("excess_vs_bench_pct", None)
+            verdict = "✅ 跑赢买入持有" if beat_bh else "❌ 没跑赢买入持有"
+            if beat_bench is not None:
+                verdict += "、" + ("✅跑赢大盘" if beat_bench > 0 else "❌没跑赢大盘")
+            bench_txt = ""
+            if "bench_return_pct" in bt:
+                bench_txt = (f" · 沪深300 {bt['bench_return_pct']}%(年化{bt['bench_annual_pct']}%)"
+                             f" · 超大盘 {bt['excess_vs_bench_pct']}%")
+            # A 股制度真实化统计
+            inst = (f" · 涨停买不进{bt['n_block_buy']}段/停牌{bt['n_suspend']}段/跌停卖不出{bt['n_stuck_sell']}段"
+                    f"(涨跌停幅{bt['limit_pct']}%)")
             self.bt_stat.setText(
                 f"【{algo}】周期{getattr(self,'_last_horizon',1)}日 · 往返成本{bt['cost_bps']}% · "
-                f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%　||　"
-                f"策略总收益 {bt['total_return_pct']}%(年化{bt['annual_return_pct']}%) vs "
+                f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%{inst}　||　"
+                f"策略 {bt['total_return_pct']}%(年化{bt['annual_return_pct']}%) vs "
                 f"买入持有 {bt['buyhold_return_pct']}%(年化{bt['buyhold_annual_pct']}%) · "
-                f"超额 {bt['excess_vs_buyhold_pct']}% · 最大回撤 {bt['max_drawdown_pct']}% · "
+                f"超额 {bt['excess_vs_buyhold_pct']}%{bench_txt} · 最大回撤 {bt['max_drawdown_pct']}% · "
                 f"夏普 {bt['sharpe']}　→　{verdict}")
             self.bt_figure.clear()
             ax = self.bt_figure.add_subplot(111)
             d = pd.to_datetime(bt["seg_dates"])
             ax.plot(d, bt["eq_strat"], label="跟随预测策略", color="#c0392b", linewidth=1.6)
-            ax.plot(d, bt["eq_bh"], label="买入持有", color="#4a90d9", linewidth=1.4, linestyle="--")
+            ax.plot(d, bt["eq_bh"], label="买入持有(该股)", color="#4a90d9", linewidth=1.4, linestyle="--")
+            if "eq_bench" in bt:
+                ax.plot(d, bt["eq_bench"], label="沪深300(大盘)", color="#e0a030", linewidth=1.3, linestyle=":")
             ax.axhline(1.0, color="#999", linewidth=0.8)
-            ax.set_ylabel("净值(初始=1)"); ax.set_title(f"{algo} 方向性收益回测（扣 {bt['cost_bps']}% 往返成本）")
+            ax.set_ylabel("净值(初始=1)"); ax.set_title(f"{algo} 方向性收益回测（扣 {bt['cost_bps']}% 往返成本 · 含A股涨跌停/停牌约束）")
             ax.legend(loc="best"); ax.grid(True, alpha=0.25)
             self.bt_figure.autofmt_xdate()
             self.bt_canvas.draw()
@@ -5572,8 +5695,9 @@ def run_experiment(code: str = "600519",
         if not backtest or r.error or r.prev_close is None:
             return None
         b = backtest_directional(r.prev_close, r.y_test_true, r.y_test_pred,
-                                 r.test_dates, horizon=horizon, cost_bps=cost_bps)
-        return {k: v for k, v in b.items() if k not in ("eq_strat", "eq_bh", "seg_dates")}
+                                 r.test_dates, horizon=horizon, cost_bps=cost_bps,
+                                 bar_info=r.bar_info, code=(None if synthetic else code))
+        return {k: v for k, v in b.items() if k not in ("eq_strat", "eq_bh", "eq_bench", "seg_dates")}
 
     return {
         "data_source": data_source,
@@ -5700,17 +5824,19 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"  ⚠ {cal_msg}；每天独立直接预测(非递归)，越往后越不可靠，绝不构成投资建议。")
 
     if args.backtest:
-        print(f"\n【方向性收益回测：按预测涨跌做多/空仓，往返成本 {args.cost}%】")
+        print(f"\n【方向性收益回测：按预测涨跌做多/空仓，往返成本 {args.cost}%，含A股涨跌停/停牌约束】")
         print(f"{'算法':<14}{'策略收益%':>10}{'年化%':>9}{'买入持有%':>10}{'超额%':>9}"
-              f"{'最大回撤%':>10}{'胜率%':>8}{'夏普':>8}")
+              f"{'最大回撤%':>10}{'胜率%':>8}{'夏普':>8}{'涨停挡':>7}{'停牌':>6}{'跌停锁':>7}")
         for r in out["results"]:
             b = r.get("backtest")
             if not b:
                 continue
             print(f"{r['algo']:<14}{b['total_return_pct']:>10}{b['annual_return_pct']:>9}"
                   f"{b['buyhold_return_pct']:>10}{b['excess_vs_buyhold_pct']:>9}"
-                  f"{b['max_drawdown_pct']:>10}{b['win_rate_pct']:>8}{b['sharpe']:>8}")
+                  f"{b['max_drawdown_pct']:>10}{b['win_rate_pct']:>8}{b['sharpe']:>8}"
+                  f"{b.get('n_block_buy',0):>7}{b.get('n_suspend',0):>6}{b.get('n_stuck_sell',0):>7}")
         print("  → 只有策略明显跑赢\"买入持有\"(超额为正)，才说明预测涨跌真的能赚钱。仍不构成投资建议。")
+        print("  说明：涨停挡=预测该买但一字涨停买不进的段数；停牌=基准日停牌买不进；跌停锁=目标日一字跌停卖不出(收益偏乐观)。")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
