@@ -4664,6 +4664,13 @@ if HAS_PYSIDE6:
             mrow.addWidget(self.mldata_model_view, stretch=1)
             layout.addLayout(mrow)
 
+            # 置顶：量化输入 → 量化输出 总表(用户视角：市场/政策/公司盈利/主力/新闻/日周月K → 明天涨跌+%)
+            self.mldata_io = QTextBrowser(); self.mldata_io.setOpenExternalLinks(True)
+            self.mldata_io.setMaximumHeight(300)
+            self.mldata_io.setHtml("<p style='color:#888'>点「🔬 生成/刷新 数据透视」后，这里显示"
+                                   "『量化输入 → 量化输出』总表：哪些类别已量化喂给模型、输出是什么。</p>")
+            layout.addWidget(self.mldata_io)
+
             split = QSplitter(Qt.Vertical)
             # 上：真实趋势 + 训练/测试分界
             self.mldata_figure = Figure(figsize=(8, 3))
@@ -4938,6 +4945,65 @@ if HAS_PYSIDE6:
             """
             self._html_source = html                 # 供"综合报告"复用
             self.mldata_srcbox.setHtml(html)
+
+            # ===== 置顶：量化输入 → 量化输出 总表(用户视角 + 4条诚实红线) =====
+            try:
+                hz = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            except Exception:
+                hz = 1
+            out_desc = ("明天(第 %d 个交易日)的<b>涨跌方向</b>(涨/跌) + <b>涨跌%%</b>" % hz) \
+                if target_mode == "return" else ("第 %d 日<b>收盘价</b>" % hz)
+
+            def _io(cat, ok, feats, note=""):
+                if ok is True:
+                    mk, bg = "✅ 已量化入模", ""
+                elif ok == "part":
+                    mk, bg = "⚠ 部分/仅参考", " bgcolor=#fff8e1"
+                else:
+                    mk, bg = "⛔ 未量化(不入模型)", " bgcolor=#fee"
+                return (f"<tr{bg}><td><b>{cat}</b></td><td>{mk}</td><td>{feats}</td>"
+                        f"<td style='color:#888'>{note}</td></tr>")
+
+            io_rows = "".join([
+                _io("市场(大盘环境)", True if has("idx_") else False,
+                    "沪深300 涨跌 idx_ret_1d、相对均线 idx_madev20", "东财；已随行情向后对齐"),
+                _io("政策", False, "—",
+                    "政策难可靠量化(需政策NLP，且常反直觉『利好出尽是利空』)，<b>不臆造→不入模型</b>"),
+                _io("公司盈利/估值", "part" if has("val_") else False,
+                    "PE(TTM)/PB/总市值 等", "⚠财报有<b>披露滞后</b>：仅用于研判卡/因子选股(横截面)，"
+                    "<b>未作时序训练特征</b>以防未来函数泄漏"),
+                _io("主力资金流入/流出", True if has("mf_") else False,
+                    "主力/超大/大单净额 mf_*、连续进出、资金-价格背离", "东财；本身是按成交单大小的<b>估算</b>"),
+                _io("新闻", False, "真实标题+链接(仅展示)",
+                    "情绪量化需NLP、且同一新闻市场反应常反直觉，<b>为防臆造→不入模型</b>"),
+                _io("日K线", True, "开高低收量额 + MA/MACD/RSI/KDJ/布林", "东财/baostock"),
+                _io("周K线(≈)", True if has("ret_w") or has("ret_") else False,
+                    "ret_w1/pos_w1/madev_w1", "由日线滚动计算(无泄露)"),
+                _io("月K线(≈)", True if has("ret_m") or has("madev_") else False,
+                    "ret_m1/pos_m1/madev_m1", "由日线滚动计算(无泄露)"),
+            ])
+            io_html = (
+                "<h3 style='color:#2c6fbb'>📊 量化输入 → 量化输出（模型就按这些划分训练）</h3>"
+                "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+                "<tr bgcolor=#eef><th>输入类别</th><th>状态</th><th>量化特征</th><th>说明</th></tr>"
+                f"{io_rows}"
+                f"<tr bgcolor=#eaf7ea><td><b>🎯 量化输出</b></td><td><b>模型预测</b></td>"
+                f"<td colspan=2><b>{out_desc}</b>（默认预测涨跌幅，避免R²虚高）</td></tr>"
+                "</table>"
+                "<div style='background:#fff4f4;border:1px solid #f0b0b0;padding:6px;margin-top:4px'>"
+                "<b style='color:#c0392b'>⚠ 四条红线(决定是真信号还是自欺的过拟合)：</b>"
+                "<ol style='margin:4px 0'>"
+                "<li><b>可量化程度不同</b>：K线/资金/财务本身是数字，好量化；政策/新闻要NLP且常反直觉，"
+                "本软件宁可不量化也不臆造。</li>"
+                "<li><b>特征多≠更准</b>：A股每只股每天只有一条样本，特征一多、样本相对就少，模型会<b>记住噪音</b>"
+                "(这正是『99%精度却只有50%方向准确率』的由来)。别一次全塞——<b>先纯价格建基线，再逐类加，"
+                "每加一类用『因子有效性IC』『Walk-Forward』『方向准确率vs基准』验证是否带来统计显著提升</b>；没提升=噪音。</li>"
+                "<li><b>时效性/未来函数</b>：财报/政策/新闻必须只用『预测那一刻已公开』的信息。"
+                "本软件财务数据只作横截面展示、未作时序训练特征，正是为防此坑。</li>"
+                "<li><b>非平稳</b>：市场规律会随时间漂移，训练一次≠一直有效，必须靠『预测跟踪』做持续样本外验证。</li>"
+                "</ol></div>")
+            if hasattr(self, "mldata_io"):
+                self.mldata_io.setHtml(io_html)
 
         def _fill_mldata_analysis(self, df, code, enrich_status=None, news=None, name="", warns=None):
             """各来源"分析后的信息"：从真实数据里算出每个来源的最新值/近况(不预测、不臆造)。
