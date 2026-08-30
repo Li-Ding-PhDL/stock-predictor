@@ -4286,6 +4286,17 @@ if HAS_PYSIDE6:
             except Exception as e:
                 self.error_signal.emit(str(e))
 
+    class VerifyWorker(QThread):
+        """启动时后台自动验证到期预测(拉真实股价对比)，不阻塞界面。"""
+        done_signal = Signal(int)
+
+        def run(self):
+            try:
+                n = verify_predictions()
+            except Exception:
+                n = 0
+            self.done_signal.emit(int(n))
+
     # ---------- 9.2 主窗口 ----------
     class MainWindow(QMainWindow):
 
@@ -4301,14 +4312,33 @@ if HAS_PYSIDE6:
 
             self._build_ui()
             self._oplog("软件启动。已就绪。")
-            # 启动时自动验证：把之前记录、目标日期已到的预测，自动拉真实股价对比(哪怕你早忘了这只票)
+            self._show_disclaimer()
+            # 启动时自动验证：把之前记录、目标日期已到的预测，自动拉真实股价对比、更新准确率
+            # (放后台线程 + 延迟启动，避免网络慢卡住开机；完成后自动刷新「预测跟踪」表)
+            QTimer.singleShot(600, self._start_auto_verify)
+
+        def _start_auto_verify(self):
             try:
-                n = verify_predictions()
-                if n > 0:
-                    self._oplog(f"启动自动验证：{n} 条到期预测已对比真实股价（见「预测跟踪」页）。")
+                self._oplog("启动自动检测：正在后台核对已到期预测的真实准确率 ...")
+                self._verify_worker = VerifyWorker()
+                self._verify_worker.done_signal.connect(self._on_auto_verify_done)
+                self._verify_worker.start()
             except Exception:
                 pass
-            self._show_disclaimer()
+
+        def _on_auto_verify_done(self, n: int):
+            if n > 0:
+                self._oplog(f"启动自动检测完成：{n} 条到期预测已用真实股价核对，准确率已更新（见「预测跟踪」页）。")
+                try:
+                    self._refresh_tracking()               # 自动刷新统计表，无需用户手点
+                except Exception:
+                    pass
+                try:
+                    self.statusBar().showMessage(f"✅ 已自动核对 {n} 条到期预测的真实准确率，见「预测跟踪」页", 10000)
+                except Exception:
+                    pass
+            else:
+                self._oplog("启动自动检测完成：暂无到期预测需要核对。")
 
         def _show_disclaimer(self):
             box = QMessageBox(self)
