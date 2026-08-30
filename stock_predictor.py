@@ -3377,6 +3377,56 @@ def factor_ic_test(codes: List[str], start: str = "20220101", end: Optional[str]
     return {"rows": rows, "n_stocks": P.shape[1], "n_periods": n_periods, "fwd": fwd, "step": step}
 
 
+def walk_forward_eval(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "return",
+                      horizon: int = 1, window: int = 20, n_folds: int = 5,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """**Walk-Forward 滚动前推验证**(借鉴 walk-forward-validation skill)——比单次 train/test 更接近实盘、更难自欺：
+    把序列切成 n_folds+1 段，第 k 折**只用它之前的数据重新拟合缩放器与模型**、预测紧邻的下一段，
+    把各折的样本外预测拼起来算总 DA/UP_P。每折独立 refit，严格无未来泄漏。
+    返回每折 DA/RMSE + 总样本外 DA(附二项显著性)与『总是涨』基准。"""
+    log = progress_cb or (lambda m: None)
+    cfg = TrainConfig(window_size=window, horizon=horizon, target_mode=target_mode,
+                      hpo_method="关闭", add_naive_baseline=False)
+    pipe = TrainingPipeline(cfg)
+    fe = pipe.fe
+    X, y, dates = fe.build_supervised_samples(raw_df)
+    pc, ct = fe.prev_close_, fe.close_target_
+    n = len(X)
+    block = n // (n_folds + 1)
+    if block < 10:
+        return {"error": "样本太少，减少折数或拉长历史。"}
+    oos_true, oos_pred, oos_pc, folds = [], [], [], []
+    for k in range(1, n_folds + 1):
+        tr_end = k * block
+        te_end = (k + 1) * block if k < n_folds else n
+        if tr_end < 30 or te_end <= tr_end:
+            continue
+        fe.fit_scale(X[:tr_end], y[:tr_end])        # 只在该折之前的数据上 fit(无泄漏)
+        try:
+            m = ALGO_REGISTRY[algo_name](window_size=window)
+            m.fit(fe.transform(X[:tr_end]),
+                  fe.scaler_y.transform(y[:tr_end].reshape(-1, 1)).ravel())
+            pp = pipe._to_price(fe.inverse_y(m.predict(fe.transform(X[tr_end:te_end]))), pc[tr_end:te_end])
+        except Exception as e:
+            log(f"[WF] 第{k}折失败：{e}"); continue
+        ctf, pcf = ct[tr_end:te_end], pc[tr_end:te_end]
+        dm = pipe._dir_metrics(ctf, pp, pcf)
+        rmse = float(np.sqrt(np.mean((ctf - pp) ** 2)))
+        folds.append({"fold": k, "n": int(len(ctf)), "DA": dm["DA"], "RMSE": round(rmse, 4),
+                      "from": str(pd.to_datetime(dates.iloc[tr_end]).date()),
+                      "to": str(pd.to_datetime(dates.iloc[te_end - 1]).date())})
+        oos_true += list(ctf); oos_pred += list(pp); oos_pc += list(pcf)
+        log(f"[WF] 第{k}/{n_folds}折 DA={dm['DA']}%")
+    if not oos_true:
+        return {"error": "全部折训练失败。"}
+    ot, op, opc = np.array(oos_true), np.array(oos_pred), np.array(oos_pc)
+    overall = pipe._dir_metrics(ot, op, opc)
+    up_rate = round(float(np.mean(ot > opc) * 100), 1)        # 实际上涨占比 = 『总是涨』基准 DA
+    return {"folds": folds, "overall_DA": overall["DA"], "overall_UP_P": overall["UP_P"],
+            "n_oos": int(len(ot)), "sig": da_significance(overall["DA"], len(ot)),
+            "up_rate": up_rate, "beat_base": overall["DA"] > up_rate + 3}
+
+
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
@@ -4420,6 +4470,11 @@ if HAS_PYSIDE6:
             self.mldata_model_combo.setMinimumWidth(160)
             self.mldata_model_combo.currentIndexChanged.connect(lambda *_: self._on_view_model_detail())
             mrow.addWidget(self.mldata_model_combo)
+            self.wf_btn = QPushButton("▶ Walk-Forward 验证")
+            self.wf_btn.setToolTip("滚动前推验证：把历史切成多折，每折只用之前数据重训、预测下一段，"
+                                   "拼起来算样本外DA。比单次train/test更接近实盘、更难自欺。")
+            self.wf_btn.clicked.connect(self._on_walk_forward)
+            mrow.addWidget(self.wf_btn)
             self.mldata_model_view = QLabel("先在左侧「运行」训练模型，这里就能选模型看它的训练/验证/测试误差与最看重的特征。")
             self.mldata_model_view.setWordWrap(True)
             self.mldata_model_view.setStyleSheet("padding:4px;background:#f6f8fb;")
@@ -4489,6 +4544,42 @@ if HAS_PYSIDE6:
             if r.formula:
                 parts.append(f"公式：{r.formula}")
             self.mldata_model_view.setText("　｜　".join(parts))
+
+        def _on_walk_forward(self):
+            name = self.mldata_model_combo.currentText() if hasattr(self, "mldata_model_combo") else ""
+            if not name:
+                QMessageBox.information(self, "提示", "请先在左侧「运行」训练模型，再选一个模型做 Walk-Forward 验证。"); return
+            use_syn = self.data_source_combo.currentIndex() == 1
+            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            self.wf_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(f"⏳ {name} 滚动前推验证中(多次重训)…"); QApplication.processEvents()
+            try:
+                if use_syn:
+                    df = StockDataFetcher.generate_synthetic_data()
+                else:
+                    code = self.code_edit.text().strip()
+                    df = StockDataFetcher().fetch(code, self.start_date.date().toString("yyyyMMdd"),
+                                                  self.end_date.date().toString("yyyyMMdd"))
+                res = walk_forward_eval(name, df, target_mode=tm, horizon=horizon, progress_cb=self._log)
+                if "error" in res:
+                    QMessageBox.warning(self, "提示", res["error"]); return
+                fold_txt = "\n".join(f"  第{f['fold']}折({f['from']}~{f['to']}, n={f['n']}): DA={f['DA']}% RMSE={f['RMSE']}"
+                                     for f in res["folds"])
+                verdict = ("✅ 样本外 DA 明显高于『总是涨』基准" if res["beat_base"]
+                           else "❌ 样本外 DA 未明显超基准——该模型在这只股票上大概率没用")
+                QMessageBox.information(self, f"Walk-Forward 验证 · {name}",
+                    f"周期 {horizon} 日 · 共 {len(res['folds'])} 折 · 样本外样本 {res['n_oos']} 条\n"
+                    f"{fold_txt}\n\n"
+                    f"总样本外方向准确率 DA = {res['overall_DA']}%（UP_P {res['overall_UP_P']}%）\n"
+                    f"『总是涨』基准 = {res['up_rate']}%　|　{res['sig']['text']}\n"
+                    f"→ {verdict}\n\n"
+                    f"注：每折只用之前数据重训(无泄漏)，比单次train/test更接近实盘。历史统计、非投资建议。")
+                self._oplog(f"Walk-Forward：{name} 样本外DA={res['overall_DA']}%（基准{res['up_rate']}%）。")
+            except Exception as e:
+                QMessageBox.critical(self, "Walk-Forward 失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.wf_btn.setEnabled(True)
 
         def _on_build_mldata(self):
             self.mldata_btn.setEnabled(False); self.mldata_hint.setText("⏳ 正在拉取数据并生成透视 ...")
