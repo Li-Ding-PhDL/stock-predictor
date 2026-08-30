@@ -98,7 +98,7 @@ python stock_predictor.py --cli --synthetic --algos "RF,SVR,GBRT"
 python stock_predictor.py --cli --code 600519 --week --backtest
 ```
 
-> **Windows 用户注意**：若用户名文件夹含 `&`（如 `&office`），VS Code 的 ▶ 运行按钮拼出的路径会让 PowerShell 报
+> **Windows 用户注意**：若用户名文件夹含 `&`（例如 `name&co` 这类带 & 的用户名），VS Code 的 ▶ 运行按钮拼出的路径会让 PowerShell 报
 > `AmpersandNotAllowed`。解法：别用 ▶，在终端里 `cd "带引号的路径"; python stock_predictor.py`。
 
 ---
@@ -128,7 +128,7 @@ stock-predictor/
 - 做成对外产品前请咨询证券合规律师；无「证券投资咨询」牌照对外荐股/收费在中国属违法。
 
 ## 👨‍💻 作者
-- **Li Ding（）** · GitHub [@Li-Ding-PhDL](https://github.com/Li-Ding-PhDL)
+- GitHub [@Li-Ding-PhDL](https://github.com/Li-Ding-PhDL)
 
 ---
 *任何"保证高准确率""稳赚不赔"的股票预测都是骗局。本软件的立场是：市场接近有效，诚实比虚假的"准"更有价值。*
