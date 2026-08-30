@@ -122,6 +122,21 @@ stock-predictor/
 
 ---
 
+## 🙏 借鉴的开源 Skills（致谢）
+
+本项目的一部分「客观分析/风控/验真」功能，参考并用 Python 独立实现了以下开源 Claude Skills 里的**公开方法学**
+（均为标准公开公式/思路，本项目未复制其代码，且全部按 A 股与本项目「诚实优先」原则重写；相关参考资料未纳入本仓库）：
+
+| 借鉴来源(GitHub) | 借鉴到本项目的功能 |
+|---|---|
+| **staskh/trading_skills** | Piotroski F-Score(9 分基本面质量)、财报披露日历(临近财报事件提示) |
+| **yennanliu/InvestSkill** | 基本面结构化分析思路(Piotroski/质量因子) |
+| **agiprolabs/claude-trading-skills** | 凯利公式仓位、相关性/组合分散化、因子有效性 IC/ICIR、Walk-Forward 滚动前推验证、EWMA/GARCH 波动率建模、均值回归股性诊断(Hurst) |
+| **tradermonty/claude-trading-skills** | 相对强弱 RS(CANSLIM「买领涨」)、大盘状态 regime |
+
+> 说明：这些方法都是**客观统计/会计指标**，本项目只用于「陈列事实 + 验证真伪」，**不产出买卖信号、不荐股**。
+> crypto/DeFi/美股期权/券商下单等与 A 股无关的 skill 未借鉴。
+
 ## ⚖️ 合规与许可
 - 本项目采用 [MIT 许可证](LICENSE)。
 - 数据来自公开接口，仅供个人学术研究。**不构成投资建议，不提供荐股服务。**

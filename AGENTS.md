@@ -114,6 +114,8 @@ python -c "import stock_predictor"
 - **市场情绪 / 舆情**：量价情绪代理已有；真正的新闻/股吧 NLP 情绪仍是扩展——务必真实抓取、不臆造分数。
 - **板块/行业**：可加行业分类 + 板块指数(`stock_board_industry_hist_em`)，按 enrich 同款 merge_asof 并入。
 - **✅ 组合与仓位 / 因子有效性 / 校准 / 波动率**（已完成，借鉴交易 skill）：GUI「组合与仓位」页 = 相关性分散化 `basket_correlation` + 凯利仓位 `kelly_fraction` + 因子有效性 `factor_ic_test`(IC/ICIR，纯价格因子无泄漏)；预测跟踪「区间覆盖率」校准(pred_lo/hi→in_interval)；`estimate_daily_vol`(EWMA/GARCH)改进置信区间。
-- **可继续做**：ARIMA 改滚动一步预测；walk-forward-validation 专项；组合层面收益回测/行业中性；龙虎榜/融资融券/解禁日历/商誉/质押因子(需独立接口)；NLP 舆情情绪；`Kstar/M5Rules/GEP/MEP` 精确实现。
+- **✅ Walk-Forward / 均值回归股性**（已完成）：`walk_forward_eval`(每折 refit 无泄漏，GUI「机器学习内部」按钮)；`stock_character`(Hurst+z-score 判均值回归/趋势，接入研判卡)。
+- **借鉴来源(致谢)**：staskh/trading_skills(Piotroski/财报日历)、yennanliu/InvestSkill(基本面结构化)、agiprolabs/claude-trading-skills(凯利/相关性/组合/IC/WalkForward/波动率/均值回归)、tradermonty/claude-trading-skills(RS/regime)。均只参考公开方法学、未复制代码。
+- **待做**：实时主力资金流(后端 `fetch_realtime_fundflow` 已备，UI 未接；用户要求 skill 做完后再完善)；ARIMA 滚动一步；组合层面收益回测/行业中性；龙虎榜/融资融券/解禁/商誉/质押因子；NLP 舆情；`Kstar/M5Rules/GEP/MEP` 精确实现。
 
 改进时请回到第 2 节红线核对一遍。

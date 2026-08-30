@@ -898,6 +898,41 @@ class StockDataFetcher:
         return ""
 
     @staticmethod
+    def fetch_realtime_fundflow(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
+        """实时主力资金快照(今日累计)：东财实时行情 push2.eastmoney.com f62/f184/f66.../f184。
+        返回 {main_net(主力净流入元), main_pct(净占比%), xl/l/m/s_net(超大/大/中/小单净额)}。
+        诚实提醒：①本就有几秒延迟(非逐笔实时) ②该主机常被东财掐断(RemoteDisconnected)，取不到就返回空、绝不造假。
+        ③『主力去哪你去哪』并不成立——它是滞后统计、且主力也会骗线，切勿当稳赚信号。"""
+        import requests
+        out: Dict[str, Any] = {"main_net": None, "main_pct": None,
+                               "xl_net": None, "l_net": None, "m_net": None, "s_net": None}
+        secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+        params = {"secid": secid, "ut": "b2884a393a59ad64002292a3e90d46a5",
+                  "fields": "f62,f184,f66,f69,f72,f75,f78,f81,f84,f87"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
+                   "Referer": "https://data.eastmoney.com/", "Connection": "close"}
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        hosts = ["https://push2.eastmoney.com", "http://push2.eastmoney.com"]
+        with ctx:
+            for host in hosts:
+                try:
+                    with requests.Session() as sess:
+                        sess.headers.update(headers)
+                        r = sess.get(host + "/api/qt/stock/get", params=params, timeout=10)
+                    d = (r.json() or {}).get("data") or {}
+                    if d:
+                        def _n(k):
+                            v = d.get(k)
+                            return float(v) if isinstance(v, (int, float)) else None
+                        out.update({"main_net": _n("f62"), "main_pct": _n("f184"),
+                                    "xl_net": _n("f66"), "l_net": _n("f72"),
+                                    "m_net": _n("f78"), "s_net": _n("f84")})
+                        return out
+                except Exception:
+                    continue
+        return out
+
+    @staticmethod
     def fetch_realtime(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
         """实时盘口快照(用于盘中监控)：akshare stock_bid_ask_em，数据源=东方财富。
         返回字典(现价/涨跌幅/今开最高最低/量比/换手/成交量额 + 买卖5档)。仅监控展示，不作历史训练。"""
@@ -3635,6 +3670,8 @@ GLOSSARY = {
          "CANSLIM 选股讲究『买领涨、不买落后』，但强弱是历史事实、不保证未来。"),
         ("大盘状态(牛/熊/震荡)", "看沪深300 相对 200 日均线的位置与均线方向：上方且上行=偏多，下方且下行=偏空，其余=震荡。"
          "熊市里再好的个股信号也要打折——这是客观背景，不是买卖信号。"),
+        ("股性(Hurst指数)", "衡量一只股是『均值回归型』(Hurst<0.45，跌多易反弹、适合高抛低吸)还是『趋势型』"
+         "(>0.55，强者恒强、适合顺势)，≈0.5 则接近随机、难有规律。这是客观统计属性，不是买卖建议。"),
         ("资产负债率", "公司欠的钱占总资产的比例。太高(如 >70%)说明借钱多，有偿债/爆雷风险。"),
         ("现金流(经营)", "公司实际收进/付出的现金，比「利润」更难造假。经营现金流长期为负要警惕。"),
         ("商誉 / 商誉减值", "收购别人时多付的溢价叫商誉；若买来的公司变差，要「商誉减值」→ 可能一次性<b>巨亏</b>。"),
@@ -3768,6 +3805,36 @@ def market_regime(bypass_proxy: bool = True) -> Dict[str, Any]:
             out["regime"], out["text"] = "bear", f"大盘偏空(沪深300在200日线下{dev:+.1f}%、均线下行)——个股信号需大打折扣"
         else:
             out["regime"], out["text"] = "range", f"大盘震荡/转折(沪深300与200日线{dev:+.1f}%、方向不明)"
+    except Exception:
+        pass
+    return out
+
+
+def stock_character(close) -> Dict[str, Any]:
+    """股性诊断(借鉴 mean-reversion skill)：用 Hurst 指数 + 近期布林 z-score 客观判断这只股的『性格』——
+    是**均值回归型**(H<0.45，跌多了容易反弹、适合高抛低吸)、**趋势型**(H>0.55，强者恒强、适合顺势)，还是**随机**(≈0.5)。
+    Hurst 用结构函数法(不同滞后差分的波动随滞后的幂律)估计。这是客观统计属性、非买卖建议。"""
+    out = {"hurst": None, "z": None, "kind": "未知", "note": ""}
+    try:
+        c = pd.to_numeric(pd.Series(close), errors="coerce").dropna().to_numpy(float)
+        if len(c) < 120:
+            return out
+        cc = c[-250:] if len(c) > 250 else c
+        lags = range(2, 20)
+        tau = [np.std(cc[lag:] - cc[:-lag]) for lag in lags]
+        tau = [t if t > 1e-12 else 1e-12 for t in tau]
+        H = float(np.polyfit(np.log(list(lags)), np.log(tau), 1)[0])
+        ma20 = float(np.mean(c[-20:])); sd20 = float(np.std(c[-20:]) + 1e-12)
+        z = (float(c[-1]) - ma20) / sd20
+        if H < 0.45:
+            kind = "均值回归型(跌多易反弹，偏高抛低吸)"
+        elif H > 0.55:
+            kind = "趋势型(强者恒强，偏顺势)"
+        else:
+            kind = "接近随机游走(难有稳定规律)"
+        znote = ("，当前明显低于20日均线(偏冷)" if z < -1.5 else
+                 ("，当前明显高于20日均线(偏热)" if z > 1.5 else "，当前在均线附近"))
+        out.update({"hurst": round(H, 3), "z": round(z, 2), "kind": kind, "note": kind + znote})
     except Exception:
         pass
     return out
@@ -3911,6 +3978,7 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         "f_score": q.get("f_score"), "f_available": q.get("f_available"), "f_detail": q.get("f_detail"),
         "roe": q.get("roe"), "rs_1q": rs_1q, "regime": reg,
         "next_report": StockDataFetcher.fetch_next_report_date(code),   # 下次财报披露日(已缓存)
+        "character": stock_character(close),                            # 股性诊断(均值回归/趋势/随机)
         "news_items": news_items, "verdict": verdict,
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
     }
@@ -3944,6 +4012,10 @@ def _plain_verdict_html(card: Dict[str, Any], f) -> str:
         mk.append(f"相对大盘近3月{'强' if card['rs_1q']>=0 else '弱'} {card['rs_1q']:+.1f}%")
     if mk:
         ev.append("<li><b>大盘环境/相对强弱：</b>" + "；".join(mk) + "</li>")
+    # 股性(均值回归/趋势)
+    ch = card.get("character", {})
+    if ch.get("hurst") is not None:
+        ev.append(f"<li><b>股性诊断：</b>{ch['note']}（Hurst={ch['hurst']}，z={ch['z']}）</li>")
     # 风险
     hi = [w for w in card.get("warns", []) if w["level"] == "高"]
     if card.get("warns"):
@@ -6270,7 +6342,8 @@ if HAS_PYSIDE6:
             outer.addWidget(select_all_btn)
 
             # 默认自动勾选几个"快且稳"的算法，开箱即用（含一个线性、一个树、一个梯度提升作对照）
-            default_on = {"Lasso", "RF", "GBRT"}
+            # 默认勾选 6 个『又快又相对准』的模型(用户偏好)：3 线性/核 + 1 极速神经网 + 1 降维回归 + 1 经典时序
+            default_on = {"SVR", "GPR", "Lasso", "PLSR", "ELM", "ARIMA"}
             categories = ["基础与传统模型", "先进与前沿模型", "公式拟合/演化计算", "经典时序模型"]
             for cat in categories:
                 cat_box = QGroupBox(cat)

@@ -74,6 +74,13 @@ python stock_predictor.py --cli --code 600519 --week --backtest   # 命令行(�
 - [ ] 真·舆情情绪（新闻 NLP，须真抓不臆造）
 - [ ] 组合层面回测 / 行业中性；龙虎榜 / 融资融券 / 解禁日历因子
 
+## 借鉴的开源 Skills（致谢，仅参考公开方法学、未复制代码）
+- **staskh/trading_skills**：Piotroski F-Score、财报披露日历
+- **yennanliu/InvestSkill**：基本面结构化分析(Piotroski/质量)
+- **agiprolabs/claude-trading-skills**：凯利仓位、相关性/组合分散化、因子 IC/ICIR、Walk-Forward、EWMA/GARCH 波动率、均值回归股性(Hurst)
+- **tradermonty/claude-trading-skills**：相对强弱 RS、大盘状态 regime
+> 均为标准公开公式，按 A 股 + 诚实优先重写；只用于陈列事实/验证真伪，不产出买卖信号。
+
 ## 合规（重要）
 **仅供交流与学习，不构成投资建议、绝不荐股；作者与本产品不承担任何法律责任与风险，盈亏自负。**
 请自用、勿高频抓取、勿无牌荐股/售卖数据。做成对外产品前请咨询证券合规律师。
