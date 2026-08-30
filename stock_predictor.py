@@ -835,9 +835,24 @@ class StockDataFetcher:
         """真实个股新闻(仅供展示/近期参考)：akshare stock_news_em，数据源=东方财富。
         注意：新闻接口只覆盖近期，且把文本转成可靠的历史情绪分数需要 NLP 模型；为避免臆造，
         本软件**不**把新闻情绪当作历史训练特征，只在界面展示真实标题与链接。"""
-        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
-        with ctx:
-            nd = StockDataFetcher._retry(lambda: ak.stock_news_em(symbol=code))
+        # 兼容坑：pandas 若启用 pyarrow 字符串后端，akshare 内部对标题做的正则含 \u，会被 RE2 拒绝
+        # (ArrowInvalid: invalid escape sequence: \u)。调用前临时关掉 arrow 字符串推断，用回 Python re。
+        _old_is = None
+        try:
+            _old_is = pd.get_option("future.infer_string")
+            pd.set_option("future.infer_string", False)
+        except Exception:
+            _old_is = None
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx:
+                nd = StockDataFetcher._retry(lambda: ak.stock_news_em(symbol=code))
+        finally:
+            if _old_is is not None:
+                try:
+                    pd.set_option("future.infer_string", _old_is)
+                except Exception:
+                    pass
         nd = nd.rename(columns={"新闻标题": "title", "发布时间": "time",
                                 "文章来源": "source", "新闻链接": "url"})
         cols = [c for c in ["time", "title", "source", "url"] if c in nd.columns]
