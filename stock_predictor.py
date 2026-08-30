@@ -2831,10 +2831,18 @@ def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "ret
     "直接预测第 h 天"的模型(用全部历史)，各得到一个未来价格锚点。各锚点都是真实的直接预测，
     中间可插值成曲线——**不做递归预测**(拿预测喂预测会误差爆炸)，**不编造**未来的开高低量。
 
-    返回：{algo, last_close, last_date, points:[{horizon, pred_close, change_pct} ...]}
+    返回：{algo, last_close, last_date, points:[{horizon, pred_close, change_pct, lo, hi, band_pct} ...]}
+    其中 lo/hi 是约 80% 置信区间(基于历史日收益波动率 σ·√h)，提醒"点预测必错、区间才诚实"。
     """
     log = progress_cb or (lambda m: None)
     points, last_close, last_date = [], None, None
+    # 历史日收益率波动率 σ(用于给预测加不确定区间；不是精确分布，只作量级参考)
+    try:
+        rr = pd.to_numeric(raw_df["close"], errors="coerce").pct_change().dropna()
+        sigma_d = float(rr.std())
+    except Exception:
+        sigma_d = 0.0
+    Z80 = 1.2816                                    # 80% 双侧置信的正态分位数
     for h in horizons:
         cfg = TrainConfig(window_size=window, horizon=h, target_mode=target_mode,
                           hpo_method="关闭", add_naive_baseline=False)
@@ -2842,12 +2850,16 @@ def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "ret
         try:
             log(f"[未来预测] 训练「第 {h} 天」直接预测模型 ...")
             r = pipe.predict_next(algo_name, raw_df)
-            points.append({"horizon": h, "pred_close": r["pred_close"],
-                           "change_pct": r["pred_change_pct"]})
+            band = Z80 * sigma_d * (h ** 0.5)       # 区间半宽(相对比例)，随周期 √h 放大
+            pc = r["pred_close"]
+            points.append({"horizon": h, "pred_close": pc, "change_pct": r["pred_change_pct"],
+                           "lo": round(pc * (1 - band), 4), "hi": round(pc * (1 + band), 4),
+                           "band_pct": round(band * 100, 2)})
             last_close, last_date = r["last_close"], r["last_date"]
         except Exception as e:
             points.append({"horizon": h, "error": str(e)})
-    return {"algo": algo_name, "last_close": last_close, "last_date": last_date, "points": points}
+    return {"algo": algo_name, "last_close": last_close, "last_date": last_date,
+            "points": points, "sigma_daily_pct": round(sigma_d * 100, 3)}
 
 
 # ==================== 第八部分补充4：批量扫描（多股批量 取数→训练→预测→风险） ====================
@@ -3261,6 +3273,29 @@ def glossary_html() -> str:
 
 
 # ==================== 第八部分补充8：综合研判卡（只汇总客观事实，绝不下买卖结论/荐股） ====================
+def da_significance(da_pct: Optional[float], n: int) -> Dict[str, Any]:
+    """判断方向准确率 DA 是否**显著**高于 50%(抛硬币)。用单侧二项检验的正态近似算 p 值。
+    返回 {p, sig, text}：p 越小越显著；sig=True 表示 p<0.05 可认为真比蒙的强。
+    诚实要点：样本越少(n 小)，哪怕 DA=60% 也可能只是运气，这里如实标注。"""
+    if da_pct is None or n is None or n < 5:
+        return {"p": None, "sig": False, "text": "样本太少，无法判断显著性"}
+    import math
+    phat = da_pct / 100.0
+    se = math.sqrt(0.25 / n)                       # H0: p=0.5 的标准误
+    z = (phat - 0.5) / (se + 1e-12)
+    # 单侧正态尾概率 P(Z>z)（用 erfc，无需 scipy）
+    p = 0.5 * math.erfc(z / math.sqrt(2))
+    if phat <= 0.5:
+        return {"p": round(p, 4), "sig": False, "text": f"≤50%(n={n})，不比抛硬币强"}
+    if p < 0.01:
+        txt = f"显著>50%(p={p:.3f}, n={n})"
+    elif p < 0.05:
+        txt = f"较显著>50%(p={p:.3f}, n={n})"
+    else:
+        txt = f"不显著(p={p:.2f}, n={n})，可能只是运气"
+    return {"p": round(p, 4), "sig": p < 0.05, "text": txt}
+
+
 def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
                   target_mode: str = "return", horizon: int = 5,
                   models=("SVR", "Lasso"),
@@ -3305,10 +3340,13 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
                 pred_chg = fc.get("pred_change_pct")
             except Exception:
                 pass
-            da_rows.append({"model": m,
-                            "DA": (mr.metrics.get("DA") if mr else None),
+            da_v = mr.metrics.get("DA") if mr else None
+            n_te = int(len(mr.y_test_true)) if (mr and mr.y_test_true is not None) else 0
+            sig = da_significance(da_v, n_te)     # DA 是否显著>50%(二项检验)
+            da_rows.append({"model": m, "DA": da_v,
                             "UP_P": (mr.metrics.get("UP_P") if mr else None),
-                            "pred_change": pred_chg})
+                            "pred_change": pred_chg, "n_test": n_te,
+                            "da_p": sig["p"], "da_sig": sig["sig"], "da_sig_text": sig["text"]})
         except Exception as e:
             da_rows.append({"model": m, "error": str(e)})
     warns = assess_risks(code, name, df, news=None)
@@ -3347,8 +3385,9 @@ def research_card_html(card: Dict[str, Any]) -> str:
         good = (up is not None and da is not None and da >= up + 3 and da >= 52)
         tag = ("<span style='color:#1e8449'>高于基准</span>" if good
                else "<span style='color:#c0392b'>≈基准/偏弱</span>")
+        sig_txt = r.get("da_sig_text", "")
         da_body += (f"<tr><td>{r['model']}</td><td>{f(da,'%',1)}</td>"
-                    f"<td>{f(r.get('UP_P'),'%',1)}</td><td>{tag}</td></tr>")
+                    f"<td>{f(r.get('UP_P'),'%',1)}</td><td>{tag}<br><span style='color:#888;font-size:12px'>{sig_txt}</span></td></tr>")
     # 模型「机械倾向」+ 可信度（回答"模型对后市的看法"，但绝不当建议：可信度低就明说≈抛硬币）
     lean_rows = ""
     for r in card["da_rows"]:
@@ -3360,11 +3399,15 @@ def research_card_html(card: Dict[str, Any]) -> str:
         else:
             lean = ("<span style='color:#c0392b'>偏涨</span>" if pc > 0.2 else
                     ("<span style='color:#1a9d5a'>偏跌</span>" if pc < -0.2 else "中性"))
-        reliable = (up is not None and da is not None and da >= up + 3 and da >= 52)
+        # 可信度须同时满足：①高于基准 ②统计上显著>50%(不是运气)。任一不满足即判为不可信
+        reliable = (up is not None and da is not None and da >= up + 3 and da >= 52
+                    and r.get("da_sig"))
         cred = ("<span style='color:#1e8449'>可信度尚可(仍非建议)</span>" if reliable
                 else "<span style='color:#c0392b'>≈抛硬币，基本不可信</span>")
         lean_rows += (f"<tr><td>{r['model']}</td><td>{lean}</td>"
-                      f"<td>{f(pc,'%',2)}</td><td>DA {f(da,'%',1)} → {cred}</td></tr>")
+                      f"<td>{f(pc,'%',2)}</td>"
+                      f"<td>DA {f(da,'%',1)} → {cred}<br>"
+                      f"<span style='color:#888;font-size:12px'>{r.get('da_sig_text','')}</span></td></tr>")
     lean_html = (f"<h3>模型对后市的「机械倾向」（{card['horizon']}日，<b style='color:#c0392b'>非预言、非建议</b>）</h3>"
                  "<p style='color:#888'>下面是模型按数据算出的方向倾向，但<b>必须连着右边的可信度一起看</b>："
                  "DA≈50% 时这个倾向就等于抛硬币，别当真。</p>"
@@ -5039,6 +5082,12 @@ if HAS_PYSIDE6:
             lbl = "未来一周·逐日预测(每日直接预测)" if weekly else "未来预测(各周期直接预测)"
             ax.plot(fut_dates, fut_prices, color="#c0392b", linewidth=1.6, linestyle="--",
                     marker="o", markersize=5, label=lbl)
+            # 约80%置信区间(基于历史波动率)：点预测必错，区间才诚实
+            if any("lo" in p for p in ok_points):
+                lo_band = [last_close] + [p.get("lo", p["pred_close"]) for p in ok_points]
+                hi_band = [last_close] + [p.get("hi", p["pred_close"]) for p in ok_points]
+                ax.fill_between(fut_dates, lo_band, hi_band, color="#c0392b", alpha=0.12,
+                                label="约80%置信区间(历史波动)")
             if weekly:
                 # 逐日模式：每个交易日都标注(周几 + 预测价 + 相对最新收盘涨跌)
                 for p in ok_points:
@@ -5072,22 +5121,20 @@ if HAS_PYSIDE6:
                     "<table border=1 cellpadding=4 cellspacing=0 width=100%>"]
             if weekly:
                 cal_note = "真实交易日" if _TRADE_CAL_CACHE["dates"] is not None else "日期(约)"
-                rows.append(f"<tr bgcolor=#eef><th>交易日</th><th>{cal_note}</th><th>预测价</th><th>较今涨跌</th></tr>")
-                prev = last_close
+                rows.append(f"<tr bgcolor=#eef><th>交易日</th><th>{cal_note}</th><th>预测价</th>"
+                            f"<th>较今涨跌</th><th>约80%区间</th></tr>")
                 for p in fc["points"]:
                     if "pred_close" in p:
                         fdate = fut_map[p["horizon"]]
                         chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
-                        # 相邻日环比(仅供参考，各点都是独立直接预测、非递归)
-                        step = (p["pred_close"] - prev) / prev * 100 if prev else 0.0
-                        arrow = "↑" if step >= 0 else "↓"
+                        band = (f"{p['lo']:.2f}~{p['hi']:.2f}" if "lo" in p else "-")
                         rows.append(f"<tr><td>下{('一二三四五')[p['horizon']-1]}({self._cn_weekday(fdate)})</td>"
                                     f"<td>{fdate.strftime('%m-%d')}</td>"
                                     f"<td><b>{p['pred_close']:.2f}</b></td>"
-                                    f"<td style='color:{col}'>{chg:+.2f}% {arrow}</td></tr>")
-                        prev = p["pred_close"]
+                                    f"<td style='color:{col}'>{chg:+.2f}%</td>"
+                                    f"<td style='color:#888;font-size:12px'>{band}</td></tr>")
                     else:
-                        rows.append(f"<tr><td>下第{p['horizon']}日</td><td colspan=3>失败</td></tr>")
+                        rows.append(f"<tr><td>下第{p['horizon']}日</td><td colspan=4>失败</td></tr>")
             else:
                 rows.append("<tr bgcolor=#eef><th>时点</th><th>预测价(元)</th><th>涨跌</th></tr>")
                 for p in fc["points"]:
@@ -5425,18 +5472,32 @@ if HAS_PYSIDE6:
                 return "<p>没有成功训练的模型。</p>"
             best = max(models, key=lambda r: (r.metrics.get("DA") or 0))
             da = best.metrics.get("DA"); up_p = best.metrics.get("UP_P")
-            # 判定：DA 要明显高于"总是涨"基准(+3%)且>52%，才推荐；否则诚实劝退
-            good = (up_rate is not None and da is not None and da >= up_rate + 3.0 and da >= 52.0)
+            n_te = int(len(best.y_test_true)) if best.y_test_true is not None else 0
+            sig = da_significance(da, n_te)        # 最佳 DA 是否统计显著>50%(而非运气/挑出来的)
+            n_models = len(models)
+            # 判定：DA 要①明显高于"总是涨"基准(+3%且>52%) ②统计显著，才推荐；否则诚实劝退
+            good = (up_rate is not None and da is not None and da >= up_rate + 3.0
+                    and da >= 52.0 and sig["sig"])
+            # 多重比较偏差：一次比了 n_models 个模型再挑最好的，最好那个的 DA 天然偏乐观
+            mc_note = ""
+            if n_models >= 3:
+                mc_note = (f"<p style='color:#c0392b;font-size:13px'>⚠ <b>多重比较偏差提醒</b>："
+                           f"本次同时比了 {n_models} 个模型再挑出 DA 最高的——"
+                           f"「挑出来的最好」本身就偏乐观(像掷一堆骰子只报最大点)。"
+                           f"务必用「预测跟踪」页做<b>样本外</b>验证，别只信这个回测数字。</p>")
             if good:
                 verdict = (f"<div style='background:#f2fbf2;border:2px solid #1e8449;padding:8px'>"
                            f"<b style='color:#1e8449'>🎯 建议用 {best.algo_name} 做本次预测</b>　"
-                           f"（测试方向准确率 DA <b>{da}%</b>，明显高于「总是涨」基准 {up_rate}%；"
-                           f"预测上涨时的精确率 UP_P {up_p}%）。仍仅供参考，不构成投资建议。</div>")
+                           f"（测试方向准确率 DA <b>{da}%</b>，明显高于「总是涨」基准 {up_rate}%、"
+                           f"且{sig['text']}；预测上涨时精确率 UP_P {up_p}%）。仍仅供参考，不构成投资建议。{mc_note}</div>")
             else:
+                why_bad = (f"最高的 {best.algo_name} DA={da}%" +
+                           (f"，虽高于基准但{sig['text']}" if (up_rate and da and da >= up_rate + 3)
+                            else f"，未明显超基准 {up_rate}%"))
                 verdict = (f"<div style='background:#fff4f4;border:2px solid #c0392b;padding:8px'>"
-                           f"<b style='color:#c0392b'>⚠️ 本次没有模型明显优于「总是涨」基准</b>"
-                           f"（基准 {up_rate}%，最高的 {best.algo_name} 也只有 {da}%）——"
-                           f"<b>不建议据此预测，别信任何单一预测。</b>换股票/换周期/多试几个模型再看。</div>")
+                           f"<b style='color:#c0392b'>⚠️ 本次没有模型可靠地优于「总是涨」基准</b>"
+                           f"（{why_bad}）——<b>不建议据此预测，别信任何单一预测。</b>"
+                           f"换股票/换周期/多试几个模型再看。{mc_note}</div>")
             # 预测依据①：模型最看重的真实输入
             fi = best.feature_importance
             if fi:
