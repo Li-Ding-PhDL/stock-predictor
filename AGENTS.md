@@ -113,6 +113,7 @@ python -c "import stock_predictor"
 - **✅ 因子选股 5 因子**（已完成）：`batch_factor_scan` = 价值/动量/资金 + 质量(`fetch_quality` ROE+营收增速) + 低波动。
 - **市场情绪 / 舆情**：量价情绪代理已有；真正的新闻/股吧 NLP 情绪仍是扩展——务必真实抓取、不臆造分数。
 - **板块/行业**：可加行业分类 + 板块指数(`stock_board_industry_hist_em`)，按 enrich 同款 merge_asof 并入。
-- **可继续做**：ARIMA 改滚动一步预测；组合层面回测/行业中性；龙虎榜/融资融券/解禁日历因子；`Kstar/M5Rules/GEP/MEP` 精确实现。
+- **✅ 组合与仓位 / 因子有效性 / 校准 / 波动率**（已完成，借鉴交易 skill）：GUI「组合与仓位」页 = 相关性分散化 `basket_correlation` + 凯利仓位 `kelly_fraction` + 因子有效性 `factor_ic_test`(IC/ICIR，纯价格因子无泄漏)；预测跟踪「区间覆盖率」校准(pred_lo/hi→in_interval)；`estimate_daily_vol`(EWMA/GARCH)改进置信区间。
+- **可继续做**：ARIMA 改滚动一步预测；walk-forward-validation 专项；组合层面收益回测/行业中性；龙虎榜/融资融券/解禁日历/商誉/质押因子(需独立接口)；NLP 舆情情绪；`Kstar/M5Rules/GEP/MEP` 精确实现。
 
 改进时请回到第 2 节红线核对一遍。
