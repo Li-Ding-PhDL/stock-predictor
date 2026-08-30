@@ -4375,6 +4375,19 @@ if HAS_PYSIDE6:
             top.addWidget(self.mldata_hint, stretch=1)
             layout.addLayout(top)
 
+            # 选择『已训练好的模型』看它的详情(训练/验证/测试误差、最看重的特征、公式)
+            mrow = QHBoxLayout()
+            mrow.addWidget(QLabel("查看训练好的模型:"))
+            self.mldata_model_combo = QComboBox()
+            self.mldata_model_combo.setMinimumWidth(160)
+            self.mldata_model_combo.currentIndexChanged.connect(lambda *_: self._on_view_model_detail())
+            mrow.addWidget(self.mldata_model_combo)
+            self.mldata_model_view = QLabel("先在左侧「运行」训练模型，这里就能选模型看它的训练/验证/测试误差与最看重的特征。")
+            self.mldata_model_view.setWordWrap(True)
+            self.mldata_model_view.setStyleSheet("padding:4px;background:#f6f8fb;")
+            mrow.addWidget(self.mldata_model_view, stretch=1)
+            layout.addLayout(mrow)
+
             split = QSplitter(Qt.Vertical)
             # 上：真实趋势 + 训练/测试分界
             self.mldata_figure = Figure(figsize=(8, 3))
@@ -4396,6 +4409,48 @@ if HAS_PYSIDE6:
             split.setSizes([280, 230, 340])
             layout.addWidget(split, stretch=1)
             return panel
+
+        def _refresh_model_combos(self):
+            """训练完成后，把成功训练的模型名填进『机器学习内部』的下拉(供查看详情)。"""
+            if not hasattr(self, "mldata_model_combo"):
+                return
+            names = [r.algo_name for r in getattr(self, "results", []) if not r.error]
+            cur = self.mldata_model_combo.currentText()
+            self.mldata_model_combo.blockSignals(True)
+            self.mldata_model_combo.clear()
+            self.mldata_model_combo.addItems(names)
+            if cur in names:
+                self.mldata_model_combo.setCurrentText(cur)
+            self.mldata_model_combo.blockSignals(False)
+            self._on_view_model_detail()
+
+        def _on_view_model_detail(self):
+            """显示所选『训练好的模型』的训练/验证/测试误差、最看重的特征、公式(如有)。"""
+            if not hasattr(self, "mldata_model_view"):
+                return
+            name = self.mldata_model_combo.currentText() if hasattr(self, "mldata_model_combo") else ""
+            r = next((x for x in getattr(self, "results", []) if x.algo_name == name and not x.error), None)
+            if r is None:
+                self.mldata_model_view.setText("先在左侧「运行」训练模型，这里就能选模型看它的训练/验证/测试误差与最看重的特征。")
+                return
+            def g(m, k):
+                return (f"{m.get(k)}" if (m and k in m) else "-")
+            tr, va, te = r.metrics_train or {}, r.metrics_val or {}, r.metrics
+            parts = [f"<b>{name}</b>　RMSE 训/验/测 = {g(tr,'RMSE')} / {g(va,'RMSE')} / {g(te,'RMSE')}",
+                     f"测试 DA {g(te,'DA')}% · UP_P {g(te,'UP_P')}% · R² {g(te,'R2')}"]
+            # 过拟合提示：训练远好于测试
+            try:
+                if tr.get("RMSE") is not None and te.get("RMSE") is not None and float(te["RMSE"]) > 1.6 * float(tr["RMSE"]):
+                    parts.append("<span style='color:#c0392b'>⚠ 训练误差远小于测试→可能过拟合</span>")
+            except Exception:
+                pass
+            if r.feature_importance:
+                lab = lambda k: self._FEATURE_LABELS.get(k, k)
+                imp = "、".join(f"{lab(k)} {v}%" for k, v in r.feature_importance[:6])
+                parts.append(f"最看重特征：{imp}")
+            if r.formula:
+                parts.append(f"公式：{r.formula}")
+            self.mldata_model_view.setText("　｜　".join(parts))
 
         def _on_build_mldata(self):
             self.mldata_btn.setEnabled(False); self.mldata_hint.setText("⏳ 正在拉取数据并生成透视 ...")
@@ -4844,6 +4899,16 @@ if HAS_PYSIDE6:
                      "a{color:#2c6fbb;word-break:break-all}</style>")
             return f"<html><head><meta charset='utf-8'>{style}</head><body>{body}</body></html>"
 
+        def _card_models(self):
+            """研判卡要评估的模型：优先用『已训练成功的模型』(排除基准)，否则用左侧勾选的算法，
+            都没有就退回 SVR/Lasso。这样研判卡覆盖『所有运行过的模型』。"""
+            got = [r.algo_name for r in getattr(self, "results", [])
+                   if not r.error and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)")]
+            if got:
+                return tuple(got)
+            sel = [n for n, cb in self.algo_checkboxes.items() if cb.isChecked() and cb.isEnabled()]
+            return tuple(sel) if sel else ("SVR", "Lasso")
+
         def _on_research_card(self):
             if self.data_source_combo.currentIndex() == 1:
                 QMessageBox.information(self, "提示", "综合研判卡需真实数据，请把数据源切到「真实数据」。"); return
@@ -4855,8 +4920,10 @@ if HAS_PYSIDE6:
             try:
                 start = self.start_date.date().toString("yyyyMMdd")
                 end = self.end_date.date().toString("yyyyMMdd")
+                mdls = self._card_models()
+                self._log(f"[研判卡] 将评估 {len(mdls)} 个模型：{', '.join(mdls)}")
                 card = research_card(code, start, end, target_mode=tm, horizon=horizon,
-                                     models=("SVR", "Lasso"), progress_cb=self._log)
+                                     models=mdls, progress_cb=self._log)
                 self._html_card = research_card_html(card)
                 # 研判卡后面附上数据溯源链接，方便逐条核对
                 links = self._source_links_html(code)
@@ -4891,7 +4958,7 @@ if HAS_PYSIDE6:
                             start0 = self.start_date.date().toString("yyyyMMdd")
                             end0 = self.end_date.date().toString("yyyyMMdd")
                             card0 = research_card(code0, start0, end0, target_mode=tm, horizon=horizon,
-                                                  models=("SVR", "Lasso"), progress_cb=self._log)
+                                                  models=self._card_models(), progress_cb=self._log)
                             self._html_card = research_card_html(card0)
                             self._prog_open("⏳ 正在生成报告(含K线图) ……")
                         except Exception as e:
@@ -5483,10 +5550,27 @@ if HAS_PYSIDE6:
             top.addWidget(b2)
             top.addStretch()
             layout.addLayout(top)
-            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(150)
+            # 筛选：状态 + 代码，让明细表更好用
+            filt = QHBoxLayout()
+            filt.addWidget(QLabel("筛选："))
+            self.trk_filter = QComboBox(); self.trk_filter.addItems(["全部", "未到期(pending)", "已验证(verified)"])
+            self.trk_filter.currentIndexChanged.connect(lambda *_: self._refresh_tracking())
+            filt.addWidget(self.trk_filter)
+            filt.addWidget(QLabel("代码含："))
+            self.trk_code_filter = QLineEdit(); self.trk_code_filter.setFixedWidth(120)
+            self.trk_code_filter.setPlaceholderText("留空=全部")
+            self.trk_code_filter.textChanged.connect(lambda *_: self._refresh_tracking())
+            filt.addWidget(self.trk_code_filter)
+            self.trk_count = QLabel(""); filt.addWidget(self.trk_count)
+            filt.addStretch()
+            layout.addLayout(filt)
+            # 摘要放进可收起的 splitter，表格默认占大头
+            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(130)
             layout.addWidget(self.trk_summary)
             self.trk_table = QTableWidget()
-            layout.addWidget(self.trk_table, stretch=1)
+            self.trk_table.setMinimumHeight(430)              # 明细表更大、看得全
+            self.trk_table.setAlternatingRowColors(True)
+            layout.addWidget(self.trk_table, stretch=5)
             self._refresh_tracking()
             return panel
 
@@ -5592,9 +5676,22 @@ if HAS_PYSIDE6:
                     "actual_close", "actual_change_pct", "hit_dir", "in_interval"]
             heads = ["记录时间", "代码", "名称", "模型", "周期", "记录时DA%", "基准日", "基准价", "预测价",
                      "预测涨跌%", "方向", "区间下", "区间上", "目标日", "状态", "实际价", "实际涨跌%", "命中", "落区间"]
+            # 应用筛选(状态 + 代码)
+            if len(df):
+                fi = self.trk_filter.currentIndex() if hasattr(self, "trk_filter") else 0
+                if fi == 1:
+                    df = df[df["status"] != "verified"]
+                elif fi == 2:
+                    df = df[df["status"] == "verified"]
+                cf = self.trk_code_filter.text().strip() if hasattr(self, "trk_code_filter") else ""
+                if cf:
+                    df = df[df["code"].astype(str).str.contains(cf)]
+            total = len(df)
             self.trk_table.setColumnCount(len(cols))
             self.trk_table.setHorizontalHeaderLabels(heads)
-            df = df.tail(300).reset_index(drop=True) if len(df) else df
+            df = df.tail(1000).reset_index(drop=True) if len(df) else df   # 显示更多(最多1000条)
+            if hasattr(self, "trk_count"):
+                self.trk_count.setText(f"共 {total} 条" + ("（显示最近1000）" if total > 1000 else ""))
             self.trk_table.setRowCount(len(df))
             for i in range(len(df)):
                 for j, c in enumerate(cols):
@@ -6208,6 +6305,7 @@ if HAS_PYSIDE6:
             # 用成功训练的模型填充"策略回测"页的模型下拉（基准行也可回测，作为对照）
             self.bt_model_combo.clear()
             self.bt_model_combo.addItems([r.algo_name for r in results if not r.error])
+            self._refresh_model_combos()          # 「机器学习内部」的模型选择下拉也刷新
             ok = sum(1 for r in results if not r.error)
             self._html_reco = self._build_recommendation_html(results)   # 供报告复用
             self.reco_view.setHtml(self._html_reco)
