@@ -704,6 +704,73 @@ class StockDataFetcher:
             return {"f_score": None, "f_available": 0, "f_detail": []}
 
     @staticmethod
+    def fetch_next_report_date(code: str, today=None, bypass_proxy: bool = True) -> Dict[str, Any]:
+        """借鉴交易 skill 的『财报日历/催化事件』：查该股**下一次财报披露日**(东财预约披露时间表)。
+        披露表按报告期整表缓存(_REPORT_CAL_CACHE)，批量时只有第一次触发网络、其余为字典过滤。
+        返回 {date(pd.Timestamp 或 None), period, disclosed(bool), days(距今自然日)}；取不到返回 date=None，绝不编造。"""
+        out = {"date": None, "period": None, "disclosed": False, "days": None}
+        if not HAS_AKSHARE:
+            return out
+        today = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.now().normalize()
+        code = str(code).zfill(6)
+        y, m = today.year, today.month
+        # 按当前月份，列出可能含"未来披露"的候选报告期(先近后远)
+        if m <= 4:
+            periods = [f"{y-1}年报", f"{y}一季", f"{y}半年报"]
+        elif m <= 8:
+            periods = [f"{y}半年报", f"{y}三季", f"{y}年报"]
+        else:
+            periods = [f"{y}三季", f"{y}年报", f"{y+1}一季"]
+
+        def _col(df, kw):
+            for c in df.columns:
+                if kw in str(c):
+                    return c
+            return None
+
+        for period in periods:
+            if period not in _REPORT_CAL_CACHE:
+                try:
+                    ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+                    with ctx:
+                        df = StockDataFetcher._retry(
+                            lambda: ak.stock_report_disclosure(market="沪深京", period=period), tries=2)
+                    _REPORT_CAL_CACHE[period] = df if (df is not None and len(df)) else None
+                except Exception:
+                    _REPORT_CAL_CACHE[period] = None
+            df = _REPORT_CAL_CACHE.get(period)
+            if df is None or len(df) == 0:
+                continue
+            code_col = _col(df, "代码")
+            if code_col is None:
+                continue
+            row = df[df[code_col].astype(str).str.zfill(6) == code]
+            if len(row) == 0:
+                continue
+            r0 = row.iloc[0]
+            actual_col = _col(df, "实际")
+            actual = pd.to_datetime(r0.get(actual_col), errors="coerce") if actual_col else pd.NaT
+            # 该期已实际披露且在今天之前 → 这期已过，看下一期
+            if pd.notna(actual) and actual.normalize() < today:
+                continue
+            # 收集本期所有候选日期(首次预约/变更/实际)，取今天及以后最早的一个
+            cand = []
+            for kw in ("首次", "变更", "实际", "预约"):
+                for c in df.columns:
+                    if kw in str(c):
+                        d = pd.to_datetime(r0.get(c), errors="coerce")
+                        if pd.notna(d):
+                            cand.append(d.normalize())
+            future = sorted(d for d in cand if d >= today)
+            if future:
+                nd = future[0]
+                out.update({"date": nd, "period": period,
+                            "disclosed": bool(pd.notna(actual) and actual.normalize() >= today),
+                            "days": int((nd - today).days)})
+                return out
+        return out
+
+    @staticmethod
     def fetch_index_close(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
         """拉大盘指数(默认沪深300)的日期+收盘价，供回测做『相对大盘超额』基准。失败抛异常由调用方跳过。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
@@ -2830,10 +2897,12 @@ RISK_KEYWORDS = {
 
 
 def assess_risks(code: str, name: str, df: pd.DataFrame,
-                 news: Optional[pd.DataFrame] = None) -> List[Dict[str, str]]:
+                 news: Optional[pd.DataFrame] = None,
+                 check_report: bool = False) -> List[Dict[str, str]]:
     """
     基于真实数据的风险自动筛查(非投资建议、非预测)。每条提示都注明**真实依据来源**。
     返回 [{level, category, msg, source, url}]，level ∈ {高,中,低}。
+    check_report=True 时额外查『临近财报披露』事件(借鉴交易 skill 的催化日历；披露表整表缓存)。
     """
     warns: List[Dict[str, str]] = []
     close = pd.to_numeric(df["close"], errors="coerce").dropna() if "close" in df.columns else pd.Series([], dtype=float)
@@ -2880,10 +2949,22 @@ def assess_risks(code: str, name: str, df: pd.DataFrame,
                                   "msg": f"近期新闻命中「{hit}」：{title}",
                                   "source": "东方财富·新闻", "url": url})
                     break
+    # 6) 临近财报披露（事件催化：业绩窗口前后波动大；真实预约披露日，取不到则跳过）
+    if check_report:
+        try:
+            rp = StockDataFetcher.fetch_next_report_date(code)
+            if rp.get("date") is not None and rp.get("days") is not None and 0 <= rp["days"] <= 12:
+                warns.append({"level": "低", "category": "临近财报",
+                              "msg": f"约 {rp['days']} 天后（{rp['date'].date()}，{rp['period']}）披露财报，"
+                                     f"业绩窗口前后波动与不确定性通常放大，注意仓位。",
+                              "source": "东方财富·预约披露时间", "url": ""})
+        except Exception:
+            pass
     return warns
 
 
 _TRADE_CAL_CACHE = {"dates": None, "source": None}   # 全会话缓存 A 股交易日历，避免重复请求
+_REPORT_CAL_CACHE: Dict[str, Any] = {}               # 全会话缓存财报披露日程(按报告期整表)，批量只取一次
 
 
 def _load_trade_calendar(progress_cb: Optional[Callable[[str], None]] = None):
@@ -2997,7 +3078,7 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
             da = mr.metrics.get("DA") if mr else None
             up_p = mr.metrics.get("UP_P") if mr else None
             fc = pipe.predict_next(algo, df)
-            warns = assess_risks(code, name, df, news=None)
+            warns = assess_risks(code, name, df, news=None, check_report=True)
             hi_risk = [w for w in warns if w["level"] == "高"]
             rows.append({
                 "code": code, "name": name, "last_close": fc["last_close"],
@@ -3306,6 +3387,8 @@ GLOSSARY = {
         ("净资产(账面价值)", "公司总资产减总负债，股东实际拥有的家底。PB 就是股价对每股净资产的倍数。"),
         ("中报/年报/季报", "半年/全年/每季度的财务成绩单。业绩公布前后股价常波动。"),
         ("业绩预亏 / 变脸 / 爆雷", "提前公告要亏 / 业绩突然大幅低于预期 / 突然暴露重大问题(财务造假、巨额计提等)，通常大跌。"),
+        ("财报披露日历(临近财报)", "上市公司按预约日期公布季报/半年报/年报。**披露前后是业绩窗口，股价波动与不确定性明显放大**。"
+         "软件用真实预约披露日，在临近时(约12天内)给风险提示——这是事件提醒，不是买卖建议。"),
     ],
     "模型与评估名词（判断准不准）": [
         ("DA 方向准确率", "预测「涨还是跌」猜对的比例。<b>50% = 抛硬币</b>，只有明显 >50% 才算真有本事。"),
@@ -3511,7 +3594,7 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
                             "da_p": sig["p"], "da_sig": sig["sig"], "da_sig_text": sig["text"]})
         except Exception as e:
             da_rows.append({"model": m, "error": str(e)})
-    warns = assess_risks(code, name, df, news=None)
+    warns = assess_risks(code, name, df, news=None, check_report=True)
     # 借鉴交易 skill：基本面质量(Piotroski F-Score) + 相对大盘强弱(CANSLIM RS) + 大盘状态(regime)
     q = StockDataFetcher.fetch_quality(code)
     ret_1q = chg(60)
@@ -3533,6 +3616,7 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         "idx_ret": last("idx_ret_1d"), "us_ret": last("us_ret"), "nb_net": last("nb_net"),
         "f_score": q.get("f_score"), "f_available": q.get("f_available"), "f_detail": q.get("f_detail"),
         "roe": q.get("roe"), "rs_1q": rs_1q, "regime": reg,
+        "next_report": StockDataFetcher.fetch_next_report_date(code),   # 下次财报披露日(已缓存)
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
     }
 
@@ -3621,7 +3705,11 @@ def research_card_html(card: Dict[str, Any]) -> str:
            f" / {f(card['nb_net'],'',1) if card['nb_net'] is not None else '-'}</td></tr>"
            f"<tr><td>基本面质量 F-Score</td><td>{(str(card.get('f_score'))+'/'+str(card.get('f_available')) if card.get('f_score') is not None else '-')}</td>"
            f"<td>相对大盘(近3月超额)</td><td>{f(card.get('rs_1q'),'%',1)}</td></tr>"
-           f"<tr><td>大盘状态</td><td colspan=3>{card.get('regime',{}).get('text','-')}</td></tr></table>")
+           f"<tr><td>大盘状态</td><td colspan=3>{card.get('regime',{}).get('text','-')}</td></tr>"
+           + (f"<tr><td>下次财报披露</td><td colspan=3>{card['next_report']['date'].date()}"
+              f"（{card['next_report']['period']}，约 {card['next_report']['days']} 天后，业绩窗口波动大）</td></tr>"
+              if card.get('next_report', {}).get('date') is not None else "")
+           + "</table>")
     return (
         f"<h2>综合研判卡 · {title}</h2>"
         "<p style='color:#c0392b'><b>本卡只汇总客观事实，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
@@ -4067,7 +4155,7 @@ if HAS_PYSIDE6:
                 self._fill_mldata_source(fe, target_mode, len(X), a, b, enrich_status, None,
                                          code if not use_synthetic else "")
                 name = getattr(self, "_mldata_name", "") if not use_synthetic else ""
-                warns = assess_risks(code, name, df, news) if not use_synthetic else []
+                warns = assess_risks(code, name, df, news, check_report=True) if not use_synthetic else []
                 self._fill_mldata_analysis(df, code if not use_synthetic else "", enrich_status, news,
                                            name, warns)
                 self._fill_mldata_table(fe, y, sample_dates, a, b, target_mode)
