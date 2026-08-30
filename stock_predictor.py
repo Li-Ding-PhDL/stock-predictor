@@ -624,7 +624,7 @@ class StockDataFetcher:
     def fetch_quality(code: str, bypass_proxy: bool = True) -> Dict[str, Optional[float]]:
         """优雅获取基本面『质量/成长』因子：ROE(净资产收益率) 与 营收同比增长率。
         取数失败(无网络/接口变动/该股无数据)时返回空 → 因子缺失、绝不编造。"""
-        out: Dict[str, Any] = {"roe": None, "rev_growth": None,
+        out: Dict[str, Any] = {"roe": None, "rev_growth": None, "debt_ratio": None,
                                "f_score": None, "f_available": 0, "f_detail": []}
         if not HAS_AKSHARE:
             return out
@@ -648,7 +648,11 @@ class StockDataFetcher:
                 for key in fi.columns:
                     if "净资产收益率" in str(key):
                         out["roe"] = pd.to_numeric(row[key], errors="coerce"); break
-            for k in ("roe", "rev_growth"):
+            # 资产负债率(避雷用：过高=偿债/爆雷风险)
+            for key in fi.columns:
+                if "资产负债率" in str(key):
+                    out["debt_ratio"] = pd.to_numeric(row[key], errors="coerce"); break
+            for k in ("roe", "rev_growth", "debt_ratio"):
                 if out[k] is not None and (pd.isna(out[k]) or np.isinf(out[k])):
                     out[k] = None
             # 复用同一份财报指标算 Piotroski F-Score(客观质量分，借鉴 trading_skills)
@@ -3669,6 +3673,16 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
     warns = assess_risks(code, name, df, news=news_df, check_report=True)
     # 借鉴交易 skill：基本面质量(Piotroski F-Score) + 相对大盘强弱(CANSLIM RS) + 大盘状态(regime)
     q = StockDataFetcher.fetch_quality(code)
+    # 深度基本面避雷(复用财报数据，零额外网络)：高杠杆 / 基本面质量很弱
+    dr = q.get("debt_ratio")
+    if dr is not None and dr >= 70:
+        warns.append({"level": "中", "category": "高杠杆",
+                      "msg": f"资产负债率 {dr:.0f}% ≥ 70%，负债偏高，偿债/再融资压力与爆雷风险需警惕。",
+                      "source": "新浪财务指标", "url": ""})
+    if q.get("f_score") is not None and q.get("f_available", 0) >= 5 and q["f_score"] <= 2:
+        warns.append({"level": "中", "category": "财务质量弱",
+                      "msg": f"Piotroski F-Score 仅 {q['f_score']}/{q['f_available']}，基本面质量偏弱。",
+                      "source": "新浪财务指标(Piotroski)", "url": ""})
     ret_1q = chg(60)
     rs_1q = None
     reg = market_regime()
