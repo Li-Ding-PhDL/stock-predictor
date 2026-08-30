@@ -772,12 +772,17 @@ class StockDataFetcher:
 
     @staticmethod
     def fetch_index_close(bypass_proxy: bool = True, symbol: str = "sh000300") -> pd.DataFrame:
-        """拉大盘指数(默认沪深300)的日期+收盘价，供回测做『相对大盘超额』基准。失败抛异常由调用方跳过。"""
+        """拉大盘指数(默认沪深300)的日期+收盘价，供回测/regime/RS 复用。会话内缓存，避免重复请求。"""
+        hit = _INDEX_CLOSE_CACHE.get(symbol)
+        if hit is not None:
+            return hit
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
             ix = StockDataFetcher._retry(lambda: ak.stock_zh_index_daily(symbol=symbol))
         ix["date"] = pd.to_datetime(ix["date"]).astype("datetime64[ns]")
-        return ix.sort_values("date")[["date", "close"]].rename(columns={"close": "idx_px"})
+        out = ix.sort_values("date")[["date", "close"]].rename(columns={"close": "idx_px"})
+        _INDEX_CLOSE_CACHE[symbol] = out
+        return out
 
     @staticmethod
     def _fetch_us_index(bypass_proxy: bool = True) -> pd.DataFrame:
@@ -2965,6 +2970,7 @@ def assess_risks(code: str, name: str, df: pd.DataFrame,
 
 _TRADE_CAL_CACHE = {"dates": None, "source": None}   # 全会话缓存 A 股交易日历，避免重复请求
 _REPORT_CAL_CACHE: Dict[str, Any] = {}               # 全会话缓存财报披露日程(按报告期整表)，批量只取一次
+_INDEX_CLOSE_CACHE: Dict[str, Any] = {}              # 全会话缓存大盘指数收盘(regime/RS/回测基准复用，避免重复请求)
 
 
 def _load_trade_calendar(progress_cb: Optional[Callable[[str], None]] = None):
@@ -3180,6 +3186,61 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             r["score"] = round(float(base) - 12.0 * r["risk_hi"] - 3.0 * (r["risk_n"] - r["risk_hi"]), 1)
     recs.sort(key=lambda r: (r.get("score") if r.get("score") is not None else -1e9), reverse=True)
     return recs
+
+
+# ==================== 第八部分补充4b：组合与仓位（借鉴 kelly/correlation/portfolio 等交易 skill） ====================
+def kelly_fraction(p: float, b: float) -> Dict[str, Any]:
+    """凯利公式仓位：p=胜率(0~1)，b=赔率(平均盈利/平均亏损)。f* = (p*b - (1-p)) / b = p - (1-p)/b。
+    借鉴 kelly-criterion skill。返回全凯利/半凯利(实务更稳)+文字解释。**这是数学最优增长比例，不是买卖建议**。
+    A 股不能做空、且估计误差大，务必用『半凯利甚至更低』，且 f*≤0 表示这笔『期望为负、根本不该下注』。"""
+    if b is None or b <= 0 or p is None or not (0 <= p <= 1):
+        return {"kelly": None, "half": None, "text": "参数无效(需 0≤胜率≤1、赔率>0)"}
+    f = p - (1 - p) / b
+    f_capped = max(0.0, min(1.0, f))               # 不做空、不加杠杆
+    half = max(0.0, min(1.0, f / 2))
+    if f <= 0:
+        text = f"凯利建议仓位 {f*100:.0f}%(≤0)：此胜率/赔率下**期望为负，不该下注**。"
+    else:
+        text = (f"全凯利 {f_capped*100:.0f}%、半凯利 {half*100:.0f}%(实务更稳)。"
+                "全凯利波动极大，多数专业人士只用半凯利或更低。")
+    return {"kelly": round(f_capped, 4), "half": round(half, 4), "raw": round(f, 4), "text": text}
+
+
+def basket_correlation(codes: List[str], start: str = "20230101", end: Optional[str] = None,
+                       progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """一篮子股票的**日收益率相关性矩阵** + **等权组合**分散化分析(借鉴 correlation/portfolio-analytics skill)。
+    相关性在**收益率**上算(价格非平稳)。返回相关矩阵、各股年化波动、等权组合年化波动、分散化收益。
+    诚实说明：相关性会随行情剧变(尤其暴跌时齐跌、分散失效)，历史相关≠未来。"""
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    rets, names, errs = {}, {}, []
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        log(f"[组合 {i}/{len(codes)}] {code} 取收益率 ...")
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            s = pd.to_numeric(df.set_index(pd.to_datetime(df["date"]))["close"], errors="coerce").pct_change().dropna()
+            if len(s) >= 30:
+                rets[code] = s
+                names[code] = StockDataFetcher.fetch_stock_name(code) or code
+            else:
+                errs.append(f"{code}(数据不足)")
+        except Exception as e:
+            errs.append(f"{code}({str(e)[:20]})")
+    if len(rets) < 2:
+        return {"error": "有效股票不足 2 只，无法算相关性。" + ("；".join(errs) if errs else "")}
+    R = pd.DataFrame(rets).dropna()
+    corr = R.corr()                                             # 皮尔逊相关(收益率上)
+    ann = 252 ** 0.5
+    vol_each = {c: float(R[c].std() * ann) for c in R.columns}  # 各股年化波动
+    w = np.repeat(1.0 / R.shape[1], R.shape[1])                 # 等权
+    port_ret = R.values @ w
+    port_vol = float(np.std(port_ret) * ann)
+    avg_vol = float(np.mean(list(vol_each.values())))
+    diversification = avg_vol - port_vol                        # 分散化降低的波动
+    avg_corr = float(corr.values[np.triu_indices_from(corr.values, k=1)].mean())
+    return {"codes": list(R.columns), "names": names, "corr": corr, "vol_each": vol_each,
+            "port_vol": port_vol, "avg_vol": avg_vol, "diversification": diversification,
+            "avg_corr": avg_corr, "n_obs": int(len(R)), "errors": errs}
 
 
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
@@ -4026,6 +4087,7 @@ if HAS_PYSIDE6:
 
             # 批量扫描：多股批量 取数→训练→预测→风险
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
+            self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
 
             main_layout.addWidget(self.tabs, stretch=1)
 
@@ -5123,6 +5185,116 @@ if HAS_PYSIDE6:
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", str(e))
 
+        # ---- 9.2.1h2 组合与仓位标签页（相关性分散化 + 凯利仓位；借鉴交易 skill） ----
+        def _build_portfolio_tab(self) -> QWidget:
+            panel = QWidget(); layout = QVBoxLayout(panel)
+            intro = QLabel("💡 组合与仓位（基金经理视角）：①填一篮子股票算『相关性+分散化』——相关性越低，"
+                           "一起持有越能降低波动(别把鸡蛋放一个篮子/一个行业)。②凯利公式按『胜率+赔率』给"
+                           "数学最优仓位，实务用半凯利更稳。全部是客观计算，非荐股；相关性会在暴跌时齐涨齐跌而失效。")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#f6f8fb;padding:6px;")
+            layout.addWidget(intro)
+
+            # --- 相关性/分散化 ---
+            row1 = QHBoxLayout()
+            row1.addWidget(QLabel("股票篮子(逗号分隔):"))
+            self.pf_codes = QLineEdit("600519,000858,601318,000001,600036")
+            row1.addWidget(self.pf_codes, stretch=1)
+            self.pf_corr_btn = QPushButton("▶ 算相关性+分散化")
+            self.pf_corr_btn.setStyleSheet("font-weight:bold;padding:5px;")
+            self.pf_corr_btn.clicked.connect(self._on_portfolio_corr)
+            row1.addWidget(self.pf_corr_btn)
+            layout.addLayout(row1)
+            self.pf_corr_view = QTextBrowser(); self.pf_corr_view.setOpenExternalLinks(True)
+            self.pf_corr_view.setMinimumHeight(240)
+            layout.addWidget(self.pf_corr_view, stretch=1)
+
+            # --- 凯利仓位计算器 ---
+            box = QGroupBox("凯利公式仓位计算器（胜率 + 赔率 → 最优仓位）")
+            g = QGridLayout(box)
+            g.addWidget(QLabel("胜率 p (%)："), 0, 0)
+            self.kelly_p = QLineEdit("52")
+            self.kelly_p.setToolTip("赢的概率。可用某模型的『上涨精确率 UP_P』或你自己的历史胜率填。")
+            g.addWidget(self.kelly_p, 0, 1)
+            g.addWidget(QLabel("赔率 b (平均盈利/平均亏损)："), 0, 2)
+            self.kelly_b = QLineEdit("1.5")
+            self.kelly_b.setToolTip("赢一次赚的 ÷ 输一次亏的。如平均赚6%、亏4%，则 b=1.5。")
+            g.addWidget(self.kelly_b, 0, 3)
+            self.kelly_btn = QPushButton("算仓位")
+            self.kelly_btn.clicked.connect(self._on_kelly)
+            g.addWidget(self.kelly_btn, 0, 4)
+            self.kelly_view = QLabel("填入胜率与赔率，点『算仓位』。")
+            self.kelly_view.setWordWrap(True); self.kelly_view.setStyleSheet("padding:6px;")
+            g.addWidget(self.kelly_view, 1, 0, 1, 5)
+            layout.addWidget(box)
+            return panel
+
+        def _on_portfolio_corr(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "组合分析需真实数据，请把数据源切到「真实数据」。"); return
+            raw = self.pf_codes.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if len(codes) < 2:
+                QMessageBox.warning(self, "提示", "至少填 2 只股票。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            self.pf_corr_btn.setEnabled(False); self.pf_corr_view.setHtml("<p>⏳ 正在取各股收益率并计算相关性…</p>")
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open("⏳ 组合相关性计算中…"); QApplication.processEvents()
+            try:
+                res = basket_correlation(codes, start, end, progress_cb=self._log)
+                if "error" in res:
+                    self.pf_corr_view.setHtml(f"<p style='color:#c0392b'>{res['error']}</p>"); return
+                cols = res["codes"]; corr = res["corr"]
+                # 相关矩阵(颜色深浅示意)
+                th = "".join(f"<th>{c}</th>" for c in cols)
+                trs = ""
+                for i, ci in enumerate(cols):
+                    tds = ""
+                    for cj in cols:
+                        v = float(corr.loc[ci, cj])
+                        bg = "#f8d7da" if v >= 0.7 else ("#fff3cd" if v >= 0.4 else "#d4edda")
+                        tds += f"<td style='background:{bg};text-align:center'>{v:.2f}</td>"
+                    trs += f"<tr><th>{ci}</th>{tds}</tr>"
+                vol_rows = "".join(f"<tr><td>{res['names'].get(c,c)}({c})</td>"
+                                   f"<td>{res['vol_each'][c]*100:.1f}%</td></tr>" for c in cols)
+                html = (
+                    f"<h3>相关性矩阵（{res['n_obs']} 个交易日的日收益率）</h3>"
+                    "<p style='color:#888'>红=高度同涨同跌(>0.7,分散作用小)；黄=中等；绿=低相关(分散好)。</p>"
+                    f"<table border=1 cellpadding=4 cellspacing=0><tr><th></th>{th}</tr>{trs}</table>"
+                    f"<h3>分散化效果（等权组合）</h3>"
+                    f"<table border=1 cellpadding=4 cellspacing=0>"
+                    f"<tr><td>篮子平均年化波动</td><td>{res['avg_vol']*100:.1f}%</td></tr>"
+                    f"<tr><td>等权组合年化波动</td><td><b>{res['port_vol']*100:.1f}%</b></td></tr>"
+                    f"<tr><td>分散化降低波动</td><td><b style='color:#1e8449'>{res['diversification']*100:.1f} 个百分点</b></td></tr>"
+                    f"<tr><td>平均两两相关</td><td>{res['avg_corr']:.2f}</td></tr></table>"
+                    f"<h3>各股年化波动</h3><table border=1 cellpadding=4 cellspacing=0>"
+                    f"<tr bgcolor=#eef><th>股票</th><th>年化波动</th></tr>{vol_rows}</table>"
+                    + (f"<p style='color:#c0392b'>跳过：{'、'.join(res['errors'])}</p>" if res.get("errors") else "")
+                    + "<p style='color:#c0392b;font-size:12px'>⚠ 相关性随行情剧变：<b>暴跌时往往齐跌、分散化会失效</b>；"
+                    "历史相关≠未来。这是客观计算、非投资建议。</p>")
+                self.pf_corr_view.setHtml(html)
+                self._oplog(f"组合相关性：{len(cols)} 只，平均相关 {res['avg_corr']:.2f}，组合波动 {res['port_vol']*100:.1f}%。")
+            except Exception as e:
+                QMessageBox.critical(self, "组合分析失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.pf_corr_btn.setEnabled(True)
+
+        def _on_kelly(self):
+            try:
+                p = float(self.kelly_p.text()) / 100.0
+                b = float(self.kelly_b.text())
+            except ValueError:
+                self.kelly_view.setText("请输入有效数字(胜率%、赔率)。"); return
+            r = kelly_fraction(p, b)
+            if r["kelly"] is None:
+                self.kelly_view.setText(r["text"]); return
+            self.kelly_view.setText(
+                f"<b>凯利仓位：全凯利 {r['kelly']*100:.0f}% ／ 半凯利 {r['half']*100:.0f}%(推荐)</b>　"
+                f"（原始 f*={r['raw']*100:.0f}%，A股不做空/不加杠杆已截断到0~100%）<br>"
+                f"<span style='color:#555'>{r['text']}</span><br>"
+                "<span style='color:#c0392b;font-size:12px'>⚠ 胜率/赔率是<b>估计值、误差大</b>，全凯利会大起大落；"
+                "这是数学最优增长比例，<b>非投资建议</b>，请务必留足风险边际。</span>")
+            self._oplog(f"凯利仓位计算：p={p:.2f}, b={b:.2f} → 半凯利 {r['half']*100:.0f}%。")
+
         # ---- 9.2.1i 预测跟踪标签页（存预测→到期对比真实→算真实准确率） ----
         def _build_tracking_tab(self) -> QWidget:
             panel = QWidget()
@@ -5289,7 +5461,10 @@ if HAS_PYSIDE6:
 
             intro = QLabel("💡 什么是策略回测：假设你「模型说涨就买、说跌就空仓」，用过去的真实行情走一遍(还扣手续费)，"
                            "看最后赚了多少，再和「一直持有不动」对比。红线(策略)明显在蓝线(买入持有)之上才算有用；"
-                           "跑不赢就说明这个预测不值得跟。这是检验预测能不能赚钱的照妖镜。")
+                           "跑不赢就说明这个预测不值得跟。这是检验预测能不能赚钱的照妖镜。\n"
+                           "⚠ 两个偏差(基金经理必看)：①幸存者偏差——只测『还在上市』的股票，暴雷退市的被自然剔除，"
+                           "真实收益会被高估；单只回测好≠这套方法在全市场都行。②回测是历史模拟，参数换一下就变，"
+                           "过去能赚不代表未来能赚。请把回测当『排除法(跑不赢就淘汰)』，而不是『收益承诺』。")
             intro.setWordWrap(True); intro.setStyleSheet("color:#555; background:#f6f8fb; padding:6px;")
             layout.addWidget(intro)
             self.bt_stat = QLabel("先在左侧运行模型，再来这里选模型回测。")
