@@ -3007,6 +3007,117 @@ RISK_KEYWORDS = {
 }
 
 
+# ==================== 软因子量化规则（透明、可审计、基于真实数据；非臆造、非真值、仅作参考特征） ====================
+# 说明：这不是"编情绪分"，而是把【真实新闻标题/真实财务】按【下面写死的明规则】映射成分数——
+# 规则完全公开、每一分都能追溯到命中了哪个词/哪个真实数字。免费新闻接口无"阅读量"，故按关键词严重度×命中数量化。
+NEWS_SENTIMENT_RULES = {
+    # 负面(恐惧/利空)：越严重扣越多
+    -5: ["退市", "终止上市", "财务造假", "资不抵债", "债务违约", "爆雷"],
+    -3: ["立案", "被查", "处罚", "问询", "关注函", "商誉减值", "预亏", "巨亏", "债务逾期", "停牌", "诉讼"],
+    -2: ["亏损", "减持", "质押", "冻结", "下调", "不及预期", "承压", "利空", "违规"],
+    -1: ["下跌", "风险", "回调", "波动"],
+    # 正面(利好)：越强加越多
+    5: ["扭亏为盈", "重大突破", "中标大单"],
+    3: ["业绩预增", "超预期", "增持", "回购", "中标", "订单", "涨停", "利好"],
+    2: ["合作", "签约", "获批", "创新高", "扩产"],
+    1: ["上涨", "反弹", "企稳"],
+}
+POLICY_KEYWORDS = {  # 政策类(从真实新闻标题识别；同样只作参考、常反直觉)
+    3: ["政策扶持", "补贴", "减税", "国家支持", "利好政策", "纳入规划"],
+    -3: ["监管收紧", "反垄断", "限制", "整顿", "约谈", "调控", "禁令"],
+}
+
+
+def news_sentiment_score(news_df) -> Dict[str, Any]:
+    """把【真实新闻标题】按明规则量化，遵循《多因子量化特征设计》：
+    ① 每条标题命中词分值求和 → tanh 压到 **[-1,1]**(有界，避免一条极端新闻主导)；
+    ② 多条新闻按 **时间衰减 exp(-t/τ) 加权平均**(τ=2天，越旧影响越小)——非简单求和(防新闻多的股票虚高)；
+    ③ 免费接口无阅读量，故省略 log(1+阅读量) 项(如实说明)。
+    返回 {score(-1~1), score10(便于阅读的-10~10), hits, n_news, policy(-1~1)}。完全可审计、非真值、需消融验证。"""
+    out = {"score": None, "score10": None, "hits": [], "n_news": 0, "policy": 0.0, "policy_hits": []}
+    if news_df is None or len(news_df) == 0:
+        return out
+    import math
+    titles = list(news_df.get("title", [])); times = list(news_df.get("time", [])) if "time" in news_df else []
+    out["n_news"] = len(titles)
+    num, den, pol_num = 0.0, 0.0, 0.0
+    now = pd.Timestamp.now()
+    for i, t in enumerate(titles):
+        t = str(t); pts = 0.0
+        for p, words in NEWS_SENTIMENT_RULES.items():
+            for w in words:
+                if w in t:
+                    pts += p; out["hits"].append((w, p))
+        ppts = 0.0
+        for p, words in POLICY_KEYWORDS.items():
+            for w in words:
+                if w in t:
+                    ppts += p; out["policy_hits"].append((w, p))
+        s_i = math.tanh(pts / 3.0)                         # 单条情感压到 [-1,1]
+        # 时间衰减权重(τ=2天)；时间解析失败则权重=1
+        w_i = 1.0
+        try:
+            age = max(0.0, (now - pd.to_datetime(times[i])).total_seconds() / 86400.0)
+            w_i = math.exp(-age / 2.0)
+        except Exception:
+            w_i = 1.0
+        num += w_i * s_i; den += w_i; pol_num += w_i * math.tanh(ppts / 3.0)
+    if den > 0:
+        out["score"] = round(num / den, 3)                 # [-1,1] 加权平均
+        out["score10"] = int(round(out["score"] * 10))     # 便于阅读的 -10~10
+        out["policy"] = round(pol_num / den, 3)
+    return out
+
+
+def profitability_score(pe_ttm, roe=None, net_profit=None, revenue=None) -> Dict[str, Any]:
+    """把【真实盈利数据】按明规则量化(遵循设计文档：用『净利润/营收』做规模可比的量化，而非绝对亏损额)。
+    有界到 [-1,1]：净利率越高越正、亏损越深越负；辅以 ROE。返回 {score(-1~1), score10, text}。可审计、非真值。"""
+    import math
+    parts = []; s = None; roe_is_base = False
+    if net_profit is not None and revenue not in (None, 0):
+        margin = net_profit / abs(revenue)                 # 净利率(亏损公司 abs 防符号错乱)
+        s = math.tanh(margin * 5.0)                         # 压到 [-1,1]；±20%净利率≈±0.76
+        parts.append(f"净利率 {margin*100:.1f}%({'亏损' if net_profit<0 else '盈利'})")
+    elif pe_ttm is not None:
+        s = -0.6 if pe_ttm <= 0 else 0.3                    # 无营收数据时退回 PE 符号(亏损=-0.6)
+        parts.append(f"PE(TTM) {pe_ttm:.1f}{'≤0(亏损)' if pe_ttm<=0 else '(盈利)'}")
+    elif roe is not None:
+        s = math.tanh(roe / 20.0)                           # 只有 ROE 时：用 ROE 压到 [-1,1]
+        parts.append(f"ROE {roe:.1f}%"); roe_is_base = True
+    if s is None:
+        return {"score": None, "score10": None, "text": "无盈利数据"}
+    if roe is not None and not roe_is_base:
+        if roe >= 15:
+            s = min(1.0, s + 0.2); parts.append(f"ROE {roe:.1f}%(高)")
+        elif roe < 0:
+            s = max(-1.0, s - 0.15); parts.append(f"ROE {roe:.1f}%(负)")
+    s = max(-1.0, min(1.0, s))
+    return {"score": round(s, 3), "score10": int(round(s * 10)), "text": "、".join(parts)}
+
+
+def soft_factor_rules_html() -> str:
+    """软因子量化规则说明(公开可审计)——展示每条规则,让用户看清每一分怎么来的。"""
+    def _rule_rows(d):
+        return "".join(f"<tr><td>{pts:+d} 分</td><td>{'、'.join(ws)}</td></tr>" for pts, ws in
+                       sorted(d.items()))
+    return (
+        "<b>📏 软因子量化规则（遵循《多因子量化特征设计》·公开可审计·非真值·需消融验证）</b>"
+        "<p style='color:#c0392b;font-size:12px'>把<b>真实</b>新闻标题/财务数字按下面<b>写死的明规则</b>映射成分数，"
+        "每一分都能追溯到命中的真实词/真实数字，不是编的。设计原则：<b>先归一到 [-1,1] 有界区间</b>"
+        "(不用无界的-10，防一条极端新闻主导)；新闻多条按<b>时间衰减(τ=2天)加权平均</b>(非求和)；"
+        "免费接口<b>无阅读量</b>，故省略 log(1+阅读量) 项(如实说明)。"
+        "近期新闻无可靠历史，只作<b>当前快照参考、不入历史训练</b>(防未来函数)。</p>"
+        "<table border=1 cellpadding=3 cellspacing=0><tr bgcolor=#eef><th>单条命中·原始分</th><th>命中词(真实标题里出现即计)</th></tr>"
+        + _rule_rows(NEWS_SENTIMENT_RULES) + "</table>"
+        "<p style='font-size:12px'>单条标题命中分求和后 <b>tanh(和/3)→[-1,1]</b>，再按时间衰减加权平均得新闻情绪分。</p>"
+        "<table border=1 cellpadding=3 cellspacing=0><tr bgcolor=#eef><th>政策·原始分</th><th>命中词</th></tr>"
+        + _rule_rows(POLICY_KEYWORDS) + "</table>"
+        "<p style='font-size:12px'><b>盈利量化</b>(规模可比)：<b>净利率=净利润/营收</b> → tanh 压到 [-1,1]"
+        "(亏损为负、越深越低)；无营收数据时退回 PE 符号；ROE≥15%再+0.2。</p>"
+        "<p style='color:#c0392b;font-size:12px'>⚠ <b>务必先做消融实验</b>：把某类软因子加进模型后，用『因子IC/Walk-Forward/"
+        "方向准确率vs基准』看是否带来<b>统计显著</b>提升；市场对新闻常反直觉(利空出尽是利好)，没显著提升就别信任、要迭代。</p>")
+
+
 def assess_risks(code: str, name: str, df: pd.DataFrame,
                  news: Optional[pd.DataFrame] = None,
                  check_report: bool = False) -> List[Dict[str, str]]:
@@ -4060,6 +4171,8 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         "roe": q.get("roe"), "rs_1q": rs_1q, "regime": reg,
         "next_report": StockDataFetcher.fetch_next_report_date(code),   # 下次财报披露日(已缓存)
         "character": stock_character(close),                            # 股性诊断(均值回归/趋势/随机)
+        "news_sent": news_sentiment_score(news_df),                     # 新闻情绪规则量化[-1,1](真实标题)
+        "profit_q": profitability_score(last("val_pe_ttm"), q.get("roe")),  # 盈利规则量化[-1,1]
         "news_items": news_items, "verdict": verdict,
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
     }
@@ -4113,6 +4226,17 @@ def _plain_verdict_html(card: Dict[str, Any], f) -> str:
                       f"<span style='color:#888'>（{n['source']} {n['time']}）</span></li>"
                       for n in ni[:3] if n.get("title"))
         ev.append(f"<li><b>近期新闻（点链接核对原文）：</b><ul>{lis}</ul></li>")
+    # 软因子量化分(规则打分[-1,1]，可审计、非真值)
+    ns = card.get("news_sent", {})
+    if ns.get("score") is not None and ns.get("n_news"):
+        tone = "偏负面/恐惧" if ns["score"] < -0.15 else ("偏正面/乐观" if ns["score"] > 0.15 else "中性")
+        hitw = "、".join(dict.fromkeys(w for w, _ in ns.get("hits", [])[:6]))
+        ev.append(f"<li><b>新闻情绪(规则量化)：</b>{ns['score']}（≈{ns['score10']}/10，{tone}；"
+                  f"{ns['n_news']}条真实新闻，命中词：{hitw or '无'}）"
+                  f"<span style='color:#888'>——透明规则打分、非真值，市场常反直觉，仅参考</span></li>")
+    pq = card.get("profit_q", {})
+    if pq.get("score") is not None:
+        ev.append(f"<li><b>盈利量化：</b>{pq['score']}（≈{pq['score10']}/10；{pq['text']}）</li>")
 
     # ② 方向 + ③ 价格/百分比
     v = card.get("verdict")
@@ -4967,15 +5091,15 @@ if HAS_PYSIDE6:
             io_rows = "".join([
                 _io("市场(大盘环境)", True if has("idx_") else False,
                     "沪深300 涨跌 idx_ret_1d、相对均线 idx_madev20", "东财；已随行情向后对齐"),
-                _io("政策", False, "—",
-                    "政策难可靠量化(需政策NLP，且常反直觉『利好出尽是利空』)，<b>不臆造→不入模型</b>"),
-                _io("公司盈利/估值", "part" if has("val_") else False,
-                    "PE(TTM)/PB/总市值 等", "⚠财报有<b>披露滞后</b>：仅用于研判卡/因子选股(横截面)，"
-                    "<b>未作时序训练特征</b>以防未来函数泄漏"),
+                _io("政策", "part", "政策方向分(利好+/利空-，真实新闻关键词命中→tanh[-1,1])",
+                    "规则量化(见下方规则)；常反直觉，仅当前快照参考、需消融验证，<b>不入历史训练</b>"),
+                _io("公司盈利/估值", "part" if has("val_") else "part",
+                    "净利率=净利润/营收→[-1,1]、PE/PB、ROE", "⚠财报<b>披露滞后</b>：横截面/研判卡用，"
+                    "<b>未作时序训练特征</b>防未来函数；估值列(val_*)若接入则入模"),
                 _io("主力资金流入/流出", True if has("mf_") else False,
                     "主力/超大/大单净额 mf_*、连续进出、资金-价格背离", "东财；本身是按成交单大小的<b>估算</b>"),
-                _io("新闻", False, "真实标题+链接(仅展示)",
-                    "情绪量化需NLP、且同一新闻市场反应常反直觉，<b>为防臆造→不入模型</b>"),
+                _io("新闻", "part", "新闻情绪分(真实标题关键词→tanh[-1,1]，多条时间衰减加权平均)",
+                    "规则量化(见下方规则)；无阅读量故用严重度、常反直觉，仅当前快照参考、<b>不入历史训练</b>"),
                 _io("日K线", True, "开高低收量额 + MA/MACD/RSI/KDJ/布林", "东财/baostock"),
                 _io("周K线(≈)", True if has("ret_w") or has("ret_") else False,
                     "ret_w1/pos_w1/madev_w1", "由日线滚动计算(无泄露)"),
@@ -5001,7 +5125,8 @@ if HAS_PYSIDE6:
                 "<li><b>时效性/未来函数</b>：财报/政策/新闻必须只用『预测那一刻已公开』的信息。"
                 "本软件财务数据只作横截面展示、未作时序训练特征，正是为防此坑。</li>"
                 "<li><b>非平稳</b>：市场规律会随时间漂移，训练一次≠一直有效，必须靠『预测跟踪』做持续样本外验证。</li>"
-                "</ol></div>")
+                "</ol></div>"
+                "<hr>" + soft_factor_rules_html())
             if hasattr(self, "mldata_io"):
                 self.mldata_io.setHtml(io_html)
 
