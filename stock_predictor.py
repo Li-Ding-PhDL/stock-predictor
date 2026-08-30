@@ -3579,10 +3579,10 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
                 up_rate = base.metrics.get("DA")
             mr = next((r for r in res if r.algo_name == m and not r.error), None)
             # 模型对未来该周期的"机械倾向"：预测涨跌幅的方向(不是建议，需配可信度看)
-            pred_chg = None
+            pred_chg = pred_px = None
             try:
                 fc = TrainingPipeline(cfg).predict_next(m, df)
-                pred_chg = fc.get("pred_change_pct")
+                pred_chg = fc.get("pred_change_pct"); pred_px = fc.get("pred_close")
             except Exception:
                 pass
             da_v = mr.metrics.get("DA") if mr else None
@@ -3590,11 +3590,22 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
             sig = da_significance(da_v, n_te)     # DA 是否显著>50%(二项检验)
             da_rows.append({"model": m, "DA": da_v,
                             "UP_P": (mr.metrics.get("UP_P") if mr else None),
-                            "pred_change": pred_chg, "n_test": n_te,
+                            "pred_change": pred_chg, "pred_close": pred_px, "n_test": n_te,
                             "da_p": sig["p"], "da_sig": sig["sig"], "da_sig_text": sig["text"]})
         except Exception as e:
             da_rows.append({"model": m, "error": str(e)})
-    warns = assess_risks(code, name, df, news=None, check_report=True)
+    # 新闻依据(真实标题+链接；同时喂给风险筛查做关键词命中)
+    news_df = None
+    try:
+        news_df = StockDataFetcher.fetch_news(code, limit=8)
+    except Exception:
+        news_df = None
+    news_items = []
+    if news_df is not None and len(news_df):
+        for _, r in news_df.head(5).iterrows():
+            news_items.append({"title": str(r.get("title", "")), "url": str(r.get("url", "")),
+                               "time": str(r.get("time", "")), "source": str(r.get("source", ""))})
+    warns = assess_risks(code, name, df, news=news_df, check_report=True)
     # 借鉴交易 skill：基本面质量(Piotroski F-Score) + 相对大盘强弱(CANSLIM RS) + 大盘状态(regime)
     q = StockDataFetcher.fetch_quality(code)
     ret_1q = chg(60)
@@ -3607,6 +3618,24 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
             rs_1q = ret_1q - idx_ret_1q                # 相对强弱：个股近3月涨幅 − 沪深300近3月涨幅
     except Exception:
         pass
+    # 主预测(给普通人的"结论")：取有预测、且DA最高的模型，配区间(历史波动 σ·√h)与可信度
+    sigma_d = float(close.pct_change().dropna().std()) if len(close) > 5 else 0.0
+    cand = [r for r in da_rows if not r.get("error") and r.get("pred_close") is not None]
+    verdict = None
+    if cand:
+        prim = max(cand, key=lambda r: (r.get("DA") or 0))
+        pcz, pchg = prim["pred_close"], (prim.get("pred_change") or 0.0)
+        band = 1.2816 * sigma_d * (horizon ** 0.5)
+        reliable = (up_rate is not None and prim.get("DA") is not None
+                    and prim["DA"] >= up_rate + 3 and prim["DA"] >= 52 and prim.get("da_sig"))
+        verdict = {
+            "model": prim["model"],
+            "direction": ("涨" if pchg > 0.2 else ("跌" if pchg < -0.2 else "基本横盘")),
+            "pred_change": pchg, "pred_close": pcz,
+            "lo": round(pcz * (1 - band), 2), "hi": round(pcz * (1 + band), 2),
+            "band_pct": round(band * 100, 1),
+            "DA": prim.get("DA"), "da_sig_text": prim.get("da_sig_text"), "reliable": reliable,
+        }
     return {
         "code": code, "name": name, "last_close": round(lc, 2), "horizon": horizon,
         "ret_1w": chg(5), "ret_1m": chg(20), "ret_1q": ret_1q,
@@ -3617,8 +3646,83 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         "f_score": q.get("f_score"), "f_available": q.get("f_available"), "f_detail": q.get("f_detail"),
         "roe": q.get("roe"), "rs_1q": rs_1q, "regime": reg,
         "next_report": StockDataFetcher.fetch_next_report_date(code),   # 下次财报披露日(已缓存)
+        "news_items": news_items, "verdict": verdict,
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
     }
+
+
+def _plain_verdict_html(card: Dict[str, Any], f) -> str:
+    """给普通人的解读（严格顺序：① 支持依据 → ② 涨跌方向 → ③ 目标价与百分比）。
+    这是把客观依据摆出来后，给出**模型的机械预测**（附可信度），不是投资建议、不是荐股。"""
+    # ① 支持依据（客观事实 + 来源）
+    ev = []
+    # 公司盈利/估值/质量
+    prof = []
+    if card.get("pe") is not None:
+        prof.append("公司<b>亏损</b>(无有效市盈率)" if card["pe"] <= 0 else f"市盈率 {f(card['pe'],'',1)}")
+    if card.get("roe") is not None:
+        prof.append(f"ROE {f(card['roe'],'%',1)}")
+    if card.get("f_score") is not None and card.get("f_available"):
+        prof.append(f"基本面质量 F-Score {card['f_score']}/{card['f_available']}")
+    if prof:
+        ev.append("<li><b>公司盈利/质量：</b>" + "、".join(prof) + "</li>")
+    # 主力资金
+    if card.get("mf5") is not None:
+        ev.append(f"<li><b>主力资金：</b>近5日净{'流入' if card['mf5']>=0 else '流出'} "
+                  f"{abs(card['mf5'])/1e4:.0f} 万元</li>")
+    # 大盘/相对强弱
+    reg = card.get("regime", {})
+    mk = []
+    if reg.get("regime", "unknown") != "unknown":
+        mk.append(reg["text"])
+    if card.get("rs_1q") is not None:
+        mk.append(f"相对大盘近3月{'强' if card['rs_1q']>=0 else '弱'} {card['rs_1q']:+.1f}%")
+    if mk:
+        ev.append("<li><b>大盘环境/相对强弱：</b>" + "；".join(mk) + "</li>")
+    # 风险
+    hi = [w for w in card.get("warns", []) if w["level"] == "高"]
+    if card.get("warns"):
+        top = "；".join(f"{w['category']}" for w in card["warns"][:4])
+        ev.append(f"<li><b>风险：</b>共 {len(card['warns'])} 条"
+                  + (f"（含高危：{'、'.join(w['category'] for w in hi)}）" if hi else "")
+                  + f"——{top}</li>")
+    else:
+        ev.append("<li><b>风险：</b>自动筛查未发现明显风险信号（不代表无风险）</li>")
+    # 新闻依据（真实标题+链接）
+    ni = card.get("news_items", [])
+    if ni:
+        lis = "".join(f"<li><a href='{n['url']}'>{n['title']}</a>"
+                      f"<span style='color:#888'>（{n['source']} {n['time']}）</span></li>"
+                      for n in ni[:3] if n.get("title"))
+        ev.append(f"<li><b>近期新闻（点链接核对原文）：</b><ul>{lis}</ul></li>")
+
+    # ② 方向 + ③ 价格/百分比
+    v = card.get("verdict")
+    if not v:
+        concl = ("<p style='color:#c0392b'>模型未能给出有效预测（数据不足/训练失败）。</p>")
+    else:
+        arrow = {"涨": "📈 偏涨", "跌": "📉 偏跌"}.get(v["direction"], "➡️ 基本横盘")
+        col = "#c0392b" if v["direction"] == "涨" else ("#1a9d5a" if v["direction"] == "跌" else "#666")
+        cred = ("<span style='color:#1e8449'>可信度尚可（仍非建议）</span>" if v["reliable"]
+                else "<span style='color:#c0392b'>≈抛硬币，基本不可信</span>")
+        concl = (
+            f"<p style='font-size:15px'><b>② 模型对未来 {card['horizon']} 个交易日的方向判断：</b>"
+            f"<b style='color:{col}'>{arrow}</b>　（模型 {v['model']}，方向准确率 DA {f(v.get('DA'),'%',1)} → {cred}；"
+            f"{v.get('da_sig_text','')}）</p>"
+            f"<p style='font-size:15px'><b>③ 预测目标价：</b>"
+            f"<b style='color:{col}'>{f(v['pred_close'],'元',2)}</b>"
+            f"（相对最新收盘 {f(card['last_close'],'元',2)} 约 <b style='color:{col}'>{v['pred_change']:+.2f}%</b>）；"
+            f"约 80% 置信区间 <b>{v['lo']}~{v['hi']} 元</b>（±{v['band_pct']}%，越往后越不准）。</p>")
+
+    return (
+        "<div style='background:#f7fbff;border:2px solid #2c6fbb;padding:10px;margin:6px 0'>"
+        "<h3 style='margin:2px 0;color:#2c6fbb'>📌 给普通人的解读（依据 → 方向 → 目标价）</h3>"
+        "<p><b>① 支持依据（都是客观事实，可点链接/看数据溯源核对）：</b></p>"
+        f"<ul style='margin:4px 0'>{''.join(ev)}</ul>"
+        + concl +
+        "<p style='color:#c0392b;font-size:12px'>⚠ 以上方向与目标价是<b>模型基于历史的机械预测</b>，"
+        "<b>不是投资建议、不是荐股、不保证兑现</b>；A股单模型方向多数≈50%(抛硬币)，"
+        "DA不显著就当没有。买不买、仓位多少请你自己决定，盈亏自负。</p></div>")
 
 
 def research_card_html(card: Dict[str, Any]) -> str:
@@ -3626,6 +3730,7 @@ def research_card_html(card: Dict[str, Any]) -> str:
     def f(v, suf="", nd=2):
         return f"{v:.{nd}f}{suf}" if isinstance(v, (int, float)) else "-"
     title = f"{card['name']}（{card['code']}）" if card.get("name") else card["code"]
+    plain = _plain_verdict_html(card, f)     # 给普通人的解读：依据→方向→价格/%
     # 风险
     if card["warns"]:
         ri = "".join(f"<li><b style='color:#c0392b'>[{w['level']}·{w['category']}]</b> {w['msg']}"
@@ -3712,7 +3817,8 @@ def research_card_html(card: Dict[str, Any]) -> str:
            + "</table>")
     return (
         f"<h2>综合研判卡 · {title}</h2>"
-        "<p style='color:#c0392b'><b>本卡只汇总客观事实，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
+        "<p style='color:#c0392b'><b>本卡只汇总客观事实 + 模型机械预测，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
+        + plain
         + risk +
         f"<h3>模型方向准确率（{card['horizon']}日，测试集真实表现）</h3>"
         "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
