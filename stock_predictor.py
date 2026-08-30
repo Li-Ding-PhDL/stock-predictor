@@ -2673,6 +2673,50 @@ def assess_risks(code: str, name: str, df: pd.DataFrame,
     return warns
 
 
+_TRADE_CAL_CACHE = {"dates": None, "source": None}   # 全会话缓存 A 股交易日历，避免重复请求
+
+
+def _load_trade_calendar(progress_cb: Optional[Callable[[str], None]] = None):
+    """拉取并缓存 A 股真实交易日历(含交易所已公布的、当年未来交易日；含节假日安排)。
+    成功返回升序的 DatetimeIndex；失败返回 None(调用方自行退回工作日推算，绝不编造)。"""
+    if _TRADE_CAL_CACHE["dates"] is not None:
+        return _TRADE_CAL_CACHE["dates"]
+    log = progress_cb or (lambda m: None)
+    if not HAS_AKSHARE:
+        return None
+    try:
+        with _no_proxy():
+            cal = ak.tool_trade_date_hist_sina()          # 列 'trade_date'，覆盖到当年年底
+        dates = pd.to_datetime(cal["trade_date"]).sort_values().reset_index(drop=True)
+        idx = pd.DatetimeIndex(dates)
+        _TRADE_CAL_CACHE["dates"] = idx
+        _TRADE_CAL_CACHE["source"] = "akshare·tool_trade_date_hist_sina"
+        log(f"[交易日历] 已加载 A 股真实交易日历，共 {len(idx)} 个交易日(覆盖到 {idx[-1].date()})。")
+        return idx
+    except Exception as e:
+        log(f"[交易日历] 加载失败，退回工作日推算(节假日可能不准)：{e}")
+        return None
+
+
+def next_trading_days(last_date, n: int,
+                      progress_cb: Optional[Callable[[str], None]] = None):
+    """返回 last_date 之后的 n 个『真实交易日』(pd.Timestamp 列表)。
+    优先用 akshare 真实日历(自动跳过周末+法定节假日)；日历缺失/不够时对超出部分退回工作日(BDay)推算。"""
+    last = pd.Timestamp(last_date).normalize()
+    cal = _load_trade_calendar(progress_cb)
+    out = []
+    if cal is not None:
+        future = cal[cal > last]
+        out = list(future[:n])
+    # 日历没有(或未来交易日不足 n 个，多见于临近年底)时，其余用工作日近似补齐
+    if len(out) < n:
+        anchor = out[-1] if out else last
+        h = 1
+        while len(out) < n:
+            out.append(anchor + pd.tseries.offsets.BDay(h)); h += 1
+    return out[:n]
+
+
 def forecast_curve(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "return",
                    horizons=(1, 5, 10, 20, 40, 60), window: int = 20,
                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
@@ -4297,10 +4341,13 @@ if HAS_PYSIDE6:
                 fc = forecast_curve(algo, df, target_mode=tm, horizons=(1, 2, 3, 4, 5, 20, 60),
                                     progress_cb=self._log)
                 last_d = pd.to_datetime(fc["last_date"])
+                mon_fut = next_trading_days(last_d, max((p["horizon"] for p in fc["points"]
+                                                         if "pred_close" in p), default=1),
+                                            progress_cb=self._log)
                 nm = {20: "1个月后", 60: "3个月后"}
                 def _row(p):
                     if p["horizon"] <= 5:
-                        fd = last_d + pd.tseries.offsets.BDay(p["horizon"])
+                        fd = mon_fut[p["horizon"] - 1]
                         label = f"下{('一二三四五')[p['horizon']-1]}({self._cn_weekday(fd)} {fd.strftime('%m-%d')})"
                     else:
                         label = nm.get(p["horizon"], f"{p['horizon']}日后")
@@ -4843,9 +4890,12 @@ if HAS_PYSIDE6:
                     markersize=3, label="历史真实收盘")
             last_date = pd.to_datetime(fc["last_date"]); last_close = fc["last_close"]
 
-            # 未来锚点：每个周期 h -> 未来第 h 个交易日(用工作日近似，法定节假日会顺延)
+            # 未来锚点：每个周期 h -> 未来第 h 个『真实交易日』(优先真实日历，跳过周末+节假日)
             ok_points = [p for p in fc["points"] if "pred_close" in p]
-            fut_dates = [last_date] + [last_date + pd.tseries.offsets.BDay(p["horizon"]) for p in ok_points]
+            max_h = max((p["horizon"] for p in ok_points), default=1)
+            fut_list = next_trading_days(last_date, max_h, progress_cb=self._log)
+            fut_map = {h: fut_list[h - 1] for h in range(1, max_h + 1)}
+            fut_dates = [last_date] + [fut_map[p["horizon"]] for p in ok_points]
             fut_prices = [last_close] + [p["pred_close"] for p in ok_points]
             lbl = "未来一周·逐日预测(每日直接预测)" if weekly else "未来预测(各周期直接预测)"
             ax.plot(fut_dates, fut_prices, color="#c0392b", linewidth=1.6, linestyle="--",
@@ -4853,7 +4903,7 @@ if HAS_PYSIDE6:
             if weekly:
                 # 逐日模式：每个交易日都标注(周几 + 预测价 + 相对最新收盘涨跌)
                 for p in ok_points:
-                    fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                    fdate = fut_map[p["horizon"]]
                     chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
                     ax.scatter([fdate], [p["pred_close"]], color=col, s=45, zorder=5)
                     ax.annotate(f"{self._cn_weekday(fdate)}\n{p['pred_close']:.2f}\n{chg:+.1f}%",
@@ -4862,7 +4912,7 @@ if HAS_PYSIDE6:
             else:
                 label_map = {20: ("1个月", "#1e8449"), 60: ("3个月", "#d35400")}
                 for p in ok_points:
-                    fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                    fdate = fut_map[p["horizon"]]
                     if p["horizon"] in label_map:
                         name, col = label_map[p["horizon"]]
                         ax.scatter([fdate], [p["pred_close"]], color=col, s=60, zorder=5)
@@ -4882,11 +4932,12 @@ if HAS_PYSIDE6:
                     f"<p>最新收盘（{fc['last_date']}）：<b>{last_close:.2f} 元</b></p>",
                     "<table border=1 cellpadding=4 cellspacing=0 width=100%>"]
             if weekly:
-                rows.append("<tr bgcolor=#eef><th>交易日</th><th>日期(约)</th><th>预测价</th><th>较今涨跌</th></tr>")
+                cal_note = "真实交易日" if _TRADE_CAL_CACHE["dates"] is not None else "日期(约)"
+                rows.append(f"<tr bgcolor=#eef><th>交易日</th><th>{cal_note}</th><th>预测价</th><th>较今涨跌</th></tr>")
                 prev = last_close
                 for p in fc["points"]:
                     if "pred_close" in p:
-                        fdate = last_date + pd.tseries.offsets.BDay(p["horizon"])
+                        fdate = fut_map[p["horizon"]]
                         chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
                         # 相邻日环比(仅供参考，各点都是独立直接预测、非递归)
                         step = (p["pred_close"] - prev) / prev * 100 if prev else 0.0
@@ -4914,7 +4965,11 @@ if HAS_PYSIDE6:
                 downs = sum(1 for p in fc["points"] if p.get("change_pct", 1) < 0)
                 rows.append(f"<p style='color:#555'>一周机械倾向：{ups} 天预测偏涨 / {downs} 天偏跌"
                             "（仅是模型按历史算出的方向，<b>非预言、非建议</b>）。</p>")
-                rows.append("<p style='color:#c0392b'>⚠ 「日期(约)」按工作日推算，遇法定节假日会顺延；"
+                if _TRADE_CAL_CACHE["dates"] is not None:
+                    date_note = "日期取自 A 股<b>真实交易日历</b>(已跳过周末与法定节假日)"
+                else:
+                    date_note = "真实交易日历未取到，日期按<b>工作日近似</b>(遇法定节假日会有偏差)"
+                rows.append(f"<p style='color:#c0392b'>⚠ {date_note}；"
                             "每天都是<b>独立直接预测</b>(不是拿前一天预测再滚动)，越往后越不可靠。"
                             "务必对照测试集 DA(方向准确率)判断可信度，绝不构成投资建议。</p>")
             else:
@@ -5615,15 +5670,18 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         wfc = forecast_curve(algo1, wdf, target_mode=args.target, horizons=(1, 2, 3, 4, 5),
                              progress_cb=print)
         last_d = pd.to_datetime(wfc["last_date"])
+        wfut = next_trading_days(last_d, 5, progress_cb=print)
+        cal_ok = _TRADE_CAL_CACHE["dates"] is not None
         print(f"  模型={algo1}  最新收盘({wfc['last_date']})={wfc['last_close']}")
         for pt in wfc["points"]:
             if pt.get("error"):
                 print(f"    下第{pt['horizon']}日  失败: {pt['error']}"); continue
-            fd = last_d + pd.tseries.offsets.BDay(pt["horizon"])
+            fd = wfut[pt["horizon"] - 1]
             wd = "周" + "一二三四五六日"[fd.weekday()]
             print(f"    下{('一二三四五')[pt['horizon']-1]}({wd} {fd.strftime('%Y-%m-%d')})  "
                   f"预测={pt['pred_close']}  ({pt['change_pct']:+}%)")
-        print("  ⚠ 日期按工作日推算(节假日顺延)；每天独立直接预测(非递归)，越往后越不可靠，绝不构成投资建议。")
+        cal_msg = "日期取自真实交易日历(已跳过周末+节假日)" if cal_ok else "真实日历未取到，日期按工作日近似(节假日可能不准)"
+        print(f"  ⚠ {cal_msg}；每天独立直接预测(非递归)，越往后越不可靠，绝不构成投资建议。")
 
     if args.backtest:
         print(f"\n【方向性收益回测：按预测涨跌做多/空仓，往返成本 {args.cost}%】")
