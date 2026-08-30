@@ -4912,7 +4912,9 @@ if HAS_PYSIDE6:
             lay.addWidget(NavigationToolbar(canvas, dlg))
             lay.addWidget(canvas)
             dlg.show()
-            self._abl_dlg = dlg          # 持有引用防被回收
+            if not hasattr(self, "_fig_dlgs"):
+                self._fig_dlgs = []
+            self._fig_dlgs.append(dlg)   # 持有引用防被回收(可多个)
 
         def _on_ablation(self):
             name = self.mldata_model_combo.currentText() if hasattr(self, "mldata_model_combo") else ""
@@ -6107,6 +6109,25 @@ if HAS_PYSIDE6:
                     + "<p style='color:#c0392b;font-size:12px'>⚠ 相关性随行情剧变：<b>暴跌时往往齐跌、分散化会失效</b>；"
                     "历史相关≠未来。这是客观计算、非投资建议。</p>")
                 self.pf_corr_view.setHtml(html)
+                # 相关性热力图(可视化)
+                try:
+                    fig = Figure(figsize=(1.2 + 0.7 * len(cols), 1.0 + 0.7 * len(cols)))
+                    ax = fig.add_subplot(111)
+                    M = corr.values
+                    im = ax.imshow(M, cmap="RdYlGn_r", vmin=-1, vmax=1)
+                    ax.set_xticks(range(len(cols))); ax.set_yticks(range(len(cols)))
+                    ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+                    ax.set_yticklabels(cols, fontsize=8)
+                    for i in range(len(cols)):
+                        for j in range(len(cols)):
+                            ax.text(j, i, f"{M[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                                    color="#000" if abs(M[i, j]) < 0.6 else "#fff")
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    ax.set_title("相关性热力图(红=高度同涨跌·分散差；绿=低相关·分散好)", fontsize=9)
+                    fig.tight_layout()
+                    self._show_fig_dialog(fig, "相关性热力图")
+                except Exception as e:
+                    self._log(f"[组合] 热力图绘制跳过：{e}")
                 self._oplog(f"组合相关性：{len(cols)} 只，平均相关 {res['avg_corr']:.2f}，组合波动 {res['port_vol']*100:.1f}%。")
             except Exception as e:
                 QMessageBox.critical(self, "组合分析失败", str(e))
@@ -6147,6 +6168,27 @@ if HAS_PYSIDE6:
                     "经验：|IC均值|&gt;0.03 且 |ICIR|&gt;0.5 才算有点用。<b>这是历史统计、不保证未来</b>，"
                     "样本少/时间短时不可靠，非投资建议。</p>")
                 self.pf_ic_view.setHtml(html)
+                # 因子 IC 柱状图(可视化)
+                try:
+                    good = [r for r in res["rows"] if r.get("mean_ic") is not None]
+                    if good:
+                        fig = Figure(figsize=(7, 4)); ax = fig.add_subplot(111)
+                        labs = [r["factor"] for r in good]; ics = [r["mean_ic"] for r in good]
+                        cols_ = ["#1e8449" if r["useful"] else "#c0392b" for r in good]
+                        ax.bar(range(len(labs)), ics, color=cols_)
+                        for i, r in enumerate(good):
+                            ax.text(i, ics[i] + (0.002 if ics[i] >= 0 else -0.002),
+                                    f"{ics[i]:.3f}\nICIR{r['icir']}", ha="center",
+                                    va="bottom" if ics[i] >= 0 else "top", fontsize=7)
+                        ax.axhline(0.03, color="#888", ls="--", lw=1, label="有效阈值 0.03")
+                        ax.axhline(-0.03, color="#888", ls="--", lw=1)
+                        ax.axhline(0, color="#333", lw=0.8)
+                        ax.set_xticks(range(len(labs))); ax.set_xticklabels(labs, rotation=15, fontsize=8)
+                        ax.set_ylabel("IC 均值"); ax.set_title("因子有效性 IC（绿=有效|IC|>0.03且|ICIR|>0.5）", fontsize=9)
+                        ax.legend(fontsize=8); ax.grid(True, axis="y", alpha=0.25); fig.tight_layout()
+                        self._show_fig_dialog(fig, "因子有效性 IC 柱状图")
+                except Exception as e:
+                    self._log(f"[IC] 柱状图绘制跳过：{e}")
                 self._oplog(f"因子IC检验：{res['n_stocks']}只×{res['n_periods']}期完成。")
             except Exception as e:
                 QMessageBox.critical(self, "IC检验失败", str(e))
