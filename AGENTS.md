@@ -1,5 +1,8 @@
 # AGENTS.md — 给 AI 协作者的说明
 
+> ⚠️ **红线（合规）**：本项目仅供交流与学习，**不构成投资建议、绝不荐股**；作者与本产品**不承担任何法律责任与风险**。
+> 任何改动都不得引入"荐股/买卖信号/保证收益"的表述，所有对外结论都要带"非建议、盈亏自负"的提示。
+
 本文件面向任何要**阅读、调用或修改** `stock_predictor.py` 的 AI 编码助手
 （Claude Code / Cursor / Copilot / Qwen Code 等）。人类贡献者也可参考。
 
@@ -36,7 +39,8 @@ stock_predictor.py
 ## 2. 不可触碰的红线（违反 = 制造出"看起来很准、实际造假"的模型）
 
 1. **时间序列绝不能随机 shuffle 切分**。必须用 `FeatureEngineer.time_series_split`（前段训练、后段测试）。
-   用 sklearn 默认 shuffle 会用未来预测过去，是严重的数据泄漏。
+   用 sklearn 默认 shuffle 会用未来预测过去，是严重的数据泄漏。**交叉验证同理**：`_cross_validate` 必须用
+   **前扩窗口 walk-forward**（只用验证折之前的数据训练），绝不能把验证折之后的未来折也拿去训练。
 2. **标准化器只在训练集上 `fit`**，测试集只 `transform`（见 `prepare_data`）。绝不在全量或测试集上 fit。
 3. **绝不删除 Naive(前值) 朴素基准和 DA 方向准确率**，也不得为了让数字好看而绕过它们。
    任何"提升精度"的改动，都必须仍然和朴素基准做公平对比。
@@ -96,11 +100,16 @@ python -c "import stock_predictor"
 - **✅ 外部数据接入**（已完成）：`StockDataFetcher.enrich()` 用 merge_asof 并入财报估值(乐咕乐股
   `stock_a_indicator_lg`)与大盘环境(沪深300 `stock_zh_index_daily`)；新闻(`stock_news_em`)仅展示不训练。
   失败自动跳过、绝不造假。**注意 merge_asof 两侧 date 必须同分辨率，已统一 datetime64[ns]。**
-- **市场情绪**：已加入量价情绪代理。真正的**舆情情绪**(新闻/股吧 NLP) 仍是扩展——务必真实抓取、不臆造分数。
-- **板块/行业**：可加行业分类 + 板块指数(如 `stock_board_industry_hist_em`)，按 enrich 同款 merge_asof 并入。
-- **✅ 方向性收益回测**（已完成）：`backtest_directional()` + GUI「策略回测」页 + CLI `--backtest --cost`；
-  按预测涨跌做多/空仓，仅在仓位变化时扣往返成本，与买入持有对比(年化/回撤/胜率/夏普)。非重叠切段避免重叠交易。
-  可进一步扩展：加做空、仓位分级(按预测涨跌幅大小)、按段年化更严谨、多标的组合回测。
-- **ARIMA 的公平性**：当前多步 forecast 在股票上会收敛到均值，往往跑不赢基准；可改成滚动一步预测以更公平。
+- **✅ 隔夜美股 / 北向资金**（已完成）：`enrich()` 已并入(`index_us_stock_sina` 日期+1对齐、`stock_hsgt_north_net_flow_in_em`)。
+- **✅ 未来一周·逐日预测 + 真实交易日历 + 置信区间**（已完成）：`forecast_curve(horizons=(1,2,3,4,5))` 逐日直接预测(非递归)；
+  `next_trading_days()`/`_load_trade_calendar()`(akshare `tool_trade_date_hist_sina`，全会话缓存)跳周末+节假日，失败退回 BDay；
+  每点带约80%置信区间(σ·√h)。CLI `--week`。`is_trading_now` 也用日历排节假日。
+- **✅ 回测贴合 A 股制度**（已完成）：`backtest_directional` 逐样本 `bar_info`(涨跌停/停牌)→涨停买不进/停牌/跌停卖不出/T+1；
+  `board_limit_pct` 按板块定幅度；波动率目标仓位 `vol_target_annual` + 单段止损 `stop_loss_pct`；对比沪深300超额(`fetch_index_close`)。
+- **✅ 统计严谨性**（已完成）：`da_significance()` 二项检验(无 scipy 用 erfc)；研判卡"可信度"须过基准+显著；推荐区加多重比较偏差警示。
+- **✅ 因子选股 5 因子**（已完成）：`batch_factor_scan` = 价值/动量/资金 + 质量(`fetch_quality` ROE+营收增速) + 低波动。
+- **市场情绪 / 舆情**：量价情绪代理已有；真正的新闻/股吧 NLP 情绪仍是扩展——务必真实抓取、不臆造分数。
+- **板块/行业**：可加行业分类 + 板块指数(`stock_board_industry_hist_em`)，按 enrich 同款 merge_asof 并入。
+- **可继续做**：ARIMA 改滚动一步预测；组合层面回测/行业中性；龙虎榜/融资融券/解禁日历因子；`Kstar/M5Rules/GEP/MEP` 精确实现。
 
 改进时请回到第 2 节红线核对一遍。

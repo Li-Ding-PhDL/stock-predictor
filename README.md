@@ -1,148 +1,134 @@
-# 基于 MATLAB 机器学习的橡胶混凝土性能预测研究
+# stock-predictor · 一键式 A 股预测研究平台
 
-[![MATLAB](https://img.shields.io/badge/MATLAB-R2020b+-blue?logo=mathworks)](https://www.mathworks.com/products/matlab.html)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
+[![GUI](https://img.shields.io/badge/GUI-PySide6-41cd52)](https://doc.qt.io/qtforpython/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## 📋 项目简介
+> ⚠️ **免责声明 / 红线（务必先读）**
+> - 本项目**仅供交流与学习，不构成任何投资建议，也绝不荐股**；作者与本产品**不承担任何法律责任与风险**，据此交易盈亏自负。
+> - 真实 A 股上，多数模型的方向准确率≈50%（和抛硬币差不多）。本软件的价值**不在"预测得准"，而在于诚实地告诉你到底准不准、并帮你避开明显的雷**。
+> - 请仅用于个人研究：勿高频抓取公开接口、勿转售/再分发数据、勿无「证券投资咨询」牌照对外荐股或收费（在中国属违法）。
+> - **任何"保证高准确率""稳赚不赔"的股票预测都是骗局。**
 
-本项目利用 **MATLAB** 和 **机器学习技术** 对橡胶混凝土（Rubber Concrete）的力学性能进行预测研究。通过集成多种智能优化算法与机器学习模型，构建高精度的非线性预测系统，为橡胶混凝土的配合比设计和性能评估提供科学依据。
+一个**单文件**（`stock_predictor.py`，约 6000 行）的沪深 A 股预测研究平台，用一套统一的
+「取数 → 特征 → 训练 → 评估 → 可视化」流水线，把 **35 种算法**插拔在一起，
+提供 **图形界面（GUI）/ 命令行（CLI）/ 可编程 API** 三种用法。
 
-## 🔬 研究背景
-
-橡胶混凝土是一种将废旧橡胶颗粒掺入传统混凝土中形成的新型环保建筑材料。然而，橡胶掺量对混凝土力学性能的影响具有高度非线性特征，传统经验公式难以准确预测。本研究采用机器学习方法，建立数据驱动的性能预测模型。
-
-## 📁 文件结构
-
-```
-Research-on-Rubber-Concrete-Using-MATLAB-Machine-Learning/
-├── 1_PSO-SVR.m                 # 粒子群优化支持向量回归模型
-├── 2_FA_RF.m                   # 萤火虫算法优化随机森林模型
-├── 3_PSO-LSBoost.m             # 粒子群优化提升树模型
-├── 3_RC_V37_Forward_Expert_Ultimate.m  # 主程序/专家系统模型
-├── 4_GA-BP.m                   # 遗传算法优化 BP 神经网络模型
-├── 5_PSO_LSSVM.m               # 粒子群优化最小二乘支持向量机模型
-├── 6_LSTM.m                    # 长短期记忆网络深度学习模型
-├── 数据集 3.xlsx                # 原始实验数据集
-├── 3_ConcreteModel_LSBoost.mat # 预训练 LSBoost 模型文件
-└── README.md                   # 项目说明文档
-```
-
-## 🤖 机器学习模型
-
-本项目实现了 **6 种** 主流机器学习算法及其优化变体：
-
-| 编号 | 模型名称 | 优化算法 | 特点 |
-|:---:|---------|---------|------|
-| 1 | **PSO-SVR** | 粒子群优化 (PSO) | 支持向量回归 + 自适应参数寻优 |
-| 2 | **FA-RF** | 萤火虫算法 (FA) | 随机森林 + 群体智能特征选择 |
-| 3 | **PSO-LSBoost** | 粒子群优化 (PSO) | 提升树集成 + 学习率优化 |
-| 4 | **GA-BP** | 遗传算法 (GA) | 反向传播神经网络 + 全局最优权重 |
-| 5 | **PSO-LSSVM** | 粒子群优化 (PSO) | 最小二乘 SVM + 核参数优化 |
-| 6 | **LSTM** | - | 长短期记忆深度学习网络 |
-
-## 🎯 核心功能
-
-- ✅ **多模型对比分析**：集成 6 种机器学习算法，支持性能横向对比
-- ✅ **智能超参数优化**：PSO、FA、GA 三种启发式算法自动调参
-- ✅ **数据预处理**：Excel 数据导入、归一化、训练集/测试集划分
-- ✅ **模型持久化**：支持训练好的模型保存为 `.mat` 文件
-- ✅ **可视化输出**：预测结果对比图、误差分析图、收敛曲线
-
-## 📊 数据集说明
-
-| 文件名 | 格式 | 说明 |
-|:------:|:----:|:-----|
-| `数据集 3.xlsx` | Excel | 橡胶混凝土实验数据（配合比、力学性能等） |
-
-### 典型数据特征
-- **输入特征**：水泥用量、水胶比、橡胶掺量、砂率、外加剂等
-- **输出目标**：抗压强度、抗折强度、弹性模量等力学指标
-
-## 🚀 快速开始
-
-### 环境要求
-- MATLAB R2020b 或更高版本
-- MATLAB Statistics and Machine Learning Toolbox
-- MATLAB Deep Learning Toolbox（用于 LSTM 模型）
-
-### 运行步骤
-
-1. **克隆仓库**
-   ```bash
-   git clone https://github.com/Li-Ding-PhDL/Research-on-Rubber-Concrete-Using-MATLAB-Machine-Learning.git
-   cd Research-on-Rubber-Concrete-Using-MATLAB-Machine-Learning
-   ```
-
-2. **准备数据**
-   - 确保 `数据集 3.xlsx` 位于项目根目录
-   - 检查数据格式与完整性
-
-3. **运行模型**
-   ```matlab
-   % 示例：运行 PSO-SVR 模型
-   run('1_PSO-SVR.m')
-   
-   % 运行主程序（专家系统）
-   run('3_RC_V37_Forward_Expert_Ultimate.m')
-   ```
-
-4. **查看结果**
-   - 预测性能指标（R²、RMSE、MAE）
-   - 可视化对比图表
-   - 模型文件（`.mat`）
-
-## 📈 预期输出
-
-每个模型运行后将生成：
-- 训练集/测试集预测对比图
-- 预测值 vs 实际值散点图
-- 相对误差分布图
-- 优化算法收敛曲线
-- 性能评估指标表格
-
-## 🔍 模型选择建议
-
-| 应用场景 | 推荐模型 | 理由 |
-|:--------|:--------|:-----|
-| 小样本数据 | PSO-SVR / PSO-LSSVM | 泛化能力强，适合有限数据 |
-| 高维特征 | FA-RF | 内置特征重要性评估 |
-| 高精度需求 | GA-BP / LSTM | 非线性拟合能力最优 |
-| 快速部署 | PSO-LSBoost | 训练速度快，可解释性好 |
-
-## 📝 引用格式
-
-如果您在本研究中使用了本项目的代码或数据，请引用：
-
-```bibtex
-@software{Li_RubberConcreteML2026,
-  author = {Li, Ding},
-  title = {Research on Rubber Concrete Using MATLAB Machine Learning},
-  year = {2026},
-  url = {https://github.com/Li-Ding-PhDL/Research-on-Rubber-Concrete-Using-MATLAB-Machine-Learning},
-  organization = {GitHub}
-}
-```
-
-## 📄 许可证
-
-本项目采用 [MIT 许可证](LICENSE)
-
-## 👨‍💻 作者信息
-
-- **Li Ding** ()
-- GitHub: [@Li-Ding-PhDL](https://github.com/Li-Ding-PhDL)
-
-## 🤝 贡献指南
-
-欢迎通过以下方式参与项目：
-1. 提交 Issue 报告问题或提出建议
-2. Fork 仓库并提交 Pull Request
-3. 分享您的实验结果和改进方案
-
-## 📧 联系方式
-
-如有学术合作或技术咨询需求，请通过 GitHub Issues 联系。
+它是照着作者的 MATLAB「MIMO 多输出研究平台」做的 Python 版，最大的设计信条是 **诚实优先（radical honesty）**。
 
 ---
 
-**最后更新**: 2026 年 8 月 29 日
+## ✨ 核心特性
+
+### 🎯 诚实优先，绝不自欺
+- **默认预测"涨跌幅"而非"价格"**：预测价格会让 R² 虚高到 0.9+（因为"明天价≈今天价"），是假象；预测涨跌幅更平稳、更诚实。
+- **两条强制基准**：`Naive(前值)`（价格误差参照）+ `总是涨(方向基准)`（DA=历史上涨日占比）。模型必须明显超过它们才算有用。
+- **方向准确率 DA + 上涨精确率 UP_P**：比 R² 更能反映"能不能真赚钱"。
+- **DA 二项显著性检验**：DA=53% 到底是真本事还是运气？给出 p 值，样本太少直接标"可能只是运气"。
+- **多重比较偏差警示**：比了一堆模型再挑最好的，本身就偏乐观——软件会提醒你去做样本外验证。
+- **预测有置信区间**：未来预测给约 80% 置信带（点预测必错，区间才诚实）。
+
+### 📊 全部真实数据、可溯源、绝不造假
+| 数据 | 来源 | 接口 |
+|---|---|---|
+| 日线行情 | 东方财富 / baostock（多源自动容错） | `stock_zh_a_hist` / baostock |
+| 财报估值 (PE/PB/市值) | 百度 / 乐咕乐股（自动适配） | `stock_zh_valuation_baidu` / `stock_a_indicator_lg` |
+| 大盘环境 | 东方财富（沪深300） | `stock_zh_index_daily` |
+| 主力资金流 | 东方财富（带浏览器头直连） | 东财资金流 API |
+| 隔夜美股 / 北向资金 | 新浪 / 东方财富 | `index_us_stock_sina` / `stock_hsgt_north_net_flow_in_em` |
+| 个股新闻 | 东方财富 | `stock_news_em`（仅展示 + 风险关键词筛查，不作训练特征） |
+| 实时盘口 | 东方财富 | 盘口五档（监控用，自采集到 `monitor_log/`） |
+| **交易日历** | 东方财富（新浪日历） | `tool_trade_date_hist_sina`（真实节假日，用于未来日期/到期日） |
+
+> **任一来源取数失败 → 如实标注"未接入"、该特征缺省，绝不填假值、绝不编情绪分、绝不编因果。**
+
+### 🧠 35 种算法 + 5 种超参优化
+- 传统/集成：SVR、LSSVM、GPR、Lasso、Ridge、ElasticNet、PLSR、KNN、RF、ExtraTrees、Bagging、AdaBoost、GBRT、XGBoost、LightGBM、CatBoost、决策树…
+- 深度学习：LSTM、GRU、Transformer、TabNet、CNN、DNN、ResNet、BPNet、RBFNet
+- 公式演化：符号回归 SR、GEP、MEP
+- 经典时序：ARIMA
+- 超参优化：PSO / GA / FA / SOA / **BO(贝叶斯，默认)**
+- 缺少可选依赖（xgboost/torch/gplearn 等）会**自动降级、不崩溃**，界面对应算法置灰并注明缺哪个库。
+
+### 📈 未来一周·逐日预测
+对**下 1~5 个交易日（约下周一~周五）各自独立训练一个"直接预测第 h 天"的模型**，
+得到每天的预测价 + 涨跌 + 约 80% 置信区间。**不做递归预测**（拿预测喂预测会误差爆炸），**不编造未来的开高低量**。
+日期取自**真实交易日历**，自动跳过周末与法定节假日。
+
+### 💰 贴合 A 股制度的收益回测
+「预测涨就满仓、预测跌就空仓」走一遍历史，扣手续费，和"买入持有"及"沪深300大盘"对比净值：
+- **T+1**（持有≥1日天然满足）、**涨停买不进 / 跌停卖不出 / 停牌不可交易**（按板块自动涨跌停幅度：主板10%、创业板/科创板20%、北交所30%、ST 5%）
+- **风控**：波动率目标仓位（高波动自动减仓）、单段止损
+- 输出：年化、最大回撤、胜率、夏普（扣无风险利率）、相对大盘超额
+> 只有**明显跑赢买入持有和大盘**，才说明预测涨跌真的能赚钱。
+
+### 🏆 因子打分选股（横截面，5 因子）
+价值（低 PE/PB）+ 动量（近 3 月）+ 资金（主力净流入）+ **质量（ROE/营收增速）** + **低波动**，
+百分位排名加权、扣风险惩罚后排序。**这是研究筛查工具，不是荐股**；排在前面 ≠ 该买。
+
+### 🔎 其它
+- **预测跟踪**：把预测存下来，等目标日到了自动拉真实股价对比，算**真实**命中率（附记录时 DA，增加可信力）。
+- **风险自动筛查**：ST/*ST、面值退市、亏损、近期暴跌、负面新闻关键词——每条都注明真实依据。
+- **综合研判卡 + 综合报告**：把客观信号汇总成一页 HTML（可导出），含"模型对后市的机械倾向"（并列可信度，绝不当买卖信号）。
+- **实时监控**：交易时段轮询盘口，记录快照供事后分析。
+- **名词解释**：41+ 金融/模型名词 + 35 算法 + 14 指标的大白话解释（写给不懂金融的用户）。
+
+---
+
+## 🚀 快速开始
+
+### 安装
+```bash
+pip install -r requirements.txt
+# 国内可加清华镜像： -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+最小可跑（不含深度学习/符号回归）：`numpy pandas scikit-learn matplotlib pyarrow requests PySide6 akshare baostock`
+
+### 图形界面
+```bash
+python stock_predictor.py
+```
+
+### 命令行（无界面，适合脚本/定时任务）
+```bash
+# 合成数据秒级自测
+python stock_predictor.py --cli --synthetic --algos "RF,SVR,GBRT"
+
+# 真实股票 + 未来一周逐日预测 + 带手续费回测
+python stock_predictor.py --cli --code 600519 --week --backtest
+```
+
+> **Windows 用户注意**：若用户名文件夹含 `&`（如 `&office`），VS Code 的 ▶ 运行按钮拼出的路径会让 PowerShell 报
+> `AmpersandNotAllowed`。解法：别用 ▶，在终端里 `cd "带引号的路径"; python stock_predictor.py`。
+
+---
+
+## 📁 目录结构
+```
+stock-predictor/
+├── stock_predictor.py   # 全部功能（单文件，约6000行）
+├── README.md            # 本文件
+├── PROJECT.md           # 5分钟工程总览
+├── AGENTS.md            # 给 AI 协作者的改代码指南（含"不可触碰的红线"）
+├── requirements.txt     # 依赖（分层，缺可选项自动降级）
+└── .gitignore           # 行情缓存/快照/预测日志/报告 等本地产物不入库
+```
+
+---
+
+## 🤝 给 AI / 开发者协作
+本项目欢迎 AI 编码助手（Claude Code / Cursor / Copilot 等）参与。**改代码前请务必先读 [AGENTS.md](AGENTS.md)**，
+尤其是"不可触碰的红线"（时序不能 shuffle、标准化只在训练集 fit、不删诚实基准、不泄漏未来、可选依赖降级不崩溃）。
+
+---
+
+## ⚖️ 合规与许可
+- 本项目采用 [MIT 许可证](LICENSE)。
+- 数据来自公开接口，仅供个人学术研究。**不构成投资建议，不提供荐股服务。**
+- 做成对外产品前请咨询证券合规律师；无「证券投资咨询」牌照对外荐股/收费在中国属违法。
+
+## 👨‍💻 作者
+- **Li Ding（）** · GitHub [@Li-Ding-PhDL](https://github.com/Li-Ding-PhDL)
+
+---
+*任何"保证高准确率""稳赚不赔"的股票预测都是骗局。本软件的立场是：市场接近有效，诚实比虚假的"准"更有价值。*
