@@ -529,10 +529,11 @@ class StockDataFetcher:
 
     @staticmethod
     def _fetch_fundflow_direct(code: str) -> pd.DataFrame:
-        """带浏览器请求头直连东财公开资金流 API(push2his.eastmoney.com)。真实数据，非爬虫破解。"""
+        """带浏览器请求头直连东财公开资金流 API。真实数据，非爬虫破解。
+        加固：每次用全新 Session + `Connection: close`(避免 keep-alive 复用导致 RemoteDisconnected)，
+        并在多个东财主机之间轮试(push2his / push2 / 1.push2his)。"""
         import requests
         secid = f"1.{code}" if code.startswith("6") else f"0.{code}"   # 1=沪 0=深/北
-        url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
         params = {
             "lmt": "0", "klt": "101", "secid": secid,
             "fields1": "f1,f2,f3,f7",
@@ -542,11 +543,33 @@ class StockDataFetcher:
         headers = {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-            "Referer": "https://data.eastmoney.com/",
-            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://data.eastmoney.com/", "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate", "Connection": "close",   # 关键：不复用连接
         }
-        r = StockDataFetcher._retry(
-            lambda: requests.get(url, params=params, headers=headers, timeout=12), tries=4, delay=1.2)
+        hosts = ["https://push2his.eastmoney.com", "https://push2.eastmoney.com",
+                 "http://push2his.eastmoney.com", "https://push2his.eastmoney.com"]
+        path = "/api/qt/stock/fflow/daykline/get"
+
+        def _try(host):
+            with requests.Session() as sess:            # 每台主机全新会话
+                sess.headers.update(headers)
+                resp = sess.get(host + path, params=params, timeout=12)
+                return resp
+
+        r = None; last = None
+        for host in hosts:                              # 主机 + 重试轮询
+            for attempt in range(2):
+                try:
+                    r = _try(host)
+                    if r is not None and r.status_code == 200:
+                        break
+                except Exception as e:
+                    last = e
+                    time.sleep(1.0)
+            if r is not None and getattr(r, "status_code", 0) == 200:
+                break
+        if r is None or r.status_code != 200:
+            raise RuntimeError(f"东财资金流各主机均不可达({last})")
         klines = (r.json().get("data") or {}).get("klines") or []
         if not klines:
             raise RuntimeError("直连返回空(可能代码/市场不对)")
