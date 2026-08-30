@@ -3249,8 +3249,8 @@ def basket_correlation(codes: List[str], start: str = "20230101", end: Optional[
 
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
-             "pred_close", "pred_change_pct", "pred_dir", "target_date",
-             "status", "actual_close", "actual_change_pct", "hit_dir", "verified_at"]
+             "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
+             "status", "actual_close", "actual_change_pct", "hit_dir", "in_interval", "verified_at"]
 
 
 def load_pred_log() -> pd.DataFrame:
@@ -3311,6 +3311,11 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> i
                 df.at[idx, "actual_close"] = str(round(actual, 4))
                 df.at[idx, "actual_change_pct"] = str(round(chg, 3))
                 df.at[idx, "hit_dir"] = "1" if pred_dir == actual_dir else "0"
+                # 区间校准：真实价是否落在记录时的约80%置信区间内
+                lo = pd.to_numeric(df.at[idx, "pred_lo"], errors="coerce") if "pred_lo" in df.columns else np.nan
+                hi = pd.to_numeric(df.at[idx, "pred_hi"], errors="coerce") if "pred_hi" in df.columns else np.nan
+                if pd.notna(lo) and pd.notna(hi):
+                    df.at[idx, "in_interval"] = "1" if (lo <= actual <= hi) else "0"
                 df.at[idx, "status"] = "verified"
                 df.at[idx, "verified_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
                 n_ok += 1
@@ -3331,11 +3336,16 @@ def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
     v["hit_dir"] = pd.to_numeric(v["hit_dir"], errors="coerce")
     v["ae"] = (pd.to_numeric(v["pred_change_pct"], errors="coerce") -
                pd.to_numeric(v["actual_change_pct"], errors="coerce")).abs()
+    v["in_interval"] = pd.to_numeric(v.get("in_interval"), errors="coerce") if "in_interval" in v.columns else np.nan
     for hz, g in v.groupby("horizon"):
+        gi = g["in_interval"].dropna()
         out[label.get(str(hz), f"{hz}日")] = {
             "n": int(len(g)),
             "dir_acc": round(float(g["hit_dir"].mean() * 100), 1),
             "mae_ret": round(float(g["ae"].mean()), 2),
+            # 区间覆盖率：真实价落在"约80%置信区间"的比例。健康值≈80%；远低=区间过窄/过度自信
+            "coverage": (round(float(gi.mean() * 100), 1) if len(gi) else None),
+            "n_cov": int(len(gi)),
         }
     return out
 
@@ -5382,6 +5392,7 @@ if HAS_PYSIDE6:
                         "base_date": base_date, "base_close": base_close,
                         "pred_close": p["pred_close"], "pred_change_pct": p["change_pct"],
                         "pred_dir": "涨" if p["pred_close"] >= base_close else "跌",
+                        "pred_lo": p.get("lo", ""), "pred_hi": p.get("hi", ""),  # 约80%置信区间(供校准检验)
                         "target_date": tgt, "status": "pending"})
                 save_predictions(rows)
                 self._oplog(f"记录预测：{code} {model}，{len(rows)} 个周期。")
@@ -5407,14 +5418,24 @@ if HAS_PYSIDE6:
             # 顶部：真实准确率(仅已验证)
             acc = prediction_accuracy()
             if acc:
+                def _cov_cell(v):
+                    c = v.get("coverage")
+                    if c is None:
+                        return "<td>-</td>"
+                    # 健康≈80%；<65% 说明区间过窄/过度自信，标红
+                    col = "#1e8449" if c >= 72 else ("#c0392b" if c < 65 else "#e0a030")
+                    return f"<td style='color:{col}'><b>{c}%</b>(n={v['n_cov']})</td>"
                 rows = "".join(f"<tr><td>{k}</td><td>{v['n']}</td>"
-                               f"<td><b>{v['dir_acc']}%</b></td><td>{v['mae_ret']}%</td></tr>"
+                               f"<td><b>{v['dir_acc']}%</b></td><td>{v['mae_ret']}%</td>{_cov_cell(v)}</tr>"
                                for k, v in acc.items())
                 html = ("<h3>真实预测准确率（仅统计已到期、已用真实股价验证的记录）</h3>"
                         "<table border=1 cellpadding=3 cellspacing=0>"
-                        "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th><th>涨跌幅平均误差</th></tr>"
+                        "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th>"
+                        "<th>涨跌幅平均误差</th><th>区间覆盖率(目标≈80%)</th></tr>"
                         f"{rows}</table>"
-                        "<p style='color:#c0392b'>方向准确率需明显>50%才有意义；样本少时仅供参考，不构成投资建议。</p>")
+                        "<p style='color:#c0392b'>方向准确率需明显&gt;50%才有意义。"
+                        "<b>区间覆盖率</b>=真实价落在『约80%置信区间』的比例：接近80%才说明区间靠谱；"
+                        "明显偏低=区间过窄/模型过度自信(别信那个窄区间)。样本少仅供参考，不构成投资建议。</p>")
             else:
                 html = ("<h3>真实预测准确率</h3><p style='color:#888'>还没有已验证的预测。"
                         "先「记录当前预测」，等目标日期到了再「验证并刷新」——这样得到的才是<b>真实的未来对比</b>，"
@@ -5423,10 +5444,10 @@ if HAS_PYSIDE6:
             # 下：预测明细表
             df = load_pred_log()
             cols = ["made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
-                    "pred_close", "pred_change_pct", "pred_dir", "target_date", "status",
-                    "actual_close", "actual_change_pct", "hit_dir"]
+                    "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date", "status",
+                    "actual_close", "actual_change_pct", "hit_dir", "in_interval"]
             heads = ["记录时间", "代码", "名称", "模型", "周期", "记录时DA%", "基准日", "基准价", "预测价",
-                     "预测涨跌%", "方向", "目标日", "状态", "实际价", "实际涨跌%", "命中"]
+                     "预测涨跌%", "方向", "区间下", "区间上", "目标日", "状态", "实际价", "实际涨跌%", "命中", "落区间"]
             self.trk_table.setColumnCount(len(cols))
             self.trk_table.setHorizontalHeaderLabels(heads)
             df = df.tail(300).reset_index(drop=True) if len(df) else df
@@ -5436,6 +5457,8 @@ if HAS_PYSIDE6:
                     val = str(df.at[i, c]) if c in df.columns else ""
                     if c == "hit_dir":
                         val = "✓命中" if val == "1" else ("✗未中" if val == "0" else "-")
+                    elif c == "in_interval":
+                        val = "✓在内" if val == "1" else ("✗出界" if val == "0" else "-")
                     self.trk_table.setItem(i, j, QTableWidgetItem(val))
             self.trk_table.resizeColumnsToContents()
 
