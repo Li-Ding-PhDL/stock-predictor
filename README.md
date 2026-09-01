@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![GUI](https://img.shields.io/badge/GUI-PySide6-41cd52)](https://doc.qt.io/qtforpython/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-All%20Rights%20Reserved-red.svg)](LICENSE)
 
 > ⚠️ **免责声明 / 红线（务必先读）**
 > - 本项目**仅供交流与学习，不构成任何投资建议，也绝不荐股**；作者与本产品**不承担任何法律责任与风险**，据此交易盈亏自负。
@@ -196,10 +196,14 @@ docker build -t stock-predictor . && docker run --rm stock-predictor --cli --syn
 > 说明：这些方法都是**客观统计/会计指标**，本项目只用于「陈列事实 + 验证真伪」，**不产出买卖信号、不荐股**。
 > crypto/DeFi/美股期权/券商下单等与 A 股无关的 skill 未借鉴。
 
-## ⚖️ 合规与许可
-- 本项目采用 [MIT 许可证](LICENSE)。
+## ⚖️ 版权与使用许可（重要）
+> **© 版权所有，保留所有权利（All Rights Reserved）。**
+> 本软件/模型已完全具备金融分析的标准。**版权归作者本人所有。未经作者书面许可，禁止以任何形式售卖、商用、再分发或二次打包分发；违者将追究相应的法律责任。**
+> 仅授权**个人学术研究与学习**使用。允许查看源码学习、非商业地个人研究；**不允许**将本软件或其衍生版本用于任何形式的销售、付费服务或商业产品。
+
 - 数据来自公开接口，仅供个人学术研究。**不构成投资建议，不提供荐股服务。**
 - 做成对外产品前请咨询证券合规律师；无「证券投资咨询」牌照对外荐股/收费在中国属违法。
+- 如需商业授权，请通过 GitHub 联系作者获得书面许可。
 
 ## 👨‍💻 作者
 - GitHub [@Li-Ding-PhDL](https://github.com/Li-Ding-PhDL)
