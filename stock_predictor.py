@@ -922,20 +922,29 @@ class StockDataFetcher:
         return ""
 
     @staticmethod
-    def fetch_industry(code: str, bypass_proxy: bool = True) -> str:
-        """获取个股所属行业(东财 stock_individual_info_em 的『行业』字段)。取不到返回空串、绝不臆造。
-        用于因子选股把『在整个篮子里的估值分位』升级为『同行业内分位』(不同行业估值中枢差异大)。"""
+    def fetch_name_industry(code: str, bypass_proxy: bool = True) -> Dict[str, str]:
+        """**一次调用**东财 stock_individual_info_em 同时取『股票简称 + 行业』(两个字段本就在同一张表里)。
+        因子选股此前分别调两次→翻倍触发限流导致都取不到；合并成一次更稳。取不到返回空串、绝不臆造。"""
+        out = {"name": "", "industry": ""}
         try:
             ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
             with ctx:
                 info = StockDataFetcher._retry(lambda: ak.stock_individual_info_em(symbol=code), tries=2)
             m = info.set_index(info.columns[0])[info.columns[1]].to_dict()
             for k, v in m.items():
-                if "行业" in str(k):
-                    return str(v).strip()
+                ks = str(k)
+                if not out["name"] and "简称" in ks:
+                    out["name"] = str(v).strip()
+                if not out["industry"] and "行业" in ks:
+                    out["industry"] = str(v).strip()
         except Exception:
             pass
-        return ""
+        return out
+
+    @staticmethod
+    def fetch_industry(code: str, bypass_proxy: bool = True) -> str:
+        """获取个股所属行业(单取；批量场景请用 fetch_name_industry 一次拿名+行业以省接口调用)。"""
+        return StockDataFetcher.fetch_name_industry(code, bypass_proxy).get("industry", "")
 
     @staticmethod
     def fetch_realtime_fundflow(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
@@ -3493,7 +3502,8 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
         try:
             df = StockDataFetcher().fetch(code, start, end)
             df, _ = StockDataFetcher.enrich(df, code, True, False, True, False, False)  # 估值+资金
-            name = StockDataFetcher.fetch_stock_name(code)
+            ni = StockDataFetcher.fetch_name_industry(code)      # 一次调用取名+行业(省接口、防限流)
+            name, industry = ni["name"], ni["industry"]
             close = pd.to_numeric(df["close"], errors="coerce")
             lc = float(close.iloc[-1])
             def last(col):
@@ -3514,7 +3524,6 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             if use_quality:
                 q = StockDataFetcher.fetch_quality(code)
                 roe, rev_g, fscore = q.get("roe"), q.get("rev_growth"), q.get("f_score")
-            industry = StockDataFetcher.fetch_industry(code)     # 行业(取不到=空串)，用于行业内估值分位
             warns = assess_risks(code, name, df, news=None)
             recs.append({"code": code, "name": name, "last_close": round(lc, 2), "industry": industry,
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
