@@ -4126,6 +4126,59 @@ def stock_character(close) -> Dict[str, Any]:
     return out
 
 
+def fetch_macro_snapshot(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """中国宏观经济快照(GDP/CPI/PPI/PMI/M2/LPR)——**仅作研究背景，绝不接入训练特征**。
+    数据来自 akshare(国家统计局/金十)免费接口；取不到的指标自动跳过、绝不臆造。
+    ⚠ 诚实红线：①宏观数据低频(季/月)、且**发布滞后 2-4 周**，直接喂日频模型=前视泄漏+信息冗余；
+    ②故本模块只画趋势供人判断大环境，不参与任何预测训练。"""
+    log = progress_cb or (lambda m: None)
+    out: Dict[str, Any] = {}
+    if not HAS_AKSHARE:
+        return out
+    # (显示名, akshare 函数名候选, 值列关键词优先级)
+    specs = [
+        ("GDP 同比%", ["macro_china_gdp_yearly", "macro_china_gdp"], ["同比", "现值", "今值"]),
+        ("CPI 同比%", ["macro_china_cpi_yearly", "macro_china_cpi"], ["同比", "现值", "今值", "全国"]),
+        ("PPI 同比%", ["macro_china_ppi_yearly", "macro_china_ppi"], ["同比", "现值", "今值"]),
+        ("制造业 PMI", ["macro_china_pmi_yearly", "macro_china_pmi"], ["制造业", "现值", "今值", "pmi"]),
+        ("M2 同比%", ["macro_china_money_supply"], ["m2", "货币和准货币", "同比"]),
+        ("LPR 1年%", ["macro_china_lpr"], ["1年", "lpr_1y", "1Y"]),
+    ]
+    for disp, fns, valkw in specs:
+        fn = next((getattr(ak, n, None) for n in fns if getattr(ak, n, None)), None)
+        if fn is None:
+            continue
+        try:
+            with _no_proxy():
+                d = StockDataFetcher._retry(fn, tries=2)
+            if d is None or len(d) == 0:
+                continue
+            cols = [str(c) for c in d.columns]
+            # 日期列：名字含 日期/月份/时间/date，或第一列
+            dcol = next((c for c in cols if any(k in c.lower() for k in ("日期", "月份", "时间", "date", "年月"))), cols[0])
+            # 值列：按关键词优先，找不到就取最后一个数值列
+            vcol = None
+            for kw in valkw:
+                vcol = next((c for c in cols if kw.lower() in c.lower()), None)
+                if vcol is not None:
+                    break
+            if vcol is None:
+                numeric = [c for c in cols if c != dcol and pd.to_numeric(d[c], errors="coerce").notna().any()]
+                vcol = numeric[-1] if numeric else None
+            if vcol is None:
+                continue
+            ser = pd.DataFrame({"date": pd.to_datetime(d[dcol], errors="coerce"),
+                                "val": pd.to_numeric(d[vcol], errors="coerce")}).dropna()
+            ser = ser.sort_values("date").tail(24)
+            if len(ser) >= 2:
+                out[disp] = {"dates": list(ser["date"]), "vals": list(ser["val"]),
+                             "latest": float(ser["val"].iloc[-1]), "col": vcol}
+                log(f"[宏观] {disp}: 最新 {out[disp]['latest']}")
+        except Exception as e:
+            log(f"[宏观] {disp} 取数跳过：{str(e)[:40]}")
+    return out
+
+
 def da_significance(da_pct: Optional[float], n: int) -> Dict[str, Any]:
     """判断方向准确率 DA 是否**显著**高于 50%(抛硬币)。用单侧二项检验的正态近似算 p 值。
     返回 {p, sig, text}：p 越小越显著；sig=True 表示 p<0.05 可认为真比蒙的强。
@@ -6094,7 +6147,13 @@ if HAS_PYSIDE6:
             self.pf_ic_btn.setStyleSheet("font-weight:bold;padding:5px;")
             self.pf_ic_btn.setToolTip("验证『动量/反转/低波动』等选股因子在这批股票上历史到底有没有用(纯价格因子,无泄漏)。")
             self.pf_ic_btn.clicked.connect(self._on_factor_ic)
-            row2.addWidget(self.pf_ic_btn); row2.addStretch()
+            row2.addWidget(self.pf_ic_btn)
+            self.macro_btn = QPushButton("🌐 宏观快照(GDP/CPI/PMI/M2)")
+            self.macro_btn.setToolTip("拉中国宏观经济数据画趋势图，看大环境。仅研究背景，"
+                                      "有发布滞后(前视风险)故不入训练特征。")
+            self.macro_btn.clicked.connect(self._on_macro)
+            row2.addWidget(self.macro_btn)
+            row2.addStretch()
             layout.addLayout(row2)
             self.pf_ic_view = QTextBrowser()
             self.pf_ic_view.setMinimumHeight(160)
@@ -6249,6 +6308,38 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "IC检验失败", str(e))
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.pf_ic_btn.setEnabled(True)
+
+        def _on_macro(self):
+            self.macro_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._prog_open("⏳ 拉取中国宏观经济数据(GDP/CPI/PMI/M2)…"); QApplication.processEvents()
+            try:
+                mac = fetch_macro_snapshot(progress_cb=self._log)
+                if not mac:
+                    QMessageBox.information(self, "提示", "宏观数据本次取不到(akshare接口/网络波动)，下次再试；绝不用假数据。"); return
+                names = list(mac.keys())
+                n = len(names)
+                cols = 2; rows = (n + 1) // 2
+                fig = Figure(figsize=(9, 2.6 * rows))
+                for i, nm in enumerate(names):
+                    ax = fig.add_subplot(rows, cols, i + 1)
+                    d = mac[nm]
+                    ax.plot(d["dates"], d["vals"], color="#2c6fbb", marker="o", ms=3, lw=1.3)
+                    ax.axhline(0, color="#999", lw=0.6)
+                    ax.set_title(f"{nm}  最新={d['latest']:.2f}", fontsize=9)
+                    ax.grid(True, alpha=0.25); ax.tick_params(labelsize=7)
+                fig.suptitle("中国宏观经济趋势（仅研究背景·不入训练特征·数据有发布滞后）", fontsize=10, color="#c0392b")
+                fig.tight_layout(rect=(0, 0, 1, 0.96))
+                self._show_fig_dialog(fig, "宏观经济快照")
+                summ = "　｜　".join(f"{nm} {mac[nm]['latest']:.2f}" for nm in names)
+                self._oplog(f"宏观快照：{summ}")
+                QMessageBox.information(self, "宏观经济快照",
+                    summ + "\n\n⚠ 宏观数据低频且发布滞后2-4周，若直接喂日频模型=前视泄漏+信息冗余；"
+                    "故本模块只画趋势供你判断大环境(牛/熊/景气)，不参与任何预测训练。非投资建议。")
+            except Exception as e:
+                QMessageBox.critical(self, "宏观取数失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.macro_btn.setEnabled(True)
 
         def _on_kelly(self):
             try:
