@@ -111,8 +111,20 @@ stock-predictor/
 ├── PROJECT.md           # 5分钟工程总览
 ├── AGENTS.md            # 给 AI 协作者的改代码指南（含"不可触碰的红线"）
 ├── requirements.txt     # 依赖（分层，缺可选项自动降级）
+├── Dockerfile           # 命令行/定时任务用镜像（Linux/Docker）
+├── scripts/daily_verify.sh  # 每日自动核对到期预测的 Bash 脚本（可挂 cron）
 └── .gitignore           # 行情缓存/快照/预测日志/报告 等本地产物不入库
 ```
+
+## 🐳 工程化 / 自动化（Linux · Docker · 定时任务）
+```bash
+# Docker 命令行冒烟
+docker build -t stock-predictor . && docker run --rm stock-predictor --cli --synthetic --algos "RF,SVR,GBRT"
+# 每交易日 15:30 自动核对到期预测(收盘后)，写进真实准确率——挂到 crontab：
+30 15 * * 1-5  /path/to/stock-predictor/scripts/daily_verify.sh >> verify.log 2>&1
+```
+> **北交所支持**：4/8/9 开头的北交所代码(如 `920087`)已正确识别——只用 akshare(原生支持)、跳过不支持北交所的 baostock，
+> 并对 akshare 限流(RemoteDisconnected)做更长退避。反数据泄漏自查清单见 [AGENTS.md](AGENTS.md) 第 2b 节。
 
 ---
 

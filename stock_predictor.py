@@ -278,6 +278,21 @@ class StockDataFetcher:
         df = fetcher.fetch("600519", "20200101", "20241231")   # 贵州茅台
     """
 
+    @staticmethod
+    def _is_bj_code(code: str) -> bool:
+        """北交所股票代码判断：4/8/9 开头（覆盖 430/830/870/920 等常见细分前缀）。
+        baostock 不支持北交所数据，识别出北交所代码后应直接跳过 baostock、只用 akshare。"""
+        c = str(code).strip()
+        return c.startswith(("4", "8", "9"))
+
+    @staticmethod
+    def _is_akshare_rate_limit_error(e: Exception) -> bool:
+        """识别 akshare(东方财富) 的短时限流特征错误(命中时应等更久再重试)：
+        RemoteDisconnected / Connection aborted / Connection reset 等被服务器主动掐连的特征。"""
+        s = str(e).lower()
+        return any(k in s for k in ("remotedisconnected", "connection aborted",
+                                    "connection reset", "remote end closed", "max retries"))
+
     # ---------- 3.1 拉取真实历史行情（多源自动容错）----------
     def fetch(self, code: str, start_date: str, end_date: str,
               adjust: str = "qfq", use_cache: bool = True,
@@ -312,6 +327,10 @@ class StockDataFetcher:
             providers = [("akshare(东方财富)", self._fetch_akshare)]
         elif source == "baostock":
             providers = [("baostock", self._fetch_baostock)]
+        elif self._is_bj_code(code):
+            # 北交所代码(920087等)：baostock 不支持(会报"股票代码未标识sh或sz"的误导性错误)，
+            # 直接跳过，只用 akshare(东方财富)——它已原生支持北交所行情，免费无需注册。
+            providers = [("akshare(东方财富)", self._fetch_akshare)]
         else:                       # auto：东方财富优先，失败自动切 baostock
             providers = [("akshare(东方财富)", self._fetch_akshare),
                          ("baostock", self._fetch_baostock)]
@@ -335,7 +354,12 @@ class StockDataFetcher:
                 except Exception as e:
                     errors.append(f"{name}(第{attempt}次): {e}")
                     if attempt < retries:
-                        time.sleep(1.0 * attempt)     # 递增退避，缓解服务器瞬时限流/掐连
+                        if name.startswith("akshare") and self._is_akshare_rate_limit_error(e):
+                            wait_s = 45.0 * attempt      # 限流冷却窗口远长于瞬时抖动，需等更久(45/90秒)
+                            print(f"[akshare限流] 第{attempt}次被限流，等待{wait_s:.0f}秒后重试...")
+                            time.sleep(wait_s)
+                        else:
+                            time.sleep(1.0 * attempt)    # 普通瞬时抖动：递增退避 1/2 秒
 
         # ---- 3.1.3 全部数据源失败：给出清晰、可操作的报错 ----
         hint = ""
