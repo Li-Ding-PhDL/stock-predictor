@@ -30,3 +30,4 @@ catboost>=1.2           # CatBoost
 gplearn>=0.4            # 符号回归 SR / GEP / MEP 近似
 torch>=2.0              # LSTM/GRU/Transformer/CNN/DNN/ResNet/BPNet 等深度学习(下载较大)
 pytorch-tabnet>=4.0     # TabNet（缺失则用 DNN 近似替代）
+backtrader>=1.9            # 可选：第三方回测框架，用于交叉验证自研回测(缺失自动降级)
