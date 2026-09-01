@@ -84,6 +84,30 @@ pip install -r requirements.txt
 ```
 最小可跑（不含深度学习/符号回归）：`numpy pandas scikit-learn matplotlib pyarrow requests PySide6 akshare baostock`
 
+<details><summary><b>📦 完整依赖清单（py 里实际用到的全部第三方库，点击展开）</b></summary>
+
+| 库 | 用途 | 是否必装 |
+|---|---|---|
+| **numpy / pandas** | 数值计算 / 数据处理（整条流水线的基础） | ✅ 必装 |
+| **scikit-learn** | 大部分机器学习算法(RF/GBRT/SVR/GPR/KNN/Lasso/Ridge/ElasticNet/PLSR/KernelRidge/MLP/DecisionTree/KMeans) + 指标(r2_score) + 标准化/KFold | ✅ 必装 |
+| **matplotlib** | 全部图表(K线/预测/回测/热力图/消融/宏观/IC 等) | ✅ 必装 |
+| **pyarrow** | 行情数据本地 parquet 缓存(`df.to_parquet`) | ✅ 必装 |
+| **requests** | 主力资金流/实时资金/东财直连 API(带浏览器头) | ✅ 必装 |
+| **PySide6** | 图形界面（只用命令行 `--cli` 可不装） | 🖥️ GUI 必装 |
+| **akshare** | 东财行情/资金流/新闻/估值/北向/交易日历/行业/宏观 等真实数据 | ✅ 强烈建议 |
+| **baostock** | 国内稳定备用行情源（东财拉不到自动切换；北交所不支持由 akshare 兜底） | ✅ 强烈建议 |
+| **statsmodels** | ARIMA 经典统计时序模型 | 🔸 建议 |
+| **optuna** | 贝叶斯超参优化 BO（默认推荐；缺失退化为随机搜索） | 🔸 建议 |
+| **arch** | GARCH(1,1) 波动率建模（预测置信区间；缺失自动退回 EWMA） | 🔹 可选 |
+| **xgboost / lightgbm / catboost** | 三大梯度提升算法 | 🔹 可选(缺则该算法置灰) |
+| **gplearn** | 符号回归 SR（也用于 GEP/MEP 近似） | 🔹 可选 |
+| **torch** | LSTM/GRU/Transformer/CNN/DNN/ResNet/BPNet/RBFNet 等深度学习（下载较大） | 🔹 可选 |
+| **pytorch-tabnet** | TabNet（缺失则用 DNN 近似替代） | 🔹 可选 |
+| **backtrader** | 第三方回测框架，用于交叉验证自研回测（缺失自动降级） | 🔹 可选 |
+
+> 标 🔹 可选的库缺失时软件会**自动降级、不崩溃**（对应算法/功能置灰或退回替代实现）。装齐全部即 `pip install -r requirements.txt`。
+</details>
+
 ### 图形界面
 ```bash
 python stock_predictor.py
