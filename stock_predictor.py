@@ -922,6 +922,22 @@ class StockDataFetcher:
         return ""
 
     @staticmethod
+    def fetch_industry(code: str, bypass_proxy: bool = True) -> str:
+        """获取个股所属行业(东财 stock_individual_info_em 的『行业』字段)。取不到返回空串、绝不臆造。
+        用于因子选股把『在整个篮子里的估值分位』升级为『同行业内分位』(不同行业估值中枢差异大)。"""
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx:
+                info = StockDataFetcher._retry(lambda: ak.stock_individual_info_em(symbol=code), tries=2)
+            m = info.set_index(info.columns[0])[info.columns[1]].to_dict()
+            for k, v in m.items():
+                if "行业" in str(k):
+                    return str(v).strip()
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
     def fetch_realtime_fundflow(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
         """实时主力资金快照(今日累计)：东财实时行情 push2.eastmoney.com f62/f184/f66.../f184。
         返回 {main_net(主力净流入元), main_pct(净占比%), xl/l/m/s_net(超大/大/中/小单净额)}。
@@ -3407,8 +3423,9 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             if use_quality:
                 q = StockDataFetcher.fetch_quality(code)
                 roe, rev_g, fscore = q.get("roe"), q.get("rev_growth"), q.get("f_score")
+            industry = StockDataFetcher.fetch_industry(code)     # 行业(取不到=空串)，用于行业内估值分位
             warns = assess_risks(code, name, df, news=None)
-            recs.append({"code": code, "name": name, "last_close": round(lc, 2),
+            recs.append({"code": code, "name": name, "last_close": round(lc, 2), "industry": industry,
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
                          "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
                          "vol60": vol60, "roe": roe, "rev_growth": rev_g, "f_score": fscore,
@@ -3427,8 +3444,21 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             return r
         pe = [r["pe"] if (r["pe"] and r["pe"] > 0) else np.nan for r in ok]     # 亏损/无PE不参与价值分
         pb = [r["pb"] if (r["pb"] and r["pb"] > 0) else np.nan for r in ok]
-        v_pe, v_pb = pct(pe, False), pct(pb, False)                            # PE/PB 越低越好
+        v_pe, v_pb = pct(pe, False), pct(pb, False)                            # PE/PB 越低越好(全篮子)
         s_val = pd.concat([v_pe, v_pb], axis=1).mean(axis=1)
+        # 行业内估值分位(借鉴 JD)：同行业内 PE/PB 越低越好——不同行业估值中枢差异大，同业比才公平。
+        # 某行业在篮子里≥3只时，该行业成员的价值分改用『行业内分位』；不足则保留全篮子分位。
+        inds = pd.Series([r.get("industry") or "" for r in ok])
+        for ind, idxs in inds.groupby(inds).groups.items():
+            idxs = list(idxs)
+            if ind and len(idxs) >= 3:
+                gpe = pct([pe[i] for i in idxs], False).values
+                gpb = pct([pb[i] for i in idxs], False).values
+                for j, i in enumerate(idxs):
+                    vv = np.nanmean([gpe[j], gpb[j]])
+                    if not np.isnan(vv):
+                        s_val.iloc[i] = vv
+                        ok[i]["val_in_industry"] = True
         s_mom = pct([r["mom3m"] for r in ok], True)                            # 动量越高越好
         s_mon = pct([r["mf5"] for r in ok], True)                             # 资金流入越多越好
         # 质量：ROE + 营收增速 + Piotroski F-Score 三者百分位取平均(有几个算几个)；低波动：波动率越低越好
@@ -5967,7 +5997,7 @@ if HAS_PYSIDE6:
         def _on_factor_finished(self, rows):
             self._batch_rows = rows                 # 复用导出
             self._batch_reset_btn()
-            headers = ["排名", "代码", "名称", "最新价", "综合分", "价值分", "动量分", "资金分",
+            headers = ["排名", "代码", "名称", "行业", "最新价", "综合分", "价值分", "动量分", "资金分",
                        "质量分", "低波动分", "近3月%", "风险数", "主要风险"]
             self.batch_table.setColumnCount(len(headers))
             self.batch_table.setHorizontalHeaderLabels(headers)
@@ -5980,7 +6010,8 @@ if HAS_PYSIDE6:
                     continue
                 rank += 1
                 m3 = r.get("mom3m")
-                vals = [str(rank), r["code"], r.get("name", ""), f"{r.get('last_close','')}",
+                vind = (r.get("industry") or "-") + ("*" if r.get("val_in_industry") else "")
+                vals = [str(rank), r["code"], r.get("name", ""), vind, f"{r.get('last_close','')}",
                         f"{r.get('score','')}", f"{r.get('value_score','') or '-'}",
                         f"{r.get('mom_score','') or '-'}", f"{r.get('money_score','') or '-'}",
                         f"{r.get('qual_score','') or '-'}", f"{r.get('lowvol_score','') or '-'}",
@@ -5988,7 +6019,7 @@ if HAS_PYSIDE6:
                         str(r.get("risk_n", "")), r.get("risk_top", "")]
                 for c, v in enumerate(vals):
                     it = QTableWidgetItem(str(v))
-                    if c == 11 and r.get("risk_n", 0) > 0:      # "风险数"列
+                    if c == 12 and r.get("risk_n", 0) > 0:      # "风险数"列(加了"行业"列后+1)
                         it.setForeground(Qt.red)
                     self.batch_table.setItem(i, c, it)
             self.batch_table.resizeColumnsToContents()
