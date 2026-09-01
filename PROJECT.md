@@ -74,6 +74,11 @@ python stock_predictor.py --cli --code 600519 --week --backtest   # 命令行(�
 - [ ] 真·舆情情绪（新闻 NLP，须真抓不臆造）
 - [ ] 组合层面回测 / 行业中性；龙虎榜 / 融资融券 / 解禁日历因子
 
+## 对齐量化行业技术标准（参考量化招聘 JD 技术要求）
+数据处理/可视化(热力图/IC/消融/宏观图)/**回测框架(自研+独立复算+Backtrader三方交叉验证)**/算法统计/
+**行业划分(行业内估值分位)**/交易规则(涨跌停·T+1·停牌·真实交易日历)/**北交所代码识别**/宏观分析(仅研究不入训练)/
+**Linux·Docker·Bash自动化**/**反数据泄漏Checklist**——逐条工程化落地，均可运行可复现，详见 README「对齐量化行业技术标准」节。
+
 ## 借鉴的开源 Skills（致谢，仅参考公开方法学、未复制代码）
 - **staskh/trading_skills**：Piotroski F-Score、财报披露日历
 - **yennanliu/InvestSkill**：基本面结构化分析(Piotroski/质量)
