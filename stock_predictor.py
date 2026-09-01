@@ -4837,8 +4837,17 @@ if HAS_PYSIDE6:
             # 批量扫描：多股批量 取数→训练→预测→风险
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
+            self.tabs.currentChanged.connect(self._on_tab_changed)
 
             main_layout.addWidget(self.tabs, stretch=1)
+
+        def _on_tab_changed(self, idx):
+            """进入『预测跟踪』页时，自动把模型下拉跳到 DA 最高的模型。"""
+            try:
+                if self.tabs.tabText(idx) == "预测跟踪":
+                    self._auto_select_best_da(notify=False)
+            except Exception:
+                pass
 
         # ---- 9.2.1b 行情 K 线图标签页 ----
         def _build_kline_tab(self) -> QWidget:
@@ -5060,8 +5069,42 @@ if HAS_PYSIDE6:
             layout.addWidget(split, stretch=1)
             return panel
 
+        def _best_da_model(self):
+            """返回当前『DA 方向准确率最高』的模型名：优先用已训练结果的测试DA；
+            没训练则退回预测跟踪里已验证记录的真实DA(prediction_postmortem)；都没有返回 None。"""
+            cand = [(r.algo_name, r.metrics.get("DA")) for r in getattr(self, "results", [])
+                    if not r.error and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)")
+                    and r.metrics.get("DA") is not None]
+            if cand:
+                return max(cand, key=lambda x: x[1])
+            try:
+                pm = prediction_postmortem()
+                if pm.get("enough") and pm.get("by_model"):
+                    m, da, n = pm["by_model"][0]      # 已按 DA 降序
+                    return (m, da)
+            except Exception:
+                pass
+            return None
+
+        def _auto_select_best_da(self, notify=False):
+            """把**所有**模型下拉(预测跟踪/未来预测/策略回测/机器学习内部)自动跳到 DA 最高的模型
+            (用户要求：点运行后全部自动跳转为 DA 最大的模型)。"""
+            best = self._best_da_model()
+            if not best:
+                return
+            name, da = best
+            combos = [getattr(self, n, None) for n in
+                      ("trk_model_combo", "fc_model_combo", "bt_model_combo", "mldata_model_combo")]
+            switched = False
+            for cb in combos:
+                if cb is not None and cb.findText(name) >= 0:
+                    cb.setCurrentText(name); switched = True
+            if switched and notify:
+                self._oplog(f"已自动把所有模型下拉切到 DA 最高的模型 {name}（DA={da}%）。")
+
         def _refresh_model_combos(self):
             """训练完成后，把成功训练的模型名填进『机器学习内部』的下拉(供查看详情)。"""
+            self._auto_select_best_da(notify=True)       # 训练完自动把预测跟踪切到DA最高的模型
             if not hasattr(self, "mldata_model_combo"):
                 return
             names = [r.algo_name for r in getattr(self, "results", []) if not r.error]
@@ -5069,7 +5112,11 @@ if HAS_PYSIDE6:
             self.mldata_model_combo.blockSignals(True)
             self.mldata_model_combo.clear()
             self.mldata_model_combo.addItems(names)
-            if cur in names:
+            # 机器学习内部的下拉也默认选DA最高的
+            best = self._best_da_model()
+            if best and best[0] in names:
+                self.mldata_model_combo.setCurrentText(best[0])
+            elif cur in names:
                 self.mldata_model_combo.setCurrentText(cur)
             self.mldata_model_combo.blockSignals(False)
             self._on_view_model_detail()
