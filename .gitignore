@@ -31,6 +31,8 @@ predictions/
 # ---- 生成的报告(本地产物，不入库) ----
 报告_*.html
 *.html
+# 教程 HTML 例外：手写的使用教程随代码入库
+!stock-predictor使用教程*.html
 
 # ---- 借鉴的外部 skill 参考资料（第三方，不入库）----
 股票预测skill借鉴/
