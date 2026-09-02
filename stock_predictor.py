@@ -62,6 +62,7 @@ import argparse                # 命令行/无界面模式参数解析（方便�
 import time                    # 计时、生成随机种子
 import warnings                # 屏蔽第三方库的冗余警告信息
 import contextlib              # 临时忽略系统代理时用到的上下文管理器
+import sqlite3                 # 预测跟踪记录存储（内置，无需安装）
 import datetime as dt          # 日期处理（股票行情按日期索引）
 from abc import ABC, abstractmethod            # 定义模型统一接口的抽象基类
 from dataclasses import dataclass, field       # 简化配置类的书写
@@ -206,7 +207,8 @@ MONITOR_DIR = os.path.join(BASE_DIR, "monitor_log")   # 实时监控的盘口快
 os.makedirs(MONITOR_DIR, exist_ok=True)
 PRED_DIR = os.path.join(BASE_DIR, "predictions")      # 预测跟踪：保存每次预测，等日期到了对比真实股价
 os.makedirs(PRED_DIR, exist_ok=True)
-PRED_LOG = os.path.join(PRED_DIR, "pred_log.csv")
+PRED_LOG = os.path.join(PRED_DIR, "pred_log.csv")     # 旧 CSV 路径（仅用于一次性迁移，新数据写 SQLite）
+PRED_DB  = os.path.join(PRED_DIR, "pred_log.db")      # SQLite 数据库：结构化存储，支持 SQL 查询
 
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
@@ -437,6 +439,7 @@ class StockDataFetcher:
     def enrich(df: pd.DataFrame, code: str, want_valuation: bool = True,
                want_index: bool = True, want_fundflow: bool = True,
                want_us: bool = True, want_northbound: bool = True,
+               want_block_trading: bool = True,
                bypass_proxy: bool = True) -> Tuple[pd.DataFrame, Dict[str, str]]:
         """
         把日线行情 df 用"按日期对齐(merge_asof 向后取最近已知值，无未来泄露)"的方式，
@@ -498,6 +501,18 @@ class StockDataFetcher:
                 status["northbound"] = f"跳过(取数失败: {e})"
         elif want_northbound:
             status["northbound"] = "跳过(未安装 akshare)"
+        if want_block_trading and HAS_AKSHARE:
+            try:
+                bt = _nsdate(StockDataFetcher._fetch_block_trading(code, bypass_proxy))
+                if len(bt) > 0:
+                    df = pd.merge_asof(df, bt, on="date", direction="backward")
+                    status["block_trading"] = f"已接入(大宗交易, {len(bt)}行)"
+                else:
+                    status["block_trading"] = "跳过(该股无大宗交易记录)"
+            except Exception as e:
+                status["block_trading"] = f"跳过(取数失败: {e})"
+        elif want_block_trading:
+            status["block_trading"] = "跳过(未安装 akshare)"
         return df.reset_index(drop=True), status
 
     @staticmethod
@@ -883,6 +898,82 @@ class StockDataFetcher:
         return nb.dropna(subset=["date"]).sort_values("date")
 
     @staticmethod
+    def _fetch_block_trading(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
+        """大宗交易数据（akshare stock_dzjy_detail）→ 按日聚合折溢率/成交额/笔数。
+        字段前缀 bt_，外部数据向后对齐(merge_asof backward)，无未来泄露。
+        数据含义：溢价(bt_premium>0)=机构溢价买入(偏看多)；折价(<0)=机构甩卖或内部转让(偏看空)。"""
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        c = code.split(".")[0] if "." in code else code
+        with ctx:
+            raw = StockDataFetcher._retry(lambda: ak.stock_dzjy_detail(symbol=c), tries=2)
+        if raw is None or len(raw) == 0:
+            return pd.DataFrame()
+        # 统一列名：不同版本akshare列名略有差异
+        col_map = {}
+        for col in raw.columns:
+            cs = str(col)
+            if "日期" in cs or cs.lower() in ("date", "trade_date"):
+                col_map[col] = "date"
+            elif "折溢率" in cs or "溢价率" in cs or "折价率" in cs:
+                col_map[col] = "bt_premium"
+            elif "成交额" in cs or "成交金额" in cs:
+                col_map[col] = "bt_amount"
+            elif "成交量" in cs and "均" not in cs:
+                col_map[col] = "bt_volume"
+            elif "成交价" in cs:
+                col_map[col] = "bt_price"
+            elif "收盘" in cs:
+                col_map[col] = "bt_close"
+        raw = raw.rename(columns=col_map)
+        if "date" not in raw.columns:
+            return pd.DataFrame()
+        raw["date"] = pd.to_datetime(raw["date"], errors="coerce").astype("datetime64[ns]")
+        # 若无折溢率列，用成交价/收盘价自行计算（参照参考代码：premium=(成交价/收盘-1)*100）
+        if "bt_premium" not in raw.columns and "bt_price" in raw.columns and "bt_close" in raw.columns:
+            raw["bt_premium"] = (pd.to_numeric(raw["bt_price"], errors="coerce") /
+                                 (pd.to_numeric(raw["bt_close"], errors="coerce") + 1e-9) - 1) * 100
+        for c2 in ["bt_premium", "bt_amount", "bt_volume"]:
+            if c2 in raw.columns:
+                raw[c2] = pd.to_numeric(raw[c2], errors="coerce")
+        # 按日聚合：折溢率取均值（代表当日机构整体情绪）、金额/量取合计、笔数计数
+        agg: Dict[str, Any] = {}
+        if "bt_premium" in raw.columns:
+            agg["bt_premium"] = "mean"
+        if "bt_amount" in raw.columns:
+            agg["bt_amount"] = "sum"
+        if "bt_volume" in raw.columns:
+            agg["bt_volume"] = "sum"
+        raw["bt_count"] = 1
+        agg["bt_count"] = "sum"
+        daily = raw.dropna(subset=["date"]).groupby("date").agg(agg).reset_index()
+        return daily.sort_values("date")
+
+    @staticmethod
+    def fetch_block_trading_display(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
+        """对外展示用（GUI大宗交易历史）：返回含原始明细字段的完整 DataFrame，不做聚合。"""
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            c = code.split(".")[0] if "." in code else code
+            with ctx:
+                raw = StockDataFetcher._retry(lambda: ak.stock_dzjy_detail(symbol=c), tries=2)
+            if raw is None or len(raw) == 0:
+                return pd.DataFrame()
+            # 统一关键列名（用于排序）
+            col_map = {}
+            for col in raw.columns:
+                cs = str(col)
+                if "日期" in cs:
+                    col_map[col] = "交易日期"
+                elif "折溢率" in cs:
+                    col_map[col] = "折溢率(%)"
+            raw = raw.rename(columns=col_map)
+            if "交易日期" in raw.columns:
+                raw = raw.sort_values("交易日期", ascending=False)
+            return raw.reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
     def fetch_news(code: str, limit: int = 15, bypass_proxy: bool = True) -> pd.DataFrame:
         """真实个股新闻(仅供展示/近期参考)：akshare stock_news_em，数据源=东方财富。
         注意：新闻接口只覆盖近期，且把文本转成可靠的历史情绪分数需要 NLP 模型；为避免臆造，
@@ -1056,7 +1147,7 @@ class FeatureEngineer:
     整体流程： 原始行情 -> 计算技术指标 -> 标准化 -> 滑动窗口切片 -> 训练/测试切分
     """
 
-    def __init__(self, window_size: int = 20, horizon: int = 1, target_mode: str = "price"):
+    def __init__(self, window_size: int = 20, horizon: int = 1, target_mode: str = "return"):
         self.window_size = window_size      # 滑动窗口长度（用过去多少天预测未来）
         self.horizon = horizon              # 预测未来第几天
         self.target_mode = target_mode      # "price"=预测收盘价水平 / "return"=预测涨跌幅(更诚实)
@@ -1159,12 +1250,92 @@ class FeatureEngineer:
             if "mf_main_pct" in df.columns:
                 df["mf_pct5"] = pd.to_numeric(df["mf_main_pct"], errors="coerce").rolling(5).mean()
 
+        # ---- 4.1.11 支撑/压力位、布林带宽、尾盘强弱、MACD 信号 ----
+        # 支撑位：近20日最低价；压力位：近20日最高价（简单有效的短期参考位）
+        df["support_20d"]  = df["low"].rolling(20).min()
+        df["resist_20d"]   = df["high"].rolling(20).max()
+        # 收盘价距支撑/压力的比例距离（>0 代表已上穿；<0 代表已下破）
+        df["dist_to_support"]  = (df["close"] - df["support_20d"])  / (df["support_20d"]  + 1e-9)
+        df["dist_to_resist"]   = (df["resist_20d"]  - df["close"])  / (df["close"] + 1e-9)
+        # 轴心点（Pivot Point）：(最高+最低+收盘)/3，经典压力/支撑参考
+        df["pivot"] = (df["high"] + df["low"] + df["close"]) / 3.0
+        # 布林带宽（Bandwidth）：带越窄=缩口(蓄势)，越宽=扩口(趋势加速或波动率飙升)
+        df["boll_width"] = (df["boll_upper"] - df["boll_lower"]) / (df["boll_mid"] + 1e-9)
+        # 价格在布林带内的位置（0=贴下轨，1=贴上轨）
+        df["boll_pos"] = (df["close"] - df["boll_lower"]) / (df["boll_upper"] - df["boll_lower"] + 1e-9)
+        # 尾盘强弱（Tail Strength）：收盘在日内高低区间的位置
+        #   → 接近1 = 强势尾盘（全天低点回升，尾盘买盘旺，次日跳高可能性更大）
+        #   → 接近0 = 弱势尾盘（全天高点回落，尾盘抛压重，次日低开概率更大）
+        df["tail_strength"] = (df["close"] - df["low"]) / (df["high"] - df["low"] + 1e-9)
+        # 近5日平均尾盘强弱（平滑单日噪音）
+        df["tail_strength_5d"] = df["tail_strength"].rolling(5).mean()
+        # MACD 金叉/死叉信号：柱状值从负转正=金叉(+1)，从正转负=死叉(-1)，其余=0
+        hist_sign = np.sign(df["macd_hist"].fillna(0.0))
+        df["macd_cross"] = hist_sign.diff().fillna(0.0)   # +2=金叉, -2=死叉, 0=无信号
+        df["macd_cross"] = df["macd_cross"].clip(-1, 1)   # 归一化到[-1,0,+1]
+
+        # ---- 4.1.12 BIAS乖离率 / 均线多头排列 / 连续放量天数 ----
+        # BIAS(N) = (收盘 - MA(N)) / MA(N) * 100，反映价格偏离均线程度
+        close = pd.to_numeric(df["close"], errors="coerce")   # 此处 close 仅供 4.1.12 节使用
+        for n, ma_col in [(5, "ma5"), (20, "ma20")]:
+            if ma_col in df.columns:
+                ma_s = pd.to_numeric(df[ma_col], errors="coerce")
+                df[f"bias_{n}"] = (close - ma_s) / (ma_s + 1e-9) * 100
+        # 均线多头排列信号：MA5>MA10>MA20>MA60 全部满足=1(强多头)，全部反向=-1(强空头)，其余=0
+        def _ma_bull(row):
+            m5  = row.get("ma5",  np.nan)
+            m10 = row.get("ma10", np.nan)
+            m20 = row.get("ma20", np.nan)
+            m60 = row.get("ma60", np.nan)
+            vals = [v for v in [m5, m10, m20, m60] if pd.notna(v)]
+            if len(vals) < 2:
+                return 0.0
+            if all(vals[i] > vals[i+1] for i in range(len(vals)-1)):
+                return 1.0
+            if all(vals[i] < vals[i+1] for i in range(len(vals)-1)):
+                return -1.0
+            return 0.0
+        ma_cols = [c for c in ["ma5","ma10","ma20","ma60"] if c in df.columns]
+        if ma_cols:
+            df["ma_bull_rank"] = df[ma_cols].apply(_ma_bull, axis=1)
+        # 连续放量天数：每日成交量>前一日则计数累加，否则归零
+        vol_s = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        vol_up = (vol_s > vol_s.shift(1)).astype(int)
+        expand = []
+        cnt = 0
+        for v in vol_up:
+            cnt = cnt + 1 if v else 0
+            expand.append(cnt)
+        df["vol_expand_days"] = expand
+        # 当日量比(已有 vol_ratio)，再加布尔标记：量比>1
+        if "vol_ratio" in df.columns:
+            df["vol_ratio_active"] = (pd.to_numeric(df["vol_ratio"], errors="coerce") > 1).astype(float)
+
+        # ---- 4.1.13 大宗交易衍生特征（仅当已接入 bt_* 列时计算）----
+        # 参照AmazingData大宗交易字段：折溢率(bt_premium)、成交额(bt_amount)、笔数(bt_count)
+        # 溢价>0=机构溢价买入(偏看多)；折价<0=机构甩卖(偏看空)；5日滚动更平稳
+        if "bt_premium" in df.columns:
+            bt_p = pd.to_numeric(df["bt_premium"], errors="coerce").fillna(0.0)
+            df["bt_premium_5d"] = bt_p.rolling(5, min_periods=1).mean()   # 5日均折溢率
+            df["bt_premium_pos"] = (bt_p > 0).astype(float)               # 当日溢价=1(看多代理)
+        if "bt_amount" in df.columns:
+            bt_a = pd.to_numeric(df["bt_amount"], errors="coerce").fillna(0.0)
+            df["bt_amount_5d"] = bt_a.rolling(5, min_periods=1).sum()     # 5日大宗合计成交额
+            # 大宗成交额占日成交额之比（需要量纲对齐：bt_amount单位万元，amount=volume*price）
+            if "volume" in df.columns and "close" in df.columns:
+                daily_amt = (pd.to_numeric(df["volume"], errors="coerce").fillna(0) *
+                             pd.to_numeric(df["close"], errors="coerce").fillna(0) / 10000)  # 元→万元
+                df["bt_amount_ratio"] = bt_a / (daily_amt + 1e-9)
+        if "bt_count" in df.columns:
+            bt_c = pd.to_numeric(df["bt_count"], errors="coerce").fillna(0.0)
+            df["bt_count_5d"] = bt_c.rolling(5, min_periods=1).sum()      # 5日大宗笔数合计
+
         # ---- 4.1.10 外部数据列缺失处理 ----
-        # 外部来源(估值/大盘/资金流)可能在"上市前/数据未覆盖期/亏损股无市盈率"等处为 NaN。
+        # 外部来源(估值/大盘/资金流/大宗交易)可能在"上市前/数据未覆盖期"等处为 NaN。
         # 这些列的 NaN 一律填 0(中性、无未来泄露)——否则后面按行 dropna 时，只要某外部列局部/整列为 NaN，
         # 就会把大段甚至全部历史行删光(空数据集报错 array=[])。填 0 表示"该处无此信息"，不影响时序纪律。
         for c in df.columns:
-            if c != "date" and str(c).startswith(("val_", "idx_", "mf_", "us_", "nb_")):
+            if c != "date" and str(c).startswith(("val_", "idx_", "mf_", "us_", "nb_", "bt_")):
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
         return df
@@ -2758,17 +2929,30 @@ class TrainingPipeline:
         fold_metrics = []
         if block < 1:
             return {}
+        # 将传入的已缩放 X 逆变换回原始空间，以便每折独立 fit scaler（消除"用未来折统计量归一化"的轻度泄漏）
+        try:
+            X_raw = self.fe.scaler_x.inverse_transform(X)
+        except Exception:
+            X_raw = X   # scaler 不可用时退化到原行为
         for k in range(1, folds + 1):
             start, end = k * block, (k + 1) * block if k < folds else n
             if start >= end - 1 or start < 1:
                 continue
-            X_tr = X[:start]                 # 只用验证折之前的数据(前扩窗口)，杜绝未来泄漏
-            y_tr = y_scaled[:start]
-            X_va, y_va_raw = X[start:end], y_raw[start:end]
+            X_tr_raw = X_raw[:start]          # 只用验证折之前的数据(前扩窗口)，杜绝未来泄漏
+            y_tr_raw = y_raw[:start]
+            X_va_raw, y_va_raw = X_raw[start:end], y_raw[start:end]
             try:
+                # 每折独立 fit scaler：只看该折之前的数据，不引入后续折的均值/方差
+                from sklearn.preprocessing import StandardScaler as _SC
+                sc_x = _SC().fit(X_tr_raw)
+                sc_y = _SC().fit(y_tr_raw.reshape(-1, 1))
+                X_tr = sc_x.transform(X_tr_raw)
+                X_va = sc_x.transform(X_va_raw)
+                y_tr = sc_y.transform(y_tr_raw.reshape(-1, 1)).ravel()
                 m = model_cls(**{**model_kwargs, **best_params})
                 m.fit(X_tr, y_tr)
-                pred = self.fe.inverse_y(m.predict(X_va))
+                pred_s = m.predict(X_va)
+                pred = sc_y.inverse_transform(pred_s.reshape(-1, 1)).ravel()
                 fold_metrics.append(Metrics.calc_all(y_va_raw, pred, cv_metric_names))
             except Exception:
                 continue
@@ -2875,8 +3059,15 @@ class TrainingPipeline:
         model.fit(X_s, y_s)
 
         # 2) 取"最新的一整个窗口"（含最后一个交易日），构造一条待预测样本
+        # 列过滤顺序必须与 build_supervised_samples 完全一致，否则 feature_cols 索引错位
         df_ind = self.fe.add_technical_indicators(raw_df)
-        df_ind = df_ind.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+        df_ind = df_ind.replace([np.inf, -np.inf], np.nan)
+        df_ind = df_ind.dropna(axis=1, how="all").dropna().reset_index(drop=True)
+        if len(df_ind) < self.config.window_size:
+            raise ValueError(
+                f"有效历史数据只有 {len(df_ind)} 行，不足 window_size={self.config.window_size} 天，"
+                "无法构造预测窗口。请增加历史数据长度或减小窗口大小。"
+            )
         last_window = df_ind[self.fe.feature_cols].values[-self.config.window_size:]
         x_new = self.fe.scaler_x.transform(last_window.flatten().reshape(1, -1))
         pred_target = float(self.fe.inverse_y(model.predict(x_new))[0])
@@ -3082,6 +3273,11 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
     def _ann(total): return (1.0 + total) ** (1.0 / years) - 1.0
     total = float(eq_strat[-1] - 1.0); total_bh = float(eq_bh[-1] - 1.0)
     peak = np.maximum.accumulate(eq_strat); mdd = float((eq_strat / peak - 1.0).min())
+    # 卡玛比率 = 年化收益% / |最大回撤%|：CFA/FRM 教材常用来评估趋势类策略的"性价比"，
+    # 比夏普更关注"尾部灾难"而非日常波动——同样是15%年化，回撤-10%比回撤-30%的卡玛高3倍，
+    # 说明前者是"更平稳地"挣到这15%，而非靠一次大冒险赌出来的。回撤为0(或数据太短)时未定义，不能除0编造。
+    ann_ret_pct = _ann(total) * 100
+    calmar = round(ann_ret_pct / abs(mdd * 100), 3) if abs(mdd) > 1e-9 else None
     n_trades = int((pos > np.concatenate([[0.0], pos[:-1]])).sum())   # 新建仓次数
     held = pos > 0
     win_rate = float(np.mean(strat_ret[held] > 0) * 100) if held.sum() > 0 else 0.0
@@ -3090,6 +3286,21 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
     excess_ret = strat_ret - rf_seg
     sharpe = float(np.mean(excess_ret) / (np.std(strat_ret) + 1e-12) *
                    np.sqrt(ann_days / max(1, horizon))) if len(strat_ret) > 1 else 0.0
+    # 索提诺比率：只惩罚下行波动，不惩罚上行波动，比夏普更适合A股单边多头。
+    # 分母 = 下行标准差(仅取 excess_ret<0 的部分)，若无亏损段则分母为0，返回None不编造。
+    down_ret = excess_ret[excess_ret < 0]
+    down_std = float(np.std(down_ret) * np.sqrt(ann_days / max(1, horizon))) if len(down_ret) > 1 else 0.0
+    sortino = round(float(np.mean(excess_ret)) * (ann_days / max(1, horizon)) / down_std, 3) \
+        if down_std > 1e-12 else None
+    # 最大回撤恢复期：从回撤最低点到净值重新回到前高所需的交易段数。
+    # 若整个测试期内都没恢复到前高，返回None(如实标注)，不猜测"以后会恢复"。
+    recovery_days = None
+    if mdd < -1e-9:
+        trough_idx = int(np.argmin(eq_strat / peak))
+        prev_peak_val = float(peak[trough_idx])
+        recover_candidates = np.where(eq_strat[trough_idx:] >= prev_peak_val)[0]
+        if len(recover_candidates) > 0:
+            recovery_days = int(recover_candidates[0]) * max(1, horizon)
 
     out = {
         "n_segments": int(len(idx)), "n_trades": n_trades,
@@ -3097,7 +3308,8 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
         "buyhold_return_pct": round(total_bh * 100, 2), "buyhold_annual_pct": round(_ann(total_bh) * 100, 2),
         "excess_vs_buyhold_pct": round((total - total_bh) * 100, 2),
         "max_drawdown_pct": round(mdd * 100, 2), "win_rate_pct": round(win_rate, 2),
-        "sharpe": round(sharpe, 3), "cost_bps": cost_bps, "limit_pct": round(limit * 100, 1),
+        "sharpe": round(sharpe, 3), "sortino": sortino, "calmar": calmar,
+        "recovery_days": recovery_days, "cost_bps": cost_bps, "limit_pct": round(limit * 100, 1),
         "n_block_buy": n_block_buy, "n_suspend": n_suspend, "n_stuck_sell": n_stuck_sell,
         "n_stop": n_stop, "avg_position": round(float(np.mean(expo[pos > 0])) if (pos > 0).any() else 0.0, 3),
         "eq_strat": eq_strat, "eq_bh": eq_bh,
@@ -3113,6 +3325,20 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
             out["bench_annual_pct"] = round(_ann(bench_total) * 100, 2)
             out["excess_vs_bench_pct"] = round((total - bench_total) * 100, 2)
             out["eq_bench"] = eq_bench
+            # 信息比率(IR) = 主动收益(策略-基准)的年化均值 / 主动收益的年化标准差。
+            # 衡量的是"基金经理视角"的核心指标：承担了多少跟踪误差风险，换来多少超额收益——
+            # 注意与夏普的区别：夏普相对『无风险利率』，IR相对『业绩基准』，是CFA二级课程重点。
+            # 近似说明：bench 与 strat_ret 按同一组"段"对齐(退出日对退出日)，第0段没有更早一期可比，
+            # 故从第1段开始算主动收益；若主动收益方差≈0(完全没跟踪误差)，IR数学上未定义，返回None。
+            if len(bench) == len(strat_ret) and len(bench) >= 3:
+                bench_seg_ret = bench[1:] / bench[:-1] - 1.0
+                active_ret = strat_ret[1:] - bench_seg_ret
+                if np.std(active_ret) > 1e-12:
+                    ir = float(np.mean(active_ret) / np.std(active_ret) *
+                               np.sqrt(ann_days / max(1, horizon)))
+                    out["information_ratio"] = round(ir, 3)
+                else:
+                    out["information_ratio"] = None
     return out
 
 
@@ -3488,7 +3714,8 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
 
 def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
                       w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
-                      w_quality: float = 1.0, w_lowvol: float = 1.0, use_quality: bool = True,
+                      w_quality: float = 1.0, w_lowvol: float = 1.0, w_tech: float = 1.0,
+                      use_quality: bool = True,
                       progress_cb: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
     """
     批量"因子打分选股"(横截面)：对一篮子股票，各算真实因子——
@@ -3530,10 +3757,40 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
                 q = StockDataFetcher.fetch_quality(code)
                 roe, rev_g, fscore = q.get("roe"), q.get("rev_growth"), q.get("f_score")
             warns = assess_risks(code, name, df, news=None)
+            # ---- 技术面信号打分（用于第6因子）----
+            # 加入 FeatureEngineer 衍生指标后，从末行取当前值
+            try:
+                df_tech = FeatureEngineer().add_technical_indicators(df.copy())
+                def tlast(col):
+                    if col in df_tech.columns:
+                        s = pd.to_numeric(df_tech[col], errors="coerce").dropna()
+                        return float(s.iloc[-1]) if len(s) else None
+                    return None
+                rsi_v    = tlast("rsi14")
+                kdj_j_v  = tlast("kdj_j")
+                macd_c_v = tlast("macd_cross")     # +1=金叉, -1=死叉
+                tail_v   = tlast("tail_strength_5d")
+                ma20_v   = tlast("boll_mid")        # 布林中轨 ≈ MA20
+                # 技术信号综合分（各子信号 0~25 分，满分100）
+                tech_sig = 50.0   # 中性基准
+                if rsi_v   is not None: tech_sig += max(0, (30 - rsi_v) * 0.8)   # RSI<30超卖加分
+                if rsi_v   is not None: tech_sig -= max(0, (rsi_v - 70) * 0.8)   # RSI>70超买减分
+                if kdj_j_v is not None: tech_sig += max(0, (20 - kdj_j_v) * 0.5) # KDJ J<20超卖加分
+                if kdj_j_v is not None: tech_sig -= max(0, (kdj_j_v - 90) * 0.3) # KDJ J>90超买减分
+                if macd_c_v is not None: tech_sig += macd_c_v * 8                 # 金叉+8, 死叉-8
+                if tail_v  is not None: tech_sig += (tail_v - 0.5) * 10          # 尾盘强弱偏离0.5的贡献
+                if ma20_v  is not None and ma20_v > 0:
+                    tech_sig += 5 if lc > ma20_v else -5                          # 站上/跌破MA20
+                tech_sig = float(np.clip(tech_sig, 0, 100))
+            except Exception:
+                tech_sig = None
+                rsi_v = kdj_j_v = macd_c_v = tail_v = None
             recs.append({"code": code, "name": name, "last_close": round(lc, 2), "industry": industry,
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
                          "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
                          "vol60": vol60, "roe": roe, "rev_growth": rev_g, "f_score": fscore,
+                         "tech_sig": tech_sig, "rsi": rsi_v, "kdj_j": kdj_j_v,
+                         "macd_cross": macd_c_v, "tail_strength": tail_v,
                          "risk_n": len(warns), "risk_hi": sum(1 for w in warns if w["level"] == "高"),
                          "risk_top": (warns[0]["category"] if warns else ""), "error": None})
         except Exception as e:
@@ -3572,11 +3829,13 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
         s_fsc = pct([r.get("f_score") for r in ok], True)
         s_qual = pd.concat([s_roe, s_revg, s_fsc], axis=1).mean(axis=1)
         s_lowvol = pct([r.get("vol60") for r in ok], False)                   # 波动越低分越高
+        # 技术面信号分：已在 per-code 循环算出0~100的绝对分，转百分位
+        s_tech = pct([r.get("tech_sig") for r in ok], True)                   # 技术信号越高越好
         for k, r in enumerate(ok):
             comps, wts = [], []
             for sc, wt in [(s_val.iloc[k], w_value), (s_mom.iloc[k], w_momentum),
                            (s_mon.iloc[k], w_money), (s_qual.iloc[k], w_quality),
-                           (s_lowvol.iloc[k], w_lowvol)]:
+                           (s_lowvol.iloc[k], w_lowvol), (s_tech.iloc[k], w_tech)]:
                 if pd.notna(sc):
                     comps.append(sc * wt); wts.append(wt)
             base = (sum(comps) / sum(wts)) if wts else 0.0
@@ -3585,6 +3844,7 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             r["money_score"] = None if pd.isna(s_mon.iloc[k]) else round(float(s_mon.iloc[k]), 1)
             r["qual_score"] = None if pd.isna(s_qual.iloc[k]) else round(float(s_qual.iloc[k]), 1)
             r["lowvol_score"] = None if pd.isna(s_lowvol.iloc[k]) else round(float(s_lowvol.iloc[k]), 1)
+            r["tech_score"] = None if pd.isna(s_tech.iloc[k]) else round(float(s_tech.iloc[k]), 1)
             r["score"] = round(float(base) - 12.0 * r["risk_hi"] - 3.0 * (r["risk_n"] - r["risk_hi"]), 1)
     recs.sort(key=lambda r: (r.get("score") if r.get("score") is not None else -1e9), reverse=True)
     return recs
@@ -3807,25 +4067,79 @@ PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "b
              "status", "actual_close", "actual_change_pct", "hit_dir", "in_interval", "verified_at"]
 
 
-def load_pred_log() -> pd.DataFrame:
-    if os.path.exists(PRED_LOG):
+def _init_pred_db() -> None:
+    """建表（首次）并自动把旧 pred_log.csv 迁移进 SQLite（一次性，不重复执行）。"""
+    cols_def = ", ".join(f'"{c}" TEXT DEFAULT ""' for c in PRED_COLS)
+    with sqlite3.connect(PRED_DB) as conn:
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS predictions (
+                {cols_def},
+                PRIMARY KEY (code, model, horizon, base_date)
+            )
+        """)
+        conn.commit()
+    # 旧 CSV → SQLite 一次性迁移（标记文件 .migrated 防重复）
+    migrated_flag = PRED_DB + ".migrated"
+    if os.path.exists(PRED_LOG) and not os.path.exists(migrated_flag):
         try:
-            return pd.read_csv(PRED_LOG, dtype=str).fillna("")
+            old = pd.read_csv(PRED_LOG, dtype=str).fillna("")
+            for c in PRED_COLS:
+                if c not in old.columns:
+                    old[c] = ""
+            with sqlite3.connect(PRED_DB) as conn:
+                placeholders = ", ".join(["?"] * len(PRED_COLS))
+                col_names = ", ".join(f'"{c}"' for c in PRED_COLS)
+                conn.executemany(
+                    f"INSERT OR IGNORE INTO predictions ({col_names}) VALUES ({placeholders})",
+                    [tuple(str(row.get(c, "")) for c in PRED_COLS) for _, row in old.iterrows()]
+                )
+                conn.commit()
+            open(migrated_flag, "w").close()
         except Exception:
             pass
-    return pd.DataFrame(columns=PRED_COLS)
+
+
+def load_pred_log() -> pd.DataFrame:
+    """从 SQLite 读取全部预测记录，返回 DataFrame（列与旧 CSV 完全一致，上层调用无需改动）。"""
+    _init_pred_db()
+    try:
+        col_list = ", ".join(f'"{c}"' for c in PRED_COLS)
+        with sqlite3.connect(PRED_DB) as conn:
+            df = pd.read_sql_query(f"SELECT {col_list} FROM predictions", conn, dtype=str)
+        return df.fillna("")
+    except Exception:
+        return pd.DataFrame(columns=PRED_COLS)
+
+
+def _save_pred_db(df: pd.DataFrame) -> None:
+    """把整张 DataFrame 写回 SQLite（INSERT OR REPLACE 逐行 upsert，保持去重语义）。"""
+    _init_pred_db()
+    with sqlite3.connect(PRED_DB) as conn:
+        placeholders = ", ".join(["?"] * len(PRED_COLS))
+        col_names = ", ".join(f'"{c}"' for c in PRED_COLS)
+        conn.executemany(
+            f"INSERT OR REPLACE INTO predictions ({col_names}) VALUES ({placeholders})",
+            [tuple(str(row.get(c, "")) for c in PRED_COLS) for _, row in df.iterrows()]
+        )
+        conn.commit()
 
 
 def save_predictions(rows: List[Dict[str, Any]]) -> int:
-    """把若干条新预测追加进日志(去重：同 code+model+horizon+base_date 只留最新)。返回新增条数。"""
-    df = load_pred_log()
+    """把若干条新预测追加进 SQLite（去重：同 code+model+horizon+base_date 只留最新）。返回新增条数。"""
+    _init_pred_db()
     add = pd.DataFrame(rows)
     for c in PRED_COLS:
         if c not in add.columns:
             add[c] = ""
-    df = pd.concat([df, add[PRED_COLS]], ignore_index=True)
-    df = df.drop_duplicates(subset=["code", "model", "horizon", "base_date"], keep="last")
-    df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
+    with sqlite3.connect(PRED_DB) as conn:
+        placeholders = ", ".join(["?"] * len(PRED_COLS))
+        col_names = ", ".join(f'"{c}"' for c in PRED_COLS)
+        # INSERT OR REPLACE 实现"同主键只留最新"的去重语义
+        conn.executemany(
+            f"INSERT OR REPLACE INTO predictions ({col_names}) VALUES ({placeholders})",
+            [tuple(str(add.at[i, c]) for c in PRED_COLS) for i in add.index]
+        )
+        conn.commit()
     return len(add)
 
 
@@ -3875,7 +4189,7 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> i
                 n_ok += 1
             except Exception:
                 continue
-    df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
+    _save_pred_db(df)
     return n_ok
 
 
@@ -4082,7 +4396,18 @@ GLOSSARY = {
         ("过拟合", "模型在「训练集」上很准、到「测试集」就拉胯——像死记硬背、不会举一反三。看训练误差远小于测试误差就是过拟合。"),
         ("训练 / 验证 / 测试集", "学习用 / 调参用 / 最终考试用，分开来防作弊(不能拿考题当练习)。"),
         ("策略回测", "用历史数据模拟「跟着模型预测买卖」到底能赚多少，还扣手续费。跑不赢「一直持有」就说明没用。"),
-        ("夏普比率", "每承担一分风险换来多少收益，越高越好(>1 算不错)。"),
+        ("夏普比率", "每承担一分风险(相对无风险利率)换来多少收益，越高越好(>1 算不错)。"),
+        ("卡玛比率(Calmar Ratio)", "年化收益 ÷ |最大回撤|，衡量\"每承受1%的最坏回撤，换来多少年化收益\"。"
+         "比夏普更看重\"尾部灾难\"而非日常小波动，CFA/FRM教材常用来评估趋势类策略。同样15%年化，回撤-10%比"
+         "回撤-30%的卡玛高3倍，说明前者赚得更\"平稳\"，不是靠一次大冒险赌出来的。"),
+        ("信息比率(Information Ratio)", "承担的\"跟踪误差\"风险，换来多少跑赢基准(如沪深300)的超额收益，"
+         "是基金经理最常用的业绩考核指标之一。和夏普的区别：夏普相对<b>无风险利率</b>，IR相对<b>业绩基准</b>。"),
+        ("索提诺比率(Sortino Ratio)", "和夏普类似，但分母只算<b>下行波动</b>（亏损段的波动），不惩罚上涨的波动。"
+         "因为投资者真正不喜欢的是亏钱，而不是涨太快——所以索提诺比夏普更适合评估A股单边多头策略。"
+         "无亏损段时未定义（显示None）。"),
+        ("最大回撤恢复期", "从净值跌到最低点后，再涨回到前高所用的<b>交易日数</b>。"
+         "衡量策略\"受伤\"后的自我修复能力——同样的最大回撤，3个月就恢复比3年才恢复的策略风险小得多。"
+         "若测试期内始终未恢复，显示None（如实标注，不猜测将来会恢复）。"),
         ("最大回撤", "从最高点跌到最低点的最大跌幅，衡量「最坏能亏多少」。"),
         ("均线 MA5/10/20", "最近 5/10/20 天收盘价的平均线，看趋势。"),
         ("区间平均线(虚线)", "所选整段时间收盘价的平均，一条水平参考线。"),
@@ -4412,6 +4737,35 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
             "band_pct": round(band * 100, 1),
             "DA": prim.get("DA"), "da_sig_text": prim.get("da_sig_text"), "reliable": reliable,
         }
+    # 技术面补充：计算支撑/压力位 + 尾盘强弱(用 FeatureEngineer)
+    tech_extra = {}
+    try:
+        df_te = FeatureEngineer().add_technical_indicators(df.copy())
+        def te_last(col):
+            if col in df_te.columns:
+                s = pd.to_numeric(df_te[col], errors="coerce").dropna()
+                return round(float(s.iloc[-1]), 4) if len(s) else None
+            return None
+        tech_extra = {
+            "support_20d":   te_last("support_20d"),
+            "resist_20d":    te_last("resist_20d"),
+            "dist_to_support": te_last("dist_to_support"),
+            "dist_to_resist":  te_last("dist_to_resist"),
+            "boll_width":    te_last("boll_width"),
+            "boll_pos":      te_last("boll_pos"),
+            "tail_strength": te_last("tail_strength"),
+            "tail_strength_5d": te_last("tail_strength_5d"),
+            "macd_cross":    te_last("macd_cross"),
+            "rsi14":         te_last("rsi14"),
+            "kdj_j":         te_last("kdj_j"),
+            # 大宗交易近5日聚合指标
+            "bt_premium_5d":   te_last("bt_premium_5d"),
+            "bt_amount_5d":    te_last("bt_amount_5d"),
+            "bt_count_5d":     te_last("bt_count_5d"),
+            "bt_amount_ratio": te_last("bt_amount_ratio"),
+        }
+    except Exception:
+        pass
     return {
         "code": code, "name": name, "last_close": round(lc, 2), "horizon": horizon,
         "ret_1w": chg(5), "ret_1m": chg(20), "ret_1q": ret_1q,
@@ -4427,6 +4781,7 @@ def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
         "profit_q": profitability_score(last("val_pe_ttm"), q.get("roe")),  # 盈利规则量化[-1,1]
         "news_items": news_items, "verdict": verdict,
         "up_rate": up_rate, "da_rows": da_rows, "warns": warns, "status": status,
+        **tech_extra,
     }
 
 
@@ -4609,6 +4964,91 @@ def research_card_html(card: Dict[str, Any]) -> str:
               f"（{card['next_report']['period']}，约 {card['next_report']['days']} 天后，业绩窗口波动大）</td></tr>"
               if card.get('next_report', {}).get('date') is not None else "")
            + "</table>")
+    # 技术指标展示块
+    def _fmt_pct(v, label=""):
+        if v is None: return "-"
+        return f"{v*100:+.1f}%{label}"
+    support_v  = card.get("support_20d")
+    resist_v   = card.get("resist_20d")
+    rsi_v      = card.get("rsi14")
+    kdj_j_v    = card.get("kdj_j")
+    tail_v     = card.get("tail_strength")
+    tail5_v    = card.get("tail_strength_5d")
+    boll_pos_v = card.get("boll_pos")
+    boll_w_v   = card.get("boll_width")
+    macd_c_v   = card.get("macd_cross")
+    lc_v       = card.get("last_close", 0) or 0
+    # RSI 超卖/超买标注
+    rsi_tag = ""
+    if rsi_v is not None:
+        if rsi_v < 30: rsi_tag = " <span style='color:#1e8449'>(超卖区)</span>"
+        elif rsi_v > 70: rsi_tag = " <span style='color:#c0392b'>(超买区)</span>"
+    # KDJ J 超卖/超买
+    kdj_tag = ""
+    if kdj_j_v is not None:
+        if kdj_j_v < 20: kdj_tag = " <span style='color:#1e8449'>(超卖)</span>"
+        elif kdj_j_v > 90: kdj_tag = " <span style='color:#c0392b'>(超买)</span>"
+    # 尾盘强弱
+    tail_tag = ""
+    if tail_v is not None:
+        tail_tag = " <span style='color:#1e8449'>(收阳强势)</span>" if tail_v > 0.6 else (
+            " <span style='color:#c0392b'>(收阴弱势)</span>" if tail_v < 0.35 else "")
+    # MACD 信号
+    macd_tag = "-"
+    if macd_c_v is not None:
+        if macd_c_v > 0: macd_tag = "<span style='color:#1e8449'>金叉（柱由负转正）</span>"
+        elif macd_c_v < 0: macd_tag = "<span style='color:#c0392b'>死叉（柱由正转负）</span>"
+        else: macd_tag = "无信号"
+    # 布林带位置：0=下轨, 1=上轨
+    boll_tag = ""
+    if boll_pos_v is not None:
+        if boll_pos_v < 0.2: boll_tag = " <span style='color:#1e8449'>(接近下轨，超卖区间)</span>"
+        elif boll_pos_v > 0.8: boll_tag = " <span style='color:#c0392b'>(接近上轨，超买区间)</span>"
+    tech_html = (
+        "<h3>技术面指标（当前值，仅供参考，不构成建议）</h3>"
+        "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+        f"<tr><td>近20日支撑位</td><td>{f(support_v,'元',2)}</td>"
+        f"<td>近20日压力位</td><td>{f(resist_v,'元',2)}</td></tr>"
+        f"<tr><td>距支撑距离</td><td>{_fmt_pct(card.get('dist_to_support'))}</td>"
+        f"<td>距压力距离</td><td>{_fmt_pct(card.get('dist_to_resist'))}</td></tr>"
+        f"<tr><td>RSI(14)</td><td>{f(rsi_v,'',1)}{rsi_tag}</td>"
+        f"<td>KDJ-J</td><td>{f(kdj_j_v,'',1)}{kdj_tag}</td></tr>"
+        f"<tr><td>尾盘强弱(当日)</td><td>{f(tail_v,'',2)}{tail_tag}</td>"
+        f"<td>尾盘强弱(5日均)</td><td>{f(tail5_v,'',2)}</td></tr>"
+        f"<tr><td>布林带位置</td><td>{f(boll_pos_v,'',2)}{boll_tag}</td>"
+        f"<td>布林带宽(相对)</td><td>{f(boll_w_v,'',3)}</td></tr>"
+        f"<tr><td>MACD信号</td><td colspan=3>{macd_tag}</td></tr>"
+        "</table>"
+        "<p style='color:#888;font-size:12px'>注：支撑/压力位=近20日低/高；尾盘强弱=(收-低)/(高-低)，越接近1代表当日收盘越靠近最高，尾盘强势；布林带位置0=下轨/1=上轨。</p>"
+    )
+    # ---- 大宗交易信息区 ----
+    bt_html = ""
+    bt_prem = card.get("bt_premium_5d")
+    bt_amt = card.get("bt_amount_5d")
+    bt_cnt = card.get("bt_count_5d")
+    bt_ratio = card.get("bt_amount_ratio")
+    if any(v is not None for v in [bt_prem, bt_amt, bt_cnt]):
+        if bt_prem is not None:
+            if bt_prem > 1:
+                prem_tag = f"<span style='color:#c0392b'><b>溢价{bt_prem:.2f}%</b>（机构溢价买入，偏看多信号）</span>"
+            elif bt_prem < -1:
+                prem_tag = f"<span style='color:#888'><b>折价{abs(bt_prem):.2f}%</b>（机构折价卖出，偏看空信号）</span>"
+            else:
+                prem_tag = f"{bt_prem:.2f}%（接近平价）"
+        else:
+            prem_tag = "-"
+        bt_html = (
+            "<h3>大宗交易（近5日，真实来源）</h3>"
+            "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+            "<tr bgcolor=#eef><th>指标</th><th>值</th><th>指标</th><th>值</th></tr>"
+            f"<tr><td>5日均折溢率</td><td>{prem_tag}</td>"
+            f"<td>5日合计成交额(万)</td><td>{f(bt_amt,'',0) if bt_amt is not None else '-'}</td></tr>"
+            f"<tr><td>5日大宗笔数</td><td>{int(bt_cnt) if bt_cnt is not None else '-'}笔</td>"
+            f"<td>大宗额占日均成交比</td><td>{f(bt_ratio*100,'%',1) if bt_ratio is not None else '-'}</td></tr>"
+            "</table>"
+            "<p style='color:#888;font-size:12px'>大宗交易为场外协议成交，不代表散户市场情绪；"
+            "溢价>1%=机构积极承接(偏看多)；折价<-1%=机构急于出货(偏看空)；参考而非决定因素，非投资建议。</p>"
+        )
     return (
         f"<h2>综合研判卡 · {title}</h2>"
         "<p style='color:#c0392b'><b>本卡只汇总客观事实 + 模型机械预测，不构成任何买卖建议、不荐股；请自行判断。</b></p>"
@@ -4619,10 +5059,148 @@ def research_card_html(card: Dict[str, Any]) -> str:
         "<tr bgcolor=#eef><th>模型</th><th>DA方向准确率</th><th>UP_P上涨精确率</th><th>对比基准</th></tr>"
         + da_body + "</table>"
         + lean_html +
-        "<h3>关键数据现状（真实来源，见数据溯源）</h3>" + ctx +
+        "<h3>关键数据现状（真实来源，见数据溯源）</h3>" + ctx
+        + tech_html
+        + bt_html +
         "<h3>客观判读（描述事实，非建议）</h3><p>" + "；".join(reads) + "。</p>"
         "<p style='color:#888;font-size:12px'>提示：市场接近有效，单模型方向预测大多≈50%；"
         "以上为客观体检，买不买、仓位多少由你决定，风险自负。</p>")
+
+
+# ==================== 第八部分补充10：尾盘五维选股（量化五步筛选，参考"尾盘选股法"）====================
+def tail_market_scan(codes: List[str],
+                     min_amp: float = 0.03, max_amp: float = 0.05,
+                     min_turn: float = 0.05, max_turn: float = 0.20,
+                     min_mv: float = 50e8,   max_mv: float = 500e8,
+                     min_vol_ratio: float = 1.0,
+                     vol_expand_days: int = 3,
+                     require_bull: bool = True,
+                     progress_cb=None) -> List[Dict[str, Any]]:
+    """
+    五维尾盘选股（参考"尾盘选股器"五步法）：
+      ① 当日涨幅 3%-5%（尾盘强势但未过热）
+      ② 换手率 5%-20%（筹码充分交换，有爆发基础）
+      ③ 流通市值 50亿-500亿（船型适中，主力可操作）
+      ④ 成交量连续放大（量比≥1且近N日量比逐日递增）
+      ⑤ 均线多头排列（MA5>MA10>MA20，趋势向上）
+    结果按"通过条件数"降序排列。**仅供参考，非买卖建议，风险自负。**
+    """
+    log = progress_cb or (lambda m: None)
+    results = []
+    for code in codes:
+        try:
+            log(f"[尾盘选股] {code} 取数...")
+            end = dt.date.today().strftime("%Y%m%d")
+            start = (dt.date.today() - dt.timedelta(days=120)).strftime("%Y%m%d")
+            df = StockDataFetcher().fetch(code, start, end)
+            if df is None or len(df) < 20:
+                continue
+            name = StockDataFetcher.fetch_stock_name(code)
+            close = pd.to_numeric(df["close"], errors="coerce")
+            lc = float(close.iloc[-1])
+            prev_c = float(close.iloc[-2]) if len(close) > 1 else lc
+            amp = (lc - prev_c) / (prev_c + 1e-9)           # 当日涨跌幅
+
+            # 换手率
+            turn = None
+            if "turnover" in df.columns:
+                t = pd.to_numeric(df["turnover"], errors="coerce").dropna()
+                if len(t): turn = float(t.iloc[-1]) / 100.0  # 转为小数
+
+            # 流通市值
+            mv = None
+            if "val_total_mv" in df.columns:
+                m = pd.to_numeric(df["val_total_mv"], errors="coerce").dropna()
+                if len(m): mv = float(m.iloc[-1]) * 1e4       # akshare 单位：万元→元
+
+            # 量比
+            vr = None
+            if "vol_ratio" in df.columns:
+                v = pd.to_numeric(df["vol_ratio"], errors="coerce").dropna()
+                if len(v): vr = float(v.iloc[-1])
+
+            # 连续放量天数
+            vol_s = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            expand = 0
+            for i in range(len(vol_s)-1, 0, -1):
+                if vol_s.iloc[i] > vol_s.iloc[i-1]:
+                    expand += 1
+                else:
+                    break
+
+            # 均线多头排列
+            bull_rank = None
+            try:
+                df_te = FeatureEngineer().add_technical_indicators(df.copy())
+                if "ma_bull_rank" in df_te.columns:
+                    br = pd.to_numeric(df_te["ma_bull_rank"], errors="coerce").dropna()
+                    if len(br): bull_rank = float(br.iloc[-1])
+            except Exception:
+                pass
+
+            # 五维条件评分
+            c1 = min_amp <= amp <= max_amp                             # ①涨幅
+            c2 = (turn is not None and min_turn <= turn <= max_turn)  # ②换手率
+            c3 = (mv   is not None and min_mv  <= mv  <= max_mv)      # ③市值
+            c4 = (vr   is not None and vr >= min_vol_ratio
+                  and expand >= vol_expand_days)                        # ④放量
+            c5 = (bull_rank is not None and bull_rank >= 1.0)         # ⑤多头排列
+
+            score = sum([c1, c2, c3, c4, c5])
+            results.append({
+                "code": code, "name": name, "last_close": round(lc, 2),
+                "amp_pct": round(amp * 100, 2),
+                "turnover_pct": round((turn or 0) * 100, 2),
+                "mv_yi": round((mv or 0) / 1e8, 1),
+                "vol_ratio": round(vr or 0, 2),
+                "vol_expand_days": expand,
+                "ma_bull": int(bull_rank or 0),
+                "c1_amp": c1, "c2_turn": c2, "c3_mv": c3, "c4_vol": c4, "c5_bull": c5,
+                "score": score,
+            })
+        except Exception as e:
+            results.append({"code": code, "name": "", "score": -1, "error": str(e)})
+    results.sort(key=lambda r: r.get("score", -1), reverse=True)
+    return results
+
+
+# ==================== 第八部分补充9：板块行情（概念板块/行业板块实时涨跌） ====================
+def fetch_board_spot(board_type: str = "concept") -> pd.DataFrame:
+    """拉取板块实时涨跌数据。board_type='concept' 概念板块 / 'industry' 行业板块。
+    数据来自东方财富(akshare)，取不到时返回空 DataFrame，绝不造假。"""
+    if not HAS_AKSHARE:
+        return pd.DataFrame()
+    try:
+        if board_type == "industry":
+            df = ak.stock_board_industry_spot_em()
+        else:
+            df = ak.stock_board_concept_spot_em()
+        # 统一列名：只保留展示需要的列
+        rename = {}
+        for col in df.columns:
+            cl = str(col).lower()
+            if "板块名称" in col or "名称" in col:
+                rename[col] = "name"
+            elif "涨跌幅" in col:
+                rename[col] = "pct"
+            elif "上涨家数" in col:
+                rename[col] = "up_cnt"
+            elif "下跌家数" in col:
+                rename[col] = "down_cnt"
+            elif "领涨股票" in col and "涨跌" not in col:
+                rename[col] = "lead_stock"
+            elif "领涨" in col and "涨跌" in col:
+                rename[col] = "lead_pct"
+            elif "换手率" in col:
+                rename[col] = "turnover"
+        df = df.rename(columns=rename)
+        need = [c for c in ["name", "pct", "up_cnt", "down_cnt", "lead_stock", "lead_pct", "turnover"] if c in df.columns]
+        df = df[need].copy()
+        df["pct"] = pd.to_numeric(df["pct"], errors="coerce").fillna(0.0)
+        df = df.sort_values("pct", ascending=False).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
@@ -4856,6 +5434,8 @@ if HAS_PYSIDE6:
             # 批量扫描：多股批量 取数→训练→预测→风险
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
+            self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
+            self.tabs.addTab(self._build_board_tab(), "板块行情")
             self.tabs.currentChanged.connect(self._on_tab_changed)
 
             main_layout.addWidget(self.tabs, stretch=1)
@@ -5660,6 +6240,10 @@ if HAS_PYSIDE6:
             self.rcard_btn.setStyleSheet("font-weight:bold; padding:6px; background:#8e44ad; color:white;")
             self.rcard_btn.clicked.connect(self._on_research_card)
             top.addWidget(self.rcard_btn)
+            self.block_trading_btn = QPushButton("📊 大宗交易历史")
+            self.block_trading_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2c3e50; color:white;")
+            self.block_trading_btn.clicked.connect(self._on_block_trading)
+            top.addWidget(self.block_trading_btn)
             self.report_btn = QPushButton("🧾 生成/刷新 报告预览")
             self.report_btn.setStyleSheet("font-weight:bold; padding:6px;")
             self.report_btn.clicked.connect(self._on_gen_report)
@@ -5823,6 +6407,66 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "研判卡生成失败", str(e))
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.rcard_btn.setEnabled(True)
+
+        def _on_block_trading(self):
+            code = self.code_edit.text().strip()
+            if not code:
+                QMessageBox.warning(self, "提示", "请先输入股票代码。"); return
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "大宗交易需真实数据，请把数据源切到「真实数据」。"); return
+            self.block_trading_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._prog_open("⏳ 正在获取大宗交易历史数据…"); QApplication.processEvents()
+            try:
+                df_bt = StockDataFetcher.fetch_block_trading_display(code)
+                if df_bt is None or len(df_bt) == 0:
+                    self.report_view.setHtml(
+                        f"<p style='color:#888'>该股票（{code}）暂无大宗交易记录，"
+                        "或数据源暂不支持（akshare stock_dzjy_detail）。</p>"
+                        "<p style='color:#888'>大宗交易通常出现在机构之间大额协议成交时，流通盘较小的股票记录较少。</p>"
+                    )
+                    return
+                # 构建 HTML 表格
+                prem_col = next((c for c in df_bt.columns if "折溢率" in str(c)), None)
+                ths = "".join(f"<th>{c}</th>" for c in df_bt.columns)
+                trs = ""
+                for _, row in df_bt.iterrows():
+                    cells = ""
+                    for ci, val in enumerate(row):
+                        cell_str = str(val) if not isinstance(val, float) else f"{val:.2f}"
+                        style = ""
+                        if prem_col and df_bt.columns[ci] == prem_col:
+                            try:
+                                pv = float(val)
+                                style = "color:#c0392b;font-weight:bold" if pv > 1 else (
+                                    "color:#1e8449;font-weight:bold" if pv < -1 else "")
+                            except Exception:
+                                pass
+                        cells += f"<td style='{style}'>{cell_str}</td>"
+                    trs += f"<tr>{cells}</tr>"
+                total_amt = None
+                if "成交额（万元）" in df_bt.columns:
+                    total_amt = pd.to_numeric(df_bt["成交额（万元）"], errors="coerce").sum()
+                elif "成交额(万元)" in df_bt.columns:
+                    total_amt = pd.to_numeric(df_bt["成交额(万元)"], errors="coerce").sum()
+                summary = (f"共 {len(df_bt)} 条记录" +
+                           (f"，合计成交额 {total_amt:,.0f} 万元" if total_amt else ""))
+                html = (
+                    f"<h3>大宗交易历史 · {code} · {summary}</h3>"
+                    "<table border=1 cellpadding=4 cellspacing=0 width=100%>"
+                    f"<tr bgcolor=#eef>{ths}</tr>{trs}</table>"
+                    "<p style='color:#888;font-size:12px'>"
+                    "折溢率<span style='color:#c0392b'>>1%（红）</span>=溢价成交(机构主动买)；"
+                    "<span style='color:#1e8449'><-1%（绿）</span>=折价成交(机构转让/甩卖)。"
+                    "大宗交易为场外协议成交，不影响当日收盘价，非投资建议。</p>"
+                )
+                self.report_view.setHtml(html)
+                self._oplog(f"大宗交易历史：{code}，共{len(df_bt)}条。")
+            except Exception as e:
+                QMessageBox.critical(self, "大宗交易获取失败", str(e))
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close()
+                self.block_trading_btn.setEnabled(True)
 
         def _on_gen_report(self):
             if not self.results and not getattr(self, "_html_analysis", "") \
@@ -6210,7 +6854,7 @@ if HAS_PYSIDE6:
             self._batch_rows = rows                 # 复用导出
             self._batch_reset_btn()
             headers = ["排名", "代码", "名称", "行业", "最新价", "综合分", "价值分", "动量分", "资金分",
-                       "质量分", "低波动分", "近3月%", "风险数", "主要风险"]
+                       "质量分", "低波动分", "技术分", "RSI", "KDJ-J", "尾盘强弱", "近3月%", "风险数", "主要风险"]
             self.batch_table.setColumnCount(len(headers))
             self.batch_table.setHorizontalHeaderLabels(headers)
             self.batch_table.setRowCount(len(rows))
@@ -6223,15 +6867,19 @@ if HAS_PYSIDE6:
                 rank += 1
                 m3 = r.get("mom3m")
                 vind = (r.get("industry") or "-") + ("*" if r.get("val_in_industry") else "")
+                rsi_s = f"{r['rsi']:.1f}" if r.get("rsi") is not None else "-"
+                kdj_s = f"{r['kdj_j']:.1f}" if r.get("kdj_j") is not None else "-"
+                tail_s = f"{r['tail_strength']:.2f}" if r.get("tail_strength") is not None else "-"
                 vals = [str(rank), r["code"], r.get("name", ""), vind, f"{r.get('last_close','')}",
                         f"{r.get('score','')}", f"{r.get('value_score','') or '-'}",
                         f"{r.get('mom_score','') or '-'}", f"{r.get('money_score','') or '-'}",
                         f"{r.get('qual_score','') or '-'}", f"{r.get('lowvol_score','') or '-'}",
+                        f"{r.get('tech_score','') or '-'}", rsi_s, kdj_s, tail_s,
                         (f"{m3*100:+.1f}%" if m3 is not None else "-"),
                         str(r.get("risk_n", "")), r.get("risk_top", "")]
                 for c, v in enumerate(vals):
                     it = QTableWidgetItem(str(v))
-                    if c == 12 and r.get("risk_n", 0) > 0:      # "风险数"列(加了"行业"列后+1)
+                    if c == 16 and r.get("risk_n", 0) > 0:      # "风险数"列
                         it.setForeground(Qt.red)
                     self.batch_table.setItem(i, c, it)
             self.batch_table.resizeColumnsToContents()
@@ -6336,6 +6984,77 @@ if HAS_PYSIDE6:
             self.kelly_view.setWordWrap(True); self.kelly_view.setStyleSheet("padding:6px;")
             g.addWidget(self.kelly_view, 1, 0, 1, 5)
             layout.addWidget(box)
+
+            # --- 1%风险逆推仓位计算器 + 金字塔建仓可视化 ---
+            risk_box = QGroupBox("1% 风险逆推仓位计算器 + 金字塔分批建仓（仓位铁律）")
+            risk_layout = QVBoxLayout(risk_box)
+
+            # 说明文字
+            risk_intro = QLabel(
+                "<span style='color:#c0392b;font-weight:bold'>铁律：每笔交易最大亏损不超过账户的1%。</span>"
+                "  公式：<b>最大仓位金额 = 总资产 × 风险比例 ÷ 止损幅度</b>"
+                "<br>金字塔：30% 底仓（最低价买）+ 40% 加仓（确认上涨）+ 30% 追涨（趋势明确）；"
+                "永远保留 10-20% 现金底线。"
+            )
+            risk_intro.setWordWrap(True)
+            risk_intro.setStyleSheet("color:#555;background:#fef9e7;padding:6px;border-radius:4px")
+            risk_layout.addWidget(risk_intro)
+
+            # 输入参数行
+            inp_row = QGridLayout()
+            inp_row.addWidget(QLabel("账户总资产(元):"), 0, 0)
+            self._risk_total = QDoubleSpinBox()
+            self._risk_total.setRange(1000, 1e9); self._risk_total.setValue(100000)
+            self._risk_total.setSingleStep(10000); self._risk_total.setGroupSeparatorShown(True)
+            inp_row.addWidget(self._risk_total, 0, 1)
+
+            inp_row.addWidget(QLabel("单笔风险比例(%):"), 0, 2)
+            self._risk_pct = QDoubleSpinBox()
+            self._risk_pct.setRange(0.1, 10); self._risk_pct.setValue(1.0); self._risk_pct.setSingleStep(0.1)
+            inp_row.addWidget(self._risk_pct, 0, 3)
+
+            inp_row.addWidget(QLabel("止损幅度(%):"), 0, 4)
+            self._risk_sl = QDoubleSpinBox()
+            self._risk_sl.setRange(0.1, 50); self._risk_sl.setValue(5.0); self._risk_sl.setSingleStep(0.5)
+            inp_row.addWidget(self._risk_sl, 0, 5)
+
+            inp_row.addWidget(QLabel("当前股价(元):"), 1, 0)
+            self._risk_price = QDoubleSpinBox()
+            self._risk_price.setRange(0.01, 10000); self._risk_price.setValue(20.0); self._risk_price.setSingleStep(1)
+            inp_row.addWidget(self._risk_price, 1, 1)
+
+            inp_row.addWidget(QLabel("保留现金底线(%):"), 1, 2)
+            self._risk_cash_floor = QDoubleSpinBox()
+            self._risk_cash_floor.setRange(0, 50); self._risk_cash_floor.setValue(10.0); self._risk_cash_floor.setSingleStep(5)
+            inp_row.addWidget(self._risk_cash_floor, 1, 3)
+
+            self._risk_calc_btn = QPushButton("▶ 计算仓位 + 画金字塔")
+            self._risk_calc_btn.setStyleSheet("background:#2980b9;color:white;font-weight:bold;padding:6px 16px;border-radius:4px")
+            self._risk_calc_btn.clicked.connect(self._on_risk_calc)
+            inp_row.addWidget(self._risk_calc_btn, 1, 4, 1, 2)
+            risk_layout.addLayout(inp_row)
+
+            # 结果文字区
+            self._risk_result_lbl = QLabel("填入参数后点「计算仓位」。")
+            self._risk_result_lbl.setWordWrap(True)
+            self._risk_result_lbl.setStyleSheet("background:#eaf4fb;padding:8px;border-radius:4px;font-size:13px")
+            risk_layout.addWidget(self._risk_result_lbl)
+
+            # 可视化区（金字塔图）
+            if MATPLOTLIB_OK:
+                from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+                import matplotlib.pyplot as plt
+                self._risk_fig, self._risk_ax = plt.subplots(figsize=(8, 4))
+                self._risk_fig.patch.set_facecolor("#f8f9fa")
+                self._risk_canvas = FigureCanvas(self._risk_fig)
+                self._risk_canvas.setMinimumHeight(280)
+                risk_layout.addWidget(self._risk_canvas)
+                self._draw_pyramid_default()
+            else:
+                self._risk_canvas = None
+                self._risk_ax = None
+
+            layout.addWidget(risk_box)
             return panel
 
         def _on_portfolio_corr(self):
@@ -6517,7 +7236,637 @@ if HAS_PYSIDE6:
                 "这是数学最优增长比例，<b>非投资建议</b>，请务必留足风险边际。</span>")
             self._oplog(f"凯利仓位计算：p={p:.2f}, b={b:.2f} → 半凯利 {r['half']*100:.0f}%。")
 
-        # ---- 9.2.1i 预测跟踪标签页（存预测→到期对比真实→算真实准确率） ----
+        # ---- 9.2.1h2 尾盘选股标签页（五维尾盘法） ----
+        def _build_tail_scan_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            layout.setSpacing(6)
+
+            # ── 参数区 ──
+            param_box = QGroupBox("五维尾盘选股参数（建议14:30后执行）")
+            param_layout = QGridLayout(param_box)
+
+            # 涨幅范围
+            param_layout.addWidget(QLabel("涨幅范围(%):"), 0, 0)
+            self._tail_amp_min = QDoubleSpinBox(); self._tail_amp_min.setRange(0, 20); self._tail_amp_min.setValue(3.0); self._tail_amp_min.setSingleStep(0.5)
+            self._tail_amp_max = QDoubleSpinBox(); self._tail_amp_max.setRange(0, 20); self._tail_amp_max.setValue(5.0); self._tail_amp_max.setSingleStep(0.5)
+            param_layout.addWidget(self._tail_amp_min, 0, 1)
+            param_layout.addWidget(QLabel("~"), 0, 2)
+            param_layout.addWidget(self._tail_amp_max, 0, 3)
+
+            # 换手率范围
+            param_layout.addWidget(QLabel("换手率范围(%):"), 0, 4)
+            self._tail_turn_min = QDoubleSpinBox(); self._tail_turn_min.setRange(0, 100); self._tail_turn_min.setValue(5.0); self._tail_turn_min.setSingleStep(1.0)
+            self._tail_turn_max = QDoubleSpinBox(); self._tail_turn_max.setRange(0, 100); self._tail_turn_max.setValue(20.0); self._tail_turn_max.setSingleStep(1.0)
+            param_layout.addWidget(self._tail_turn_min, 0, 5)
+            param_layout.addWidget(QLabel("~"), 0, 6)
+            param_layout.addWidget(self._tail_turn_max, 0, 7)
+
+            # 流通市值范围
+            param_layout.addWidget(QLabel("流通市值(亿):"), 1, 0)
+            self._tail_mv_min = QDoubleSpinBox(); self._tail_mv_min.setRange(0, 100000); self._tail_mv_min.setValue(50); self._tail_mv_min.setSingleStep(10)
+            self._tail_mv_max = QDoubleSpinBox(); self._tail_mv_max.setRange(0, 100000); self._tail_mv_max.setValue(500); self._tail_mv_max.setSingleStep(10)
+            param_layout.addWidget(self._tail_mv_min, 1, 1)
+            param_layout.addWidget(QLabel("~"), 1, 2)
+            param_layout.addWidget(self._tail_mv_max, 1, 3)
+
+            # 量比最小值
+            param_layout.addWidget(QLabel("量比最小值:"), 1, 4)
+            self._tail_vr_min = QDoubleSpinBox(); self._tail_vr_min.setRange(0, 20); self._tail_vr_min.setValue(1.0); self._tail_vr_min.setSingleStep(0.1)
+            param_layout.addWidget(self._tail_vr_min, 1, 5)
+
+            # 连续放量天数
+            param_layout.addWidget(QLabel("连续放量天数≥:"), 1, 6)
+            self._tail_expand_days = QSpinBox(); self._tail_expand_days.setRange(1, 20); self._tail_expand_days.setValue(3)
+            param_layout.addWidget(self._tail_expand_days, 1, 7)
+
+            # 均线多头排列
+            self._tail_require_bull = QCheckBox("要求均线多头排列(MA5>MA10>MA20)")
+            self._tail_require_bull.setChecked(True)
+            param_layout.addWidget(self._tail_require_bull, 2, 0, 1, 4)
+
+            # 股票代码输入
+            param_layout.addWidget(QLabel("股票代码(空=全A股):"), 2, 4)
+            self._tail_codes_edit = QLineEdit()
+            self._tail_codes_edit.setPlaceholderText("如: 600519,000858,300750 (留空则扫描全部)")
+            param_layout.addWidget(self._tail_codes_edit, 2, 5, 1, 3)
+
+            layout.addWidget(param_box)
+
+            # ── 按钮区 ──
+            btn_row = QHBoxLayout()
+            self._tail_scan_btn = QPushButton("▶ 开始尾盘扫描")
+            self._tail_scan_btn.setStyleSheet("background:#27ae60;color:white;font-weight:bold;padding:6px 20px;border-radius:4px")
+            self._tail_scan_btn.clicked.connect(self._on_tail_scan_start)
+            self._tail_stop_btn = QPushButton("■ 停止")
+            self._tail_stop_btn.setStyleSheet("background:#c0392b;color:white;font-weight:bold;padding:6px 12px;border-radius:4px")
+            self._tail_stop_btn.setEnabled(False)
+            self._tail_stop_btn.clicked.connect(self._on_tail_scan_stop)
+            self._tail_progress = QProgressBar(); self._tail_progress.setRange(0, 100); self._tail_progress.setValue(0)
+            self._tail_status_lbl = QLabel("就绪")
+            btn_row.addWidget(self._tail_scan_btn)
+            btn_row.addWidget(self._tail_stop_btn)
+            btn_row.addWidget(self._tail_progress, 1)
+            btn_row.addWidget(self._tail_status_lbl)
+            layout.addLayout(btn_row)
+
+            # ── 说明标签 ──
+            hint = QLabel(
+                "<span style='color:#888;font-size:12px'>"
+                "五维条件：①涨幅3-5%  ②换手率5-20%  ③流通市值50-500亿  "
+                "④量比>1且连续3日放量  ⑤均线多头排列(MA5>MA10>MA20)  "
+                "| 综合分=满足条件数/5×100，全部满足=100分"
+                "</span>"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            # ── 结果表格 ──
+            self._tail_table = QTableWidget(0, 15)
+            self._tail_table.setHorizontalHeaderLabels([
+                "排名", "代码", "名称", "最新价",
+                "①涨幅%", "②换手率%", "③市值(亿)",
+                "④量比", "连续放量天", "⑤均线多头",
+                "涨幅✓", "换手✓", "市值✓", "放量✓", "多头✓"
+            ])
+            self._tail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self._tail_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self._tail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._tail_table.setSortingEnabled(True)
+            self._tail_table.setAlternatingRowColors(True)
+            layout.addWidget(self._tail_table, 1)
+
+            # ── 可视化区（Matplotlib图表） ──
+            if MATPLOTLIB_OK:
+                viz_box = QGroupBox("五维雷达图 & 涨幅/换手率散点图")
+                viz_layout = QHBoxLayout(viz_box)
+                from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+                import matplotlib.pyplot as plt
+                self._tail_fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                self._tail_fig.patch.set_facecolor("#1e1e2e")
+                self._tail_radar_ax = axes[0]
+                self._tail_scatter_ax = axes[1]
+                self._tail_canvas = FigureCanvas(self._tail_fig)
+                self._tail_canvas.setMinimumHeight(280)
+                viz_layout.addWidget(self._tail_canvas)
+                layout.addWidget(viz_box)
+            else:
+                self._tail_canvas = None
+
+            self._tail_scan_worker = None
+            return panel
+
+        def _on_tail_scan_start(self):
+            codes_text = self._tail_codes_edit.text().strip()
+            if codes_text:
+                codes = [c.strip() for c in codes_text.replace("，", ",").split(",") if c.strip()]
+            else:
+                codes = []
+            params = dict(
+                codes=codes,
+                min_amp=self._tail_amp_min.value() / 100,
+                max_amp=self._tail_amp_max.value() / 100,
+                min_turn=self._tail_turn_min.value() / 100,
+                max_turn=self._tail_turn_max.value() / 100,
+                min_mv=self._tail_mv_min.value() * 1e8,
+                max_mv=self._tail_mv_max.value() * 1e8,
+                min_vol_ratio=self._tail_vr_min.value(),
+                vol_expand_days=self._tail_expand_days.value(),
+                require_bull=self._tail_require_bull.isChecked(),
+            )
+            self._tail_scan_btn.setEnabled(False)
+            self._tail_stop_btn.setEnabled(True)
+            self._tail_progress.setValue(0)
+            self._tail_status_lbl.setText("扫描中...")
+            self._tail_table.setRowCount(0)
+
+            class _TailWorker(QThread):
+                progress_sig = Signal(int, str)
+                done_sig = Signal(list)
+                def __init__(self, p): super().__init__(); self._p = p; self._stop = False
+                def stop(self): self._stop = True
+                def run(self):
+                    def cb(done, total, code):
+                        if total > 0: self.progress_sig.emit(int(done/total*100), f"[{done}/{total}] {code}")
+                    results = tail_market_scan(
+                        codes=self._p["codes"],
+                        min_amp=self._p["min_amp"], max_amp=self._p["max_amp"],
+                        min_turn=self._p["min_turn"], max_turn=self._p["max_turn"],
+                        min_mv=self._p["min_mv"], max_mv=self._p["max_mv"],
+                        min_vol_ratio=self._p["min_vol_ratio"],
+                        vol_expand_days=self._p["vol_expand_days"],
+                        require_bull=self._p["require_bull"],
+                        progress_cb=cb,
+                    )
+                    self.done_sig.emit(results)
+
+            w = _TailWorker(params)
+            w.progress_sig.connect(lambda v, s: (self._tail_progress.setValue(v), self._tail_status_lbl.setText(s)))
+            w.done_sig.connect(self._on_tail_scan_done)
+            self._tail_scan_worker = w
+            w.start()
+
+        def _on_tail_scan_stop(self):
+            if self._tail_scan_worker:
+                self._tail_scan_worker.stop()
+            self._tail_scan_btn.setEnabled(True)
+            self._tail_stop_btn.setEnabled(False)
+            self._tail_status_lbl.setText("已停止")
+
+        def _on_tail_scan_done(self, results: list):
+            self._tail_scan_btn.setEnabled(True)
+            self._tail_stop_btn.setEnabled(False)
+            self._tail_progress.setValue(100)
+            self._tail_status_lbl.setText(f"完成，共找到 {len(results)} 只满足条件股票（按综合分排序）")
+
+            # 填充表格
+            self._tail_table.setSortingEnabled(False)
+            self._tail_table.setRowCount(len(results))
+            GREEN = QColor("#27ae60"); RED = QColor("#c0392b"); YELLOW = QColor("#f39c12")
+
+            def _check_item(val: bool) -> QTableWidgetItem:
+                item = QTableWidgetItem("✓" if val else "✗")
+                item.setForeground(GREEN if val else RED)
+                item.setTextAlignment(Qt.AlignCenter)
+                return item
+
+            for i, r in enumerate(results):
+                rank_item = QTableWidgetItem(str(i + 1))
+                rank_item.setTextAlignment(Qt.AlignCenter)
+                self._tail_table.setItem(i, 0, rank_item)
+                self._tail_table.setItem(i, 1, QTableWidgetItem(r.get("code", "")))
+                self._tail_table.setItem(i, 2, QTableWidgetItem(r.get("name", "")))
+
+                price_item = QTableWidgetItem(f"{r.get('last_close', 0):.2f}")
+                price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self._tail_table.setItem(i, 3, price_item)
+
+                amp_pct = r.get("amp_pct", 0) * 100
+                amp_item = QTableWidgetItem(f"{amp_pct:.2f}%")
+                amp_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                amp_item.setForeground(GREEN if amp_pct > 0 else RED)
+                self._tail_table.setItem(i, 4, amp_item)
+
+                turn_item = QTableWidgetItem(f"{r.get('turnover_pct', 0)*100:.2f}%")
+                turn_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self._tail_table.setItem(i, 5, turn_item)
+
+                mv_item = QTableWidgetItem(f"{r.get('mv_yi', 0):.1f}")
+                mv_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self._tail_table.setItem(i, 6, mv_item)
+
+                vr_item = QTableWidgetItem(f"{r.get('vol_ratio', 0):.2f}")
+                vr_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                vr_val = r.get("vol_ratio", 0)
+                vr_item.setForeground(GREEN if vr_val >= 1 else QColor("#888"))
+                self._tail_table.setItem(i, 7, vr_item)
+
+                expand_item = QTableWidgetItem(str(r.get("vol_expand_days", 0)))
+                expand_item.setTextAlignment(Qt.AlignCenter)
+                self._tail_table.setItem(i, 8, expand_item)
+
+                bull_val = r.get("ma_bull", 0)
+                bull_item = QTableWidgetItem("多头" if bull_val >= 1 else ("空头" if bull_val <= -1 else "震荡"))
+                bull_item.setForeground(GREEN if bull_val >= 1 else (RED if bull_val <= -1 else YELLOW))
+                bull_item.setTextAlignment(Qt.AlignCenter)
+                self._tail_table.setItem(i, 9, bull_item)
+
+                self._tail_table.setItem(i, 10, _check_item(bool(r.get("c1_amp", False))))
+                self._tail_table.setItem(i, 11, _check_item(bool(r.get("c2_turn", False))))
+                self._tail_table.setItem(i, 12, _check_item(bool(r.get("c3_mv", False))))
+                self._tail_table.setItem(i, 13, _check_item(bool(r.get("c4_vol", False))))
+                self._tail_table.setItem(i, 14, _check_item(bool(r.get("c5_bull", False))))
+
+                # 整行颜色：满足全部5条件=绿色底
+                score = r.get("score", 0)
+                if score >= 100:
+                    for col in range(15):
+                        item = self._tail_table.item(i, col)
+                        if item:
+                            item.setBackground(QColor("#1a472a"))
+                elif score >= 60:
+                    for col in range(15):
+                        item = self._tail_table.item(i, col)
+                        if item:
+                            item.setBackground(QColor("#2c3e50"))
+
+            self._tail_table.setSortingEnabled(True)
+            self._tail_table.sortItems(0, Qt.AscendingOrder)
+
+            # ── 可视化：雷达图 + 散点图 ──
+            if self._tail_canvas is not None and results:
+                self._draw_tail_charts(results)
+
+        def _draw_tail_charts(self, results: list):
+            try:
+                import numpy as np
+                import matplotlib
+                matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+                matplotlib.rcParams["axes.unicode_minus"] = False
+
+                fig = self._tail_fig
+                fig.clear()
+                axes = fig.subplots(1, 2)
+                radar_ax = axes[0]
+                scatter_ax = axes[1]
+                fig.patch.set_facecolor("#1e1e2e")
+
+                # ── 左图：雷达图（取前5名综合分） ──
+                top5 = results[:5]
+                categories = ["涨幅条件", "换手条件", "市值条件", "放量条件", "多头条件"]
+                N = len(categories)
+                angles = [n / float(N) * 2 * np.pi for n in range(N)]
+                angles += angles[:1]
+
+                radar_ax.set_facecolor("#12122a")
+                radar_ax.set_theta_offset(np.pi / 2)
+                radar_ax.set_theta_direction(-1)
+                radar_ax.set_xticks(angles[:-1])
+                radar_ax.set_xticklabels(categories, color="white", fontsize=9)
+                radar_ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+                radar_ax.set_yticklabels(["20", "40", "60", "80", "100"], color="#888", fontsize=7)
+                radar_ax.set_ylim(0, 1)
+                radar_ax.spines["polar"].set_color("#444")
+                radar_ax.grid(color="#333", linestyle="--", linewidth=0.5)
+                radar_ax.set_title("前5名五维雷达图", color="white", fontsize=11, pad=15)
+
+                colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
+                for idx, r in enumerate(top5):
+                    vals = [
+                        1.0 if r.get("c1_amp") else 0.3,
+                        1.0 if r.get("c2_turn") else 0.3,
+                        1.0 if r.get("c3_mv") else 0.3,
+                        1.0 if r.get("c4_vol") else 0.3,
+                        1.0 if r.get("c5_bull") else 0.3,
+                    ]
+                    vals += vals[:1]
+                    color = colors[idx % len(colors)]
+                    radar_ax.plot(angles, vals, color=color, linewidth=2, linestyle="solid")
+                    radar_ax.fill(angles, vals, alpha=0.15, color=color)
+                    name = r.get("name", r.get("code", ""))[:4]
+                    radar_ax.annotate(name, xy=(angles[0], vals[0]), fontsize=7, color=color)
+
+                # ── 右图：涨幅 vs 换手率散点图（按综合分着色） ──
+                scatter_ax.set_facecolor("#12122a")
+                scatter_ax.spines["bottom"].set_color("#444")
+                scatter_ax.spines["top"].set_color("#444")
+                scatter_ax.spines["left"].set_color("#444")
+                scatter_ax.spines["right"].set_color("#444")
+                scatter_ax.tick_params(colors="white")
+                scatter_ax.set_xlabel("涨幅(%)", color="white", fontsize=10)
+                scatter_ax.set_ylabel("换手率(%)", color="white", fontsize=10)
+                scatter_ax.set_title("涨幅 vs 换手率（颜色=综合分）", color="white", fontsize=11)
+
+                amp_vals = [r.get("amp_pct", 0) * 100 for r in results]
+                turn_vals = [r.get("turnover_pct", 0) * 100 for r in results]
+                score_vals = [r.get("score", 0) for r in results]
+
+                sc = scatter_ax.scatter(
+                    amp_vals, turn_vals,
+                    c=score_vals, cmap="RdYlGn",
+                    vmin=0, vmax=100,
+                    s=60, alpha=0.85, edgecolors="#333", linewidths=0.5
+                )
+                cbar = fig.colorbar(sc, ax=scatter_ax)
+                cbar.set_label("综合分", color="white", fontsize=9)
+                cbar.ax.yaxis.set_tick_params(color="white")
+                plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+                # 标注前5名名称
+                for r in results[:5]:
+                    scatter_ax.annotate(
+                        r.get("name", r.get("code", ""))[:4],
+                        (r.get("amp_pct", 0) * 100, r.get("turnover_pct", 0) * 100),
+                        fontsize=7, color="white",
+                        xytext=(3, 3), textcoords="offset points"
+                    )
+
+                # 目标区间框
+                amp_min = self._tail_amp_min.value(); amp_max = self._tail_amp_max.value()
+                turn_min = self._tail_turn_min.value(); turn_max = self._tail_turn_max.value()
+                from matplotlib.patches import Rectangle
+                rect = Rectangle(
+                    (amp_min, turn_min), amp_max - amp_min, turn_max - turn_min,
+                    linewidth=1.5, edgecolor="#27ae60", facecolor="none", linestyle="--", alpha=0.7
+                )
+                scatter_ax.add_patch(rect)
+                scatter_ax.set_xlim(left=min(amp_vals + [amp_min]) - 0.5)
+
+                fig.tight_layout(pad=2)
+                self._tail_canvas.draw()
+            except Exception as e:
+                self._oplog(f"尾盘图表绘制失败: {e}")
+
+        def _draw_pyramid_default(self):
+            """绘制默认金字塔示意图（未填参数时展示）"""
+            if not MATPLOTLIB_OK or self._risk_ax is None:
+                return
+            try:
+                import matplotlib
+                matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+                matplotlib.rcParams["axes.unicode_minus"] = False
+                ax = self._risk_ax; ax.clear()
+                ax.set_facecolor("#f8f9fa")
+                self._risk_fig.patch.set_facecolor("#f8f9fa")
+                layers = [
+                    (0.30, "#e74c3c", "③ 追涨仓 30%\n趋势明确时补入", "最高价买入"),
+                    (0.40, "#e67e22", "② 加仓 40%\n确认突破后加入", "中间价买入"),
+                    (0.30, "#27ae60", "① 底仓 30%\n最低价建仓", "最低价买入"),
+                ]
+                y = 0
+                for ratio, color, label, sublabel in reversed(layers):
+                    width = 0.3 + ratio * 1.4
+                    x = (2.0 - width) / 2
+                    ax.barh(y + 0.5, width, height=0.85, left=x,
+                            color=color, alpha=0.85, edgecolor="white", linewidth=1.5)
+                    ax.text(1.0, y + 0.5, label, ha="center", va="center",
+                            color="white", fontsize=9, fontweight="bold")
+                    ax.text(2.05, y + 0.5, sublabel, ha="left", va="center",
+                            color="#555", fontsize=8)
+                    y += 1
+                ax.set_xlim(0, 2.6); ax.set_ylim(-0.3, 3.3)
+                ax.axis("off")
+                ax.set_title("金字塔分批建仓法（示意图）\n总仓位上限 = 总资产 × (1 - 现金底线%)",
+                             fontsize=10, color="#2c3e50", pad=10)
+                ax.text(1.0, -0.15, "⚠ 永远保留 10~20% 现金底线（应急 + 抄底机会）",
+                        ha="center", va="center", color="#c0392b", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="#fef9e7", ec="#f39c12"))
+                self._risk_fig.tight_layout()
+                self._risk_canvas.draw()
+            except Exception:
+                pass
+
+        def _on_risk_calc(self):
+            try:
+                total = self._risk_total.value()
+                risk_pct = self._risk_pct.value() / 100.0
+                sl_pct = self._risk_sl.value() / 100.0
+                price = self._risk_price.value()
+                cash_floor_pct = self._risk_cash_floor.value() / 100.0
+            except Exception:
+                self._risk_result_lbl.setText("参数读取失败，请检查输入。"); return
+            if sl_pct <= 0:
+                self._risk_result_lbl.setText("止损幅度不能为0。"); return
+
+            max_position_money = total * risk_pct / sl_pct
+            available = total * (1 - cash_floor_pct)
+            capped = max_position_money > available
+            actual_position = min(max_position_money, available)
+            shares = int(actual_position / price / 100) * 100 if price > 0 else 0
+            actual_money = shares * price
+
+            tier1 = actual_money * 0.30; tier2 = actual_money * 0.40; tier3 = actual_money * 0.30
+            sh1 = int(tier1 / price / 100) * 100 if price > 0 else 0
+            sh2 = int(tier2 / price / 100) * 100 if price > 0 else 0
+            sh3 = int(tier3 / price / 100) * 100 if price > 0 else 0
+            stop_loss_money = actual_money * sl_pct
+            cash_reserved = total * cash_floor_pct
+
+            result_text = (
+                f"<b>账户总资产：</b>{total:,.0f} 元　"
+                f"<b>单笔风险：</b>{total*risk_pct:,.0f} 元（{self._risk_pct.value():.1f}%）<br>"
+                f"<b>理论最大仓位金额：</b>{max_position_money:,.0f} 元"
+                + (f"　<span style='color:#c0392b'>（已限制至可用资金 {available:,.0f} 元）</span>" if capped else "") +
+                f"<br><b>实际建仓金额（取整百股）：</b>"
+                f"<span style='color:#2980b9;font-size:15px'><b>{actual_money:,.0f} 元 / {shares} 股</b></span>"
+                f"　股价 {price:.2f} 元<br>"
+                f"<b>止损触发亏损：</b>{stop_loss_money:,.0f} 元　<b>现金底线保留：</b>{cash_reserved:,.0f} 元<br>"
+                f"<hr>"
+                f"<b>金字塔分批计划：</b><br>"
+                f"&nbsp;&nbsp;① <span style='color:#27ae60'>底仓 30%</span>："
+                f"{tier1:,.0f}元 / <b>{sh1}股</b>（最低价建仓，趋势未明时只买这一档）<br>"
+                f"&nbsp;&nbsp;② <span style='color:#e67e22'>加仓 40%</span>："
+                f"{tier2:,.0f}元 / <b>{sh2}股</b>（确认突破/上涨后加入）<br>"
+                f"&nbsp;&nbsp;③ <span style='color:#e74c3c'>追涨 30%</span>："
+                f"{tier3:,.0f}元 / <b>{sh3}股</b>（趋势明确时补仓）<br>"
+                f"<span style='color:#c0392b;font-size:11px'>"
+                f"⚠ 仓位铁律：单笔≤账户1%、总持仓不超过可用资金、永远保留现金底线。非投资建议，盈亏自负。</span>"
+            )
+            self._risk_result_lbl.setText(result_text)
+            self._oplog(f"1%风险逆推：总资产{total:.0f}，仓位{actual_money:.0f}，止损{stop_loss_money:.0f}")
+
+            if MATPLOTLIB_OK and self._risk_canvas is not None:
+                self._draw_pyramid_with_data(total, actual_money, tier1, tier2, tier3,
+                                              sh1, sh2, sh3, price, sl_pct, cash_reserved)
+
+        def _draw_pyramid_with_data(self, total, actual_money, tier1, tier2, tier3,
+                                     sh1, sh2, sh3, price, sl_pct, cash_reserved):
+            try:
+                import matplotlib
+                matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+                matplotlib.rcParams["axes.unicode_minus"] = False
+                ax = self._risk_ax; ax.clear()
+                ax.set_facecolor("#f8f9fa")
+                self._risk_fig.patch.set_facecolor("#f8f9fa")
+
+                layers_data = [
+                    (tier3, "#e74c3c", f"③ 追涨仓 30%\n{tier3:,.0f}元/{sh3}股", "趋势明确"),
+                    (tier2, "#e67e22", f"② 加仓 40%\n{tier2:,.0f}元/{sh2}股", "确认突破"),
+                    (tier1, "#27ae60", f"① 底仓 30%\n{tier1:,.0f}元/{sh1}股", "最低价建仓"),
+                ]
+                y = 0
+                for money, color, label, sublabel in reversed(layers_data):
+                    ratio = money / actual_money if actual_money > 0 else 0.33
+                    width = 0.3 + ratio * 1.4
+                    x = (2.0 - width) / 2
+                    ax.barh(y + 0.5, width, height=0.85, left=x,
+                            color=color, alpha=0.85, edgecolor="white", linewidth=1.5)
+                    ax.text(1.0, y + 0.5, label, ha="center", va="center",
+                            color="white", fontsize=8.5, fontweight="bold")
+                    ax.text(2.05, y + 0.5, sublabel, ha="left", va="center",
+                            color="#555", fontsize=8)
+                    y += 1
+
+                ax.set_xlim(0, 2.6); ax.set_ylim(-0.5, 3.6)
+                ax.axis("off")
+                ax.set_title(
+                    f"金字塔建仓计划  总仓位 {actual_money:,.0f}元/{sh1+sh2+sh3}股\n"
+                    f"止损幅度 {sl_pct*100:.1f}%  |  现金底线 {cash_reserved:,.0f}元  |  股价 {price:.2f}元",
+                    fontsize=9.5, color="#2c3e50", pad=10
+                )
+
+                used_ratio = actual_money / total if total > 0 else 0
+                ax.barh(3.3, used_ratio * 2.0, height=0.22, left=0,
+                        color="#3498db", alpha=0.7)
+                ax.barh(3.3, (1 - used_ratio) * 2.0, height=0.22, left=used_ratio * 2.0,
+                        color="#bdc3c7", alpha=0.5)
+                ax.text(1.0, 3.42, f"仓位占比 {used_ratio*100:.1f}%  |  现金 {(1-used_ratio)*100:.1f}%",
+                        ha="center", va="center", fontsize=8, color="#2c3e50")
+                ax.text(1.0, -0.35, "⚠ 永远保留现金底线，切勿满仓。非投资建议，盈亏自负。",
+                        ha="center", va="center", color="#c0392b", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="#fef9e7", ec="#f39c12"))
+                self._risk_fig.tight_layout()
+                self._risk_canvas.draw()
+            except Exception as e:
+                self._oplog(f"金字塔图绘制失败: {e}")
+
+        # ---- 9.2.1i 板块行情标签页（概念/行业板块实时涨跌） ----
+        def _build_board_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+
+            # 顶部控制行
+            top = QHBoxLayout()
+            self.board_type_combo = QComboBox()
+            self.board_type_combo.addItems(["概念板块", "行业板块"])
+            top.addWidget(QLabel("板块类型:"))
+            top.addWidget(self.board_type_combo)
+            self.board_refresh_btn = QPushButton("▶ 刷新板块行情")
+            self.board_refresh_btn.setStyleSheet("font-weight:bold;padding:5px;background:#c0392b;color:white;")
+            self.board_refresh_btn.clicked.connect(self._on_board_refresh)
+            top.addWidget(self.board_refresh_btn)
+            self.board_status = QLabel("点击刷新获取最新板块涨跌数据")
+            self.board_status.setStyleSheet("color:#666;")
+            top.addWidget(self.board_status, stretch=1)
+            layout.addLayout(top)
+
+            # 说明文字
+            note = QLabel("数据来自东方财富（akshare），仅供参考，不构成投资建议。"
+                          "红色=涨，绿色=跌（A股传统配色）。")
+            note.setStyleSheet("color:#888;font-size:11px;padding:2px;")
+            layout.addWidget(note)
+
+            # 滚动区域放板块卡片
+            self.board_scroll = QScrollArea()
+            self.board_scroll.setWidgetResizable(True)
+            self.board_inner = QWidget()
+            self.board_grid = QGridLayout(self.board_inner)
+            self.board_grid.setSpacing(6)
+            self.board_scroll.setWidget(self.board_inner)
+            layout.addWidget(self.board_scroll, stretch=1)
+
+            # 下方明细表格
+            self.board_table = QTextBrowser()
+            self.board_table.setMaximumHeight(180)
+            self.board_table.setOpenExternalLinks(False)
+            layout.addWidget(self.board_table)
+            return panel
+
+        def _on_board_refresh(self):
+            btype = "industry" if self.board_type_combo.currentIndex() == 1 else "concept"
+            self.board_refresh_btn.setEnabled(False)
+            self.board_status.setText("正在拉取数据…")
+            try:
+                df = fetch_board_spot(btype)
+            except Exception as e:
+                self.board_status.setText(f"获取失败: {e}")
+                self.board_refresh_btn.setEnabled(True)
+                return
+            if df.empty:
+                self.board_status.setText("未获取到数据（akshare 未安装或接口异常）")
+                self.board_refresh_btn.setEnabled(True)
+                return
+
+            # 清空旧卡片
+            while self.board_grid.count():
+                item = self.board_grid.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            # 渲染卡片：两列网格
+            COLS = 2
+            for i, row in df.iterrows():
+                pct = float(row.get("pct", 0))
+                name = str(row.get("name", ""))
+                up = int(row.get("up_cnt", 0)) if "up_cnt" in row else "-"
+                down = int(row.get("down_cnt", 0)) if "down_cnt" in row else "-"
+                lead = str(row.get("lead_stock", "")) if "lead_stock" in row else ""
+
+                frame = QFrame()
+                frame.setFrameShape(QFrame.StyledPanel)
+                bg = "#fff0f0" if pct >= 0 else "#f0fff0"
+                frame.setStyleSheet(f"background:{bg};border-radius:6px;padding:2px;")
+                fl = QVBoxLayout(frame)
+                fl.setSpacing(1)
+                fl.setContentsMargins(6, 4, 6, 4)
+
+                # 板块名称
+                name_lbl = QLabel(name)
+                name_lbl.setStyleSheet("font-weight:bold;font-size:13px;")
+                fl.addWidget(name_lbl)
+
+                # 涨跌幅
+                arrow = "▲" if pct >= 0 else "▼"
+                color = "#c0392b" if pct >= 0 else "#27ae60"
+                pct_lbl = QLabel(f"{arrow}{pct:+.2f}%")
+                pct_lbl.setStyleSheet(f"color:{color};font-size:14px;font-weight:bold;")
+                fl.addWidget(pct_lbl)
+
+                # 上涨/下跌家数
+                detail_lbl = QLabel(f"涨{up}家 / 跌{down}家" + (f"  领涨:{lead}" if lead else ""))
+                detail_lbl.setStyleSheet("color:#666;font-size:11px;")
+                fl.addWidget(detail_lbl)
+
+                r, c = divmod(i, COLS)
+                self.board_grid.addWidget(frame, r, c)
+
+            # 明细 HTML 表格（Top20 + Bottom10）
+            top20 = df.head(20)
+            bot10 = df.tail(10)
+            rows_html = ""
+            for _, row in pd.concat([top20, bot10]).drop_duplicates().iterrows():
+                pct = float(row.get("pct", 0))
+                col = "#c0392b" if pct >= 0 else "#27ae60"
+                rows_html += (f"<tr><td>{row.get('name','')}</td>"
+                              f"<td style='color:{col};text-align:right'>{pct:+.2f}%</td>"
+                              f"<td>{row.get('up_cnt','-')}</td><td>{row.get('down_cnt','-')}</td>"
+                              f"<td>{row.get('lead_stock','')}</td></tr>")
+            self.board_table.setHtml(
+                "<table width='100%' cellspacing='0' cellpadding='3' border='0'>"
+                "<tr style='background:#eee'><th>板块</th><th>涨跌幅</th><th>涨家数</th><th>跌家数</th><th>领涨股</th></tr>"
+                + rows_html + "</table>"
+            )
+            n_up = int((df["pct"] > 0).sum())
+            n_dn = int((df["pct"] < 0).sum())
+            self.board_status.setText(
+                f"共 {len(df)} 个板块 · 上涨{n_up}个 · 下跌{n_dn}个 · "
+                f"最强: {df.iloc[0]['name']} {df.iloc[0]['pct']:+.2f}% · "
+                f"最弱: {df.iloc[-1]['name']} {df.iloc[-1]['pct']:+.2f}%"
+            )
+            self.board_refresh_btn.setEnabled(True)
+            self._oplog(f"板块行情刷新完成：{len(df)}个板块，涨{n_up}跌{n_dn}。")
+
+        # ---- 9.2.1j 预测跟踪标签页（存预测→到期对比真实→算真实准确率） ----
         def _build_tracking_tab(self) -> QWidget:
             panel = QWidget()
             layout = QVBoxLayout(panel)
@@ -6866,6 +8215,8 @@ if HAS_PYSIDE6:
             if "bench_return_pct" in bt:
                 bench_txt = (f" · 沪深300 {bt['bench_return_pct']}%(年化{bt['bench_annual_pct']}%)"
                              f" · 超大盘 {bt['excess_vs_bench_pct']}%")
+                if bt.get("information_ratio") is not None:
+                    bench_txt += f" · 信息比率(IR) {bt['information_ratio']}"
             # A 股制度真实化统计
             inst = (f" · 涨停买不进{bt['n_block_buy']}段/停牌{bt['n_suspend']}段/跌停卖不出{bt['n_stuck_sell']}段"
                     f"(涨跌停幅{bt['limit_pct']}%)")
@@ -6879,8 +8230,12 @@ if HAS_PYSIDE6:
                 f"交易{bt['n_trades']}/{bt['n_segments']}段 · 胜率{bt['win_rate_pct']}%{inst}{risk_txt}　||　"
                 f"策略 {bt['total_return_pct']}%(年化{bt['annual_return_pct']}%) vs "
                 f"买入持有 {bt['buyhold_return_pct']}%(年化{bt['buyhold_annual_pct']}%) · "
-                f"超额 {bt['excess_vs_buyhold_pct']}%{bench_txt} · 最大回撤 {bt['max_drawdown_pct']}% · "
-                f"夏普 {bt['sharpe']}　→　{verdict}")
+                f"超额 {bt['excess_vs_buyhold_pct']}%{bench_txt} · 最大回撤 {bt['max_drawdown_pct']}%"
+                + (f"(恢复{bt['recovery_days']}日)" if bt.get('recovery_days') is not None else "(未恢复)" if bt.get('max_drawdown_pct', 0) < -0.1 else "")
+                + f" · 夏普 {bt['sharpe']}"
+                + (f" · 索提诺 {bt['sortino']}" if bt.get('sortino') is not None else "")
+                + (f" · 卡玛 {bt['calmar']}" if bt.get('calmar') is not None else "")
+                + f"　→　{verdict}")
             self.bt_figure.clear()
             ax = self.bt_figure.add_subplot(111)
             d = pd.to_datetime(bt["seg_dates"])
@@ -7383,6 +8738,20 @@ if HAS_PYSIDE6:
             "mf_main_net": "主力净流入", "mf_main_pct": "主力净占比", "mf_xl_net": "超大单净额",
             "mf_l_net": "大单净额", "mf_streak": "主力连续进出天数", "mf_cum5": "主力5日累计",
             "mf_price_div": "资金-价格背离",
+            # 4.1.12 新增
+            "bias_5": "BIAS5乖离率", "bias_20": "BIAS20乖离率",
+            "ma_bull_rank": "均线多头排列", "vol_expand_days": "连续放量天数",
+            "vol_ratio_active": "量比>1",
+            # 4.1.11 新增
+            "support_20d": "近20日支撑位", "resist_20d": "近20日压力位",
+            "dist_to_support": "距支撑距离", "dist_to_resist": "距压力距离",
+            "pivot": "轴心点(Pivot)", "boll_width": "布林带宽", "boll_pos": "布林带位置",
+            "tail_strength": "尾盘强弱", "tail_strength_5d": "5日尾盘均强", "macd_cross": "MACD金叉信号",
+            # 4.1.13 大宗交易
+            "bt_premium": "大宗折溢率(%)", "bt_premium_5d": "大宗5日均折溢率",
+            "bt_premium_pos": "大宗溢价信号", "bt_amount": "大宗成交额(万)",
+            "bt_amount_5d": "大宗5日合计额", "bt_amount_ratio": "大宗额占比",
+            "bt_count": "大宗笔数", "bt_count_5d": "大宗5日笔数",
         }
 
         def _build_recommendation_html(self, results):
