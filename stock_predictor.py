@@ -364,7 +364,7 @@ class StockDataFetcher:
                     errors.append(f"{name}(第{attempt}次): {e}")
                     if attempt < retries:
                         if name.startswith("akshare") and self._is_akshare_rate_limit_error(e):
-                            wait_s = 45.0 * attempt      # 限流冷却窗口远长于瞬时抖动，需等更久(45/90秒)
+                            wait_s = 20.0 * attempt      # 限流冷却窗口比瞬时抖动长，需多等一会(20/40秒)
                             print(f"[akshare限流] 第{attempt}次被限流，等待{wait_s:.0f}秒后重试...")
                             time.sleep(wait_s)
                         else:
@@ -4069,6 +4069,7 @@ PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "b
              "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
              "status", "actual_close", "actual_change_pct", "hit_dir", "in_interval", "verified_at", "source"]
 PRED_RETENTION_DAYS = 15   # 「预测跟踪」只保留最近15日的已验证记录（未到期的pending不受影响，见 prune_pred_log）
+PRICE_HIT_TOLERANCE = 0.05  # 「股价命中」判定：|实际价-预测价|/实际价 <= 5% 才算命中(不用±80%置信区间，区间太宽会虚高"准"的观感)
 
 
 def _init_pred_db() -> None:
@@ -4191,11 +4192,12 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> i
                 df.at[idx, "actual_close"] = str(round(actual, 4))
                 df.at[idx, "actual_change_pct"] = str(round(chg, 3))
                 df.at[idx, "hit_dir"] = "1" if pred_dir == actual_dir else "0"
-                # 区间校准：真实价是否落在记录时的约80%置信区间内
-                lo = pd.to_numeric(df.at[idx, "pred_lo"], errors="coerce") if "pred_lo" in df.columns else np.nan
-                hi = pd.to_numeric(df.at[idx, "pred_hi"], errors="coerce") if "pred_hi" in df.columns else np.nan
-                if pd.notna(lo) and pd.notna(hi):
-                    df.at[idx, "in_interval"] = "1" if (lo <= actual <= hi) else "0"
+                # 股价命中：|实际价-预测价|/实际价 <= PRICE_HIT_TOLERANCE(默认5%) 才算命中，
+                # 不用记录时的约80%置信区间(区间太宽，落在区间内不代表预测真的准)
+                pred_close = pd.to_numeric(df.at[idx, "pred_close"], errors="coerce") if "pred_close" in df.columns else np.nan
+                if pd.notna(pred_close) and actual != 0:
+                    rel_err = abs(actual - pred_close) / abs(actual)
+                    df.at[idx, "in_interval"] = "1" if rel_err <= PRICE_HIT_TOLERANCE else "0"
                 df.at[idx, "status"] = "verified"
                 df.at[idx, "verified_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
                 n_ok += 1
@@ -4240,7 +4242,7 @@ def _recent_verified(days: int = PRED_RETENTION_DAYS) -> pd.DataFrame:
 
 def prediction_postmortem() -> Dict[str, Any]:
     """预测复盘(借鉴 signal-postmortem skill)：从**已验证**的预测里找系统性规律/偏差——
-    整体真实DA、区间覆盖率、系统性乐观/悲观偏差(预测涨跌 − 实际涨跌的均值)、按方向拆分的命中率、最好/最差模型。
+    整体真实DA、股价命中率(见 PRICE_HIT_TOLERANCE)、系统性乐观/悲观偏差(预测涨跌 − 实际涨跌的均值)、按方向拆分的命中率、最好/最差模型。
     全部基于真实到期对比，只用最近15日(PRED_RETENTION_DAYS)已验证的记录(见 _recent_verified)，
     帮你看清『模型到底错在哪、别一直被同一个坑坑』。非投资建议。"""
     v = _recent_verified()
@@ -4271,17 +4273,18 @@ def prediction_postmortem() -> Dict[str, Any]:
     return out
 
 
-# 预测跟踪支持的 8 个周期(交易日) → 中文标签，按顺序展示
-PRED_HORIZONS = [1, 3, 5, 10, 20, 30, 40, 60]
-PRED_HZ_LABEL = {1: "一天(1日)", 3: "三天(3日)", 5: "一周(5日)", 10: "两周(10日)",
-                 20: "一个月(20日)", 30: "一个半月(30日)", 40: "两个月(40日)", 60: "三个月(60日)"}
+# 预测跟踪支持的 10 个周期(交易日) → 中文标签，按顺序展示（1~5日逐日 + 10/20/30/40/60日）
+PRED_HORIZONS = [1, 2, 3, 4, 5, 10, 20, 30, 40, 60]
+PRED_HZ_LABEL = {1: "一天(1日)", 2: "两天(2日)", 3: "三天(3日)", 4: "四天(4日)", 5: "一周(5日)",
+                 10: "两周(10日)", 20: "一个月(20日)", 30: "一个半月(30日)", 40: "两个月(40日)",
+                 60: "三个月(60日)"}
 
 
 def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
-    """按预测周期统计**真实**方向准确率(dir_acc)与股价准确性/区间覆盖率(coverage)(只用最近15日
+    """按预测周期统计**真实**方向准确率(dir_acc)与股价准确性(coverage，见 PRICE_HIT_TOLERANCE)(只用最近15日
     已验证记录，全部真实到期对比，见 _recent_verified)。
     误差% = |预测涨跌% − 实际涨跌%|(收益率口径的绝对误差)。返回每周期:
-    {n, dir_acc(方向准确率%), err_max/err_mean/err_median/err_min(误差%), coverage(股价准确性/区间覆盖率%)}。"""
+    {n, dir_acc(方向准确率%), err_max/err_mean/err_median/err_min(误差%), coverage(股价准确性，|实际价-预测价|/实际价≤5%的比例)}。"""
     v = _recent_verified()
     out = {}
     if len(v) == 0:
@@ -8281,7 +8284,7 @@ if HAS_PYSIDE6:
             self.trk_hint = QLabel("先在左侧「运行选中配置模型」训练，这里才会出现已训练模型。")
             self.trk_hint.setStyleSheet("color:#888;")
             top.addWidget(self.trk_hint)
-            b1 = QPushButton("📌 记录当前预测(1/3/5/10/20/30/40/60日)")
+            b1 = QPushButton("📌 记录当前预测(1/2/3/4/5/10/20/30/40/60日)")
             b1.setStyleSheet("font-weight:bold; padding:6px;")
             b1.clicked.connect(self._on_record_prediction)
             top.addWidget(b1)
@@ -8326,7 +8329,7 @@ if HAS_PYSIDE6:
             model = self.trk_model_combo.currentText()
             target_mode = "return" if self.target_combo.currentIndex() == 0 else "price"
             try:
-                self.trk_summary.setHtml(f"<p>正在用 {model} 为 {code} 生成 1/3/5/10/20/30/40/60 日预测并记录 ...</p>")
+                self.trk_summary.setHtml(f"<p>正在用 {model} 为 {code} 生成 1/2/3/4/5/10/20/30/40/60 日预测并记录 ...</p>")
                 QApplication.processEvents()
                 df = StockDataFetcher().fetch(code, self.start_date.date().toString("yyyyMMdd"),
                                               self.end_date.date().toString("yyyyMMdd"))
@@ -8409,12 +8412,12 @@ if HAS_PYSIDE6:
                         "<table border=1 cellpadding=3 cellspacing=0 width=100%>"
                         "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th>"
                         "<th>最大误差</th><th>平均误差</th><th>中位数误差</th><th>最小误差</th>"
-                        "<th>股价准确性(区间命中率≈80%)</th></tr>"
+                        f"<th>股价准确性(±{PRICE_HIT_TOLERANCE*100:.0f}%误差内)</th></tr>"
                         f"{rows}</table>"
                         "<p style='color:#c0392b'>误差% = |预测涨跌% − 实际涨跌%|(收益率口径，越小越准)。"
                         "<b>方向准确率</b>=涨跌方向猜对的比例，需明显&gt;50%才有意义；"
-                        "<b>股价准确性</b>=真实价落在预测约80%置信区间内的比例，接近80%才说明价格预测靠谱——"
-                        "两者是两回事，方向猜对不代表价格准。"
+                        f"<b>股价准确性</b>=|实际价-预测价|/实际价 ≤ {PRICE_HIT_TOLERANCE*100:.0f}% 的比例，"
+                        "越高说明价格预测越准——两者是两回事，方向猜对不代表价格准。"
                         f"只统计最近{PRED_RETENTION_DAYS}日验证的记录，更早的旧记录会被自动清理(见 prune_pred_log)；"
                         "全部用真实到期股价验算；样本少仅供参考，不构成投资建议。</p>")
             else:
@@ -8426,7 +8429,7 @@ if HAS_PYSIDE6:
             if pm.get("enough"):
                 uh, un = pm["up_hit"]; dh, dn = pm["dn_hit"]
                 mdl = "、".join(f"{m}{da}%(n={n})" for m, da, n in pm["by_model"][:5])
-                cov = f"、区间覆盖率 {pm['coverage']}%" if pm.get("coverage") is not None else ""
+                cov = f"、股价命中率 {pm['coverage']}%" if pm.get("coverage") is not None else ""
                 html += (
                     "<h3>📋 预测复盘（从已验证记录找规律）</h3>"
                     f"<p>共 {pm['n']} 条已验证 · 真实方向准确率 <b>{pm['da']}%</b>{cov}</p>"
@@ -8445,7 +8448,7 @@ if HAS_PYSIDE6:
             # "命中"改名"方向命中"、"落区间"改名"股价命中"：两者不是一回事，方向对不代表价格准(见下方高亮说明)
             heads = ["记录时间", "代码", "名称", "模型", "周期", "记录时DA%", "基准日", "基准价", "预测价",
                      "预测涨跌%", "方向", "区间下", "区间上", "目标日", "状态", "实际价", "实际涨跌%",
-                     "方向命中", "股价命中(±80%区间)", "来源"]
+                     "方向命中", f"股价命中(±{PRICE_HIT_TOLERANCE*100:.0f}%误差内)", "来源"]
             # 应用筛选(状态 + 代码)
             if len(df):
                 fi = self.trk_filter.currentIndex() if hasattr(self, "trk_filter") else 0
