@@ -82,6 +82,7 @@ from matplotlib.figure import Figure
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei",
                                           "Arial Unicode MS", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
+MATPLOTLIB_OK = True   # matplotlib 为硬依赖（无 try/except），能导入到这里就一定可用
 # 注意：FigureCanvasQTAgg 依赖 PySide6/PyQt 才能导入，放到"可选依赖"区域（1.3.7）里按需导入，
 # 这样在没装 GUI 库、只想用本文件做命令行训练/批量实验的场景下，导入本文件不会直接报错。
 
@@ -184,10 +185,11 @@ try:
         QGroupBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton, QLabel,
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
-        QFileDialog, QDialog, QProgressDialog
+        QFileDialog, QDialog, QProgressDialog, QSpinBox, QDoubleSpinBox, QHeaderView, QFrame,
+        QToolButton
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QFont, QColor
     matplotlib.use("QtAgg")     # 让 matplotlib 使用 Qt 后端，方便嵌入 PySide6 界面
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -901,7 +903,8 @@ class StockDataFetcher:
     def _fetch_block_trading(code: str, bypass_proxy: bool = True) -> pd.DataFrame:
         """大宗交易数据（akshare stock_dzjy_detail）→ 按日聚合折溢率/成交额/笔数。
         字段前缀 bt_，外部数据向后对齐(merge_asof backward)，无未来泄露。
-        数据含义：溢价(bt_premium>0)=机构溢价买入(偏看多)；折价(<0)=机构甩卖或内部转让(偏看空)。"""
+        数据含义：折溢率仅为原始交易数据，A股大宗交易折价是流动性补偿导致的结构性常态(非"机构看空"的因果结论)，
+        常见驱动因素含股权激励解禁减持/员工持股退出/大股东内部转让等，展示端不得直接下"看多/看空"判断。"""
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         c = code.split(".")[0] if "." in code else code
         with ctx:
@@ -1313,7 +1316,7 @@ class FeatureEngineer:
 
         # ---- 4.1.13 大宗交易衍生特征（仅当已接入 bt_* 列时计算）----
         # 参照AmazingData大宗交易字段：折溢率(bt_premium)、成交额(bt_amount)、笔数(bt_count)
-        # 溢价>0=机构溢价买入(偏看多)；折价<0=机构甩卖(偏看空)；5日滚动更平稳
+        # 折溢率仅作数值特征喂给模型学习(而非人工下因果结论)；5日滚动更平稳
         if "bt_premium" in df.columns:
             bt_p = pd.to_numeric(df["bt_premium"], errors="coerce").fillna(0.0)
             df["bt_premium_5d"] = bt_p.rolling(5, min_periods=1).mean()   # 5日均折溢率
@@ -4064,7 +4067,8 @@ def ablation_experiment(code: str, start: str = "20200101", end: Optional[str] =
 # ==================== 第八部分补充5：预测跟踪（存预测→到期对比真实股价→算真实准确率） ====================
 PRED_COLS = ["id", "made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
              "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date",
-             "status", "actual_close", "actual_change_pct", "hit_dir", "in_interval", "verified_at"]
+             "status", "actual_close", "actual_change_pct", "hit_dir", "in_interval", "verified_at", "source"]
+PRED_RETENTION_DAYS = 15   # 「预测跟踪」只保留最近15日的已验证记录（未到期的pending不受影响，见 prune_pred_log）
 
 
 def _init_pred_db() -> None:
@@ -4077,6 +4081,14 @@ def _init_pred_db() -> None:
                 PRIMARY KEY (code, model, horizon, base_date)
             )
         """)
+        # 旧库缺新列（如 source）时逐个 ALTER TABLE 补上，兼容老版本建的库
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+        for c in PRED_COLS:
+            if c not in existing:
+                try:
+                    conn.execute(f'ALTER TABLE predictions ADD COLUMN "{c}" TEXT DEFAULT ""')
+                except Exception:
+                    pass
         conn.commit()
     # 旧 CSV → SQLite 一次性迁移（标记文件 .migrated 防重复）
     migrated_flag = PRED_DB + ".migrated"
@@ -4190,15 +4202,48 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None) -> i
             except Exception:
                 continue
     _save_pred_db(df)
+    prune_pred_log()
     return n_ok
+
+
+def prune_pred_log(days: int = PRED_RETENTION_DAYS) -> int:
+    """「预测跟踪」只保留最近 N 日数据：只清理**已验证**且验证时间早于 N 天前的旧记录；
+    未到期(pending)的记录不受影响、继续保留直到验证——避免60日等长周期预测在到期前被误删。
+    返回本次清理的条数。"""
+    df = load_pred_log()
+    if len(df) == 0:
+        return 0
+    cutoff = (dt.datetime.now() - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    va = df["verified_at"].fillna("")
+    drop = df[(df["status"] == "verified") & (va != "") & (va < cutoff)]
+    if len(drop) == 0:
+        return 0
+    with sqlite3.connect(PRED_DB) as conn:
+        conn.executemany(
+            'DELETE FROM predictions WHERE code=? AND model=? AND horizon=? AND base_date=?',
+            [(r["code"], r["model"], r["horizon"], r["base_date"]) for _, r in drop.iterrows()]
+        )
+        conn.commit()
+    return len(drop)
+
+
+def _recent_verified(days: int = PRED_RETENTION_DAYS) -> pd.DataFrame:
+    """取已验证记录里"最近 N 日验证"的那部分，供精度/复盘统计用（方向准确率+股价准确性都只用这批）。"""
+    df = load_pred_log()
+    v = df[df["status"] == "verified"].copy()
+    if len(v) == 0:
+        return v
+    cutoff = (dt.datetime.now() - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    va = v["verified_at"].fillna("")
+    return v[(va != "") & (va >= cutoff)].copy()
 
 
 def prediction_postmortem() -> Dict[str, Any]:
     """预测复盘(借鉴 signal-postmortem skill)：从**已验证**的预测里找系统性规律/偏差——
     整体真实DA、区间覆盖率、系统性乐观/悲观偏差(预测涨跌 − 实际涨跌的均值)、按方向拆分的命中率、最好/最差模型。
-    全部基于真实到期对比，帮你看清『模型到底错在哪、别一直被同一个坑坑』。非投资建议。"""
-    df = load_pred_log()
-    v = df[df["status"] == "verified"].copy()
+    全部基于真实到期对比，只用最近15日(PRED_RETENTION_DAYS)已验证的记录(见 _recent_verified)，
+    帮你看清『模型到底错在哪、别一直被同一个坑坑』。非投资建议。"""
+    v = _recent_verified()
     if len(v) < 5:
         return {"n": int(len(v)), "enough": False}
     v["hit"] = pd.to_numeric(v["hit_dir"], errors="coerce")
@@ -4233,11 +4278,11 @@ PRED_HZ_LABEL = {1: "一天(1日)", 3: "三天(3日)", 5: "一周(5日)", 10: "�
 
 
 def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
-    """按预测周期统计**真实**方向准确率与误差分布(只用已验证记录，全部真实到期对比)。
+    """按预测周期统计**真实**方向准确率(dir_acc)与股价准确性/区间覆盖率(coverage)(只用最近15日
+    已验证记录，全部真实到期对比，见 _recent_verified)。
     误差% = |预测涨跌% − 实际涨跌%|(收益率口径的绝对误差)。返回每周期:
-    {n, dir_acc(方向准确率%), err_max/err_mean/err_median/err_min(误差%), coverage(区间覆盖率%)}。"""
-    df = load_pred_log()
-    v = df[df["status"] == "verified"].copy()
+    {n, dir_acc(方向准确率%), err_max/err_mean/err_median/err_min(误差%), coverage(股价准确性/区间覆盖率%)}。"""
+    v = _recent_verified()
     out = {}
     if len(v) == 0:
         return out
@@ -5030,9 +5075,14 @@ def research_card_html(card: Dict[str, Any]) -> str:
     if any(v is not None for v in [bt_prem, bt_amt, bt_cnt]):
         if bt_prem is not None:
             if bt_prem > 1:
-                prem_tag = f"<span style='color:#c0392b'><b>溢价{bt_prem:.2f}%</b>（机构溢价买入，偏看多信号）</span>"
+                prem_tag = (f"<span style='color:#c0392b'><b>溢价{bt_prem:.2f}%</b></span>"
+                            f"（A股大宗交易多数为折价成交，出现溢价相对少见；折溢率本身不能推出"
+                            f"'看多/看空'结论，需结合公告核实交易性质）")
             elif bt_prem < -1:
-                prem_tag = f"<span style='color:#888'><b>折价{abs(bt_prem):.2f}%</b>（机构折价卖出，偏看空信号）</span>"
+                prem_tag = (f"<span style='color:#888'><b>折价{abs(bt_prem):.2f}%</b></span>"
+                            f"（A股大宗交易折价是流动性补偿导致的结构性常态，历史统计主流折价幅度"
+                            f"常年在5%-8%左右；常见原因是股权激励解禁减持、员工持股计划到期退出、"
+                            f"大股东/高管内部转让等，多数与'机构看空'无关，不构成买卖信号）")
             else:
                 prem_tag = f"{bt_prem:.2f}%（接近平价）"
         else:
@@ -5084,12 +5134,22 @@ def tail_market_scan(codes: List[str],
       ④ 成交量连续放大（量比≥1且近N日量比逐日递增）
       ⑤ 均线多头排列（MA5>MA10>MA20，趋势向上）
     结果按"通过条件数"降序排列。**仅供参考，非买卖建议，风险自负。**
+
+    ⚠ 重要提示（务必阅读）：
+      · 本函数是纯规则打分，**未做任何历史有效性验证**——"满足几条条件"和"未来收益是否更好"
+        目前没有必然联系；如需验证，配合 tail_market_scan_backtest() 使用。
+      · 数据源切到 baostock 兜底时不含换手率字段，②号条件会因 turn=None 而必然判定为不满足，
+        结果里会用 dims_available/missing_dims 如实标注"本次实际按几维评分"，不要只看 score 绝对值。
+      · 涨幅3-5%+换手放大+尾盘临近，是流传的"主力启动"经典画像，但同一组技术特征同样可能是
+        "尾盘拉高吸引跟风、次日出货"的画像——本工具无法区分两者，高分不等于主力看多。
+      · 若他人也在用相同的默认参数扫描同一批股票，不代表命中该参数区间的股票存在"隐藏优势"。
     """
-    log = progress_cb or (lambda m: None)
+    total_n = len(codes)
     results = []
-    for code in codes:
+    for i, code in enumerate(codes):
+        if progress_cb:
+            progress_cb(i, total_n, code)          # 与调用方约定的签名：(已完成数, 总数, 当前代码)
         try:
-            log(f"[尾盘选股] {code} 取数...")
             end = dt.date.today().strftime("%Y%m%d")
             start = (dt.date.today() - dt.timedelta(days=120)).strftime("%Y%m%d")
             df = StockDataFetcher().fetch(code, start, end)
@@ -5147,6 +5207,13 @@ def tail_market_scan(codes: List[str],
             c5 = (bull_rank is not None and bull_rank >= 1.0)         # ⑤多头排列
 
             score = sum([c1, c2, c3, c4, c5])
+            # 数据完整性：区分"条件真的不满足" vs "这一维数据本身缺失"(如换手率走 baostock 兜底时取不到)
+            missing_dims = []
+            if turn is None: missing_dims.append("换手率(②)")
+            if mv is None: missing_dims.append("流通市值(③)")
+            if vr is None: missing_dims.append("量比(④)")
+            if bull_rank is None: missing_dims.append("均线排列(⑤)")
+            dims_available = 5 - len(missing_dims)
             results.append({
                 "code": code, "name": name, "last_close": round(lc, 2),
                 "amp_pct": round(amp * 100, 2),
@@ -5157,11 +5224,119 @@ def tail_market_scan(codes: List[str],
                 "ma_bull": int(bull_rank or 0),
                 "c1_amp": c1, "c2_turn": c2, "c3_mv": c3, "c4_vol": c4, "c5_bull": c5,
                 "score": score,
+                "dims_available": dims_available, "missing_dims": missing_dims,
+                "score_note": (f"{score}/5(仅{dims_available}维有数据，缺:{'、'.join(missing_dims)})"
+                               if missing_dims else f"{score}/5"),
             })
         except Exception as e:
             results.append({"code": code, "name": "", "score": -1, "error": str(e)})
+    if progress_cb:
+        progress_cb(total_n, total_n, "完成")
     results.sort(key=lambda r: r.get("score", -1), reverse=True)
     return results
+
+
+def tail_market_scan_backtest(codes: List[str], lookback_days: int = 252, fwd_days: int = 5,
+                              min_amp: float = 0.03, max_amp: float = 0.05,
+                              min_turn: float = 0.05, max_turn: float = 0.20,
+                              min_mv: float = 50e8, max_mv: float = 500e8,
+                              min_vol_ratio: float = 1.0, vol_expand_days: int = 3,
+                              progress_cb=None) -> Dict[str, Any]:
+    """**尾盘五维选股的历史有效性验证**——tail_market_scan() 本身是纯规则打分，没有做过任何历史检验，
+    这个函数补上这一步："满足条件数越多，未来收益是否真的越好"这个假设到底站不站得住脚。
+
+    对每只股票过去 lookback_days 个交易日，逐日回放五维条件(用当天及以前数据，不看未来)，
+    与该日之后 fwd_days 日的**真实已实现收益**配对(未来收益仅用于事后检验，不作为特征，无泄漏)，
+    按"当天满足几条条件"分组统计：n、平均未来收益、上涨占比(胜率)，
+    并用项目里已有的 da_significance() 对高分组胜率做二项显著性检验(而不是想当然认为分越高越好)。
+
+    诚实要点：换手率维度若数据源缺失(baostock兜底)则该维当天历史记录里也如实标记缺失，不编造。
+    这是历史统计，不保证未来重演，不构成买卖建议。"""
+    log = progress_cb or (lambda m: None)
+    buckets: Dict[int, List[float]] = {s: [] for s in range(6)}   # score(0-5) -> 未来收益率列表
+    dims_missing_days = 0
+    total_days = 0
+    for i, code in enumerate(codes):
+        log(f"[尾盘选股回测 {i+1}/{len(codes)}] {code} 取历史数据...")
+        try:
+            end = dt.date.today().strftime("%Y%m%d")
+            start = (dt.date.today() - dt.timedelta(days=int(lookback_days * 1.6) + 30)).strftime("%Y%m%d")
+            df = StockDataFetcher().fetch(code, start, end)
+            if df is None or len(df) < 40:
+                continue
+            df = df.tail(lookback_days + fwd_days + 20).reset_index(drop=True)
+            df = FeatureEngineer().add_technical_indicators(df.copy())
+            close = pd.to_numeric(df["close"], errors="coerce")
+            amp = close.pct_change()
+            fwd_ret = close.shift(-fwd_days) / close - 1.0                 # 事后已实现收益，仅用于检验
+            vol_s = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            vol_up = (vol_s > vol_s.shift(1))
+            # 连续放量天数(向量化：借助分组累计计数)
+            grp = (~vol_up).cumsum()
+            expand_days = vol_up.groupby(grp).cumsum()
+            turn = (pd.to_numeric(df["turnover"], errors="coerce") / 100.0
+                    if "turnover" in df.columns else pd.Series(np.nan, index=df.index))
+            mv = (pd.to_numeric(df["val_total_mv"], errors="coerce") * 1e4
+                  if "val_total_mv" in df.columns else pd.Series(np.nan, index=df.index))
+            vr = (pd.to_numeric(df["vol_ratio"], errors="coerce")
+                  if "vol_ratio" in df.columns else pd.Series(np.nan, index=df.index))
+            bull = (pd.to_numeric(df["ma_bull_rank"], errors="coerce")
+                    if "ma_bull_rank" in df.columns else pd.Series(np.nan, index=df.index))
+
+            c1 = (amp >= min_amp) & (amp <= max_amp)
+            c2 = (turn >= min_turn) & (turn <= max_turn)
+            c3 = (mv >= min_mv) & (mv <= max_mv)
+            c4 = (vr >= min_vol_ratio) & (expand_days >= vol_expand_days)
+            c5 = (bull >= 1.0)
+            score = c1.astype(int) + c2.fillna(False).astype(int) + c3.fillna(False).astype(int) \
+                    + c4.fillna(False).astype(int) + c5.fillna(False).astype(int)
+
+            valid = fwd_ret.notna() & amp.notna()
+            n_start = max(60, len(df) - lookback_days - fwd_days)         # 跳过指标预热期
+            for j in range(n_start, len(df) - fwd_days):
+                if not valid.iloc[j]:
+                    continue
+                total_days += 1
+                if turn.isna().iloc[j] or mv.isna().iloc[j] or vr.isna().iloc[j] or bull.isna().iloc[j]:
+                    dims_missing_days += 1
+                s = int(score.iloc[j])
+                buckets[s].append(float(fwd_ret.iloc[j]))
+        except Exception as e:
+            log(f"[尾盘选股回测] {code} 失败：{e}")
+    if progress_cb:
+        progress_cb(len(codes), len(codes), "完成")
+
+    rows = []
+    for s in range(6):
+        arr = buckets[s]
+        if len(arr) < 5:
+            rows.append({"score": s, "n": len(arr), "mean_fwd_ret_pct": None, "win_rate_pct": None})
+            continue
+        a = np.array(arr)
+        win = float((a > 0).mean() * 100)
+        rows.append({
+            "score": s, "n": len(a),
+            "mean_fwd_ret_pct": round(float(a.mean()) * 100, 3),
+            "median_fwd_ret_pct": round(float(np.median(a)) * 100, 3),
+            "win_rate_pct": round(win, 1),
+            "sig_vs_50pct": da_significance(win, len(a)),
+        })
+    high = [r for r in rows if r["score"] >= 4 and r["n"] >= 5]
+    low = [r for r in rows if r["score"] <= 1 and r["n"] >= 5]
+    high_mean = float(np.average([r["mean_fwd_ret_pct"] for r in high],
+                                  weights=[r["n"] for r in high])) if high else None
+    low_mean = float(np.average([r["mean_fwd_ret_pct"] for r in low],
+                                 weights=[r["n"] for r in low])) if low else None
+    verdict = "样本不足，无法判断"
+    if high_mean is not None and low_mean is not None:
+        verdict = (f"高分组(≥4)未来{fwd_days}日均收益{high_mean:.2f}% vs 低分组(≤1){low_mean:.2f}%，"
+                    + ("高分组确实更高" if high_mean > low_mean else "高分组反而不比低分组高，条件多不代表未来收益好"))
+    return {
+        "rows": rows, "fwd_days": fwd_days, "n_stocks": len(codes), "total_days": total_days,
+        "dims_missing_ratio_pct": round(dims_missing_days / total_days * 100, 1) if total_days else 0.0,
+        "high_vs_low_verdict": verdict,
+        "note": "历史统计，样本外未来不保证重演；不构成买卖建议，风险自负。",
+    }
 
 
 # ==================== 第八部分补充9：板块行情（概念板块/行业板块实时涨跌） ====================
@@ -5285,6 +5460,34 @@ if HAS_PYSIDE6:
                 n = 0
             self.done_signal.emit(int(n))
 
+    class CollapsibleSection(QWidget):
+        """可折叠板块：点击标题展开/收起内容区，用于收纳次要控件、节省纵向空间。"""
+
+        def __init__(self, title: str, content: QWidget, expanded: bool = False, parent=None):
+            super().__init__(parent)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 4); layout.setSpacing(0)
+            self.toggle_btn = QToolButton()
+            self.toggle_btn.setText(" " + title)
+            self.toggle_btn.setCheckable(True)
+            self.toggle_btn.setChecked(expanded)
+            self.toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self.toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+            self.toggle_btn.setStyleSheet(
+                "QToolButton { font-weight:bold; padding:6px; text-align:left; "
+                "border:1px solid #ccc; background:#eef2f7; }"
+                "QToolButton:checked { background:#dbe6f5; }")
+            self.toggle_btn.clicked.connect(self._on_toggled)
+            layout.addWidget(self.toggle_btn)
+            self.content = content
+            self.content.setVisible(expanded)
+            layout.addWidget(self.content)
+
+        def _on_toggled(self):
+            expanded = self.toggle_btn.isChecked()
+            self.content.setVisible(expanded)
+            self.toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
     # ---------- 9.2 主窗口 ----------
     class MainWindow(QMainWindow):
 
@@ -5304,9 +5507,15 @@ if HAS_PYSIDE6:
             # 启动时自动验证：把之前记录、目标日期已到的预测，自动拉真实股价对比、更新准确率
             # (放后台线程 + 延迟启动，避免网络慢卡住开机；完成后自动刷新「预测跟踪」表)
             QTimer.singleShot(600, self._start_auto_verify)
+            # 长时间挂着运行时，每隔几小时也自动核对一次到期预测(不用等下次重启软件)
+            self._auto_verify_timer = QTimer(self)
+            self._auto_verify_timer.timeout.connect(self._start_auto_verify)
+            self._auto_verify_timer.start(4 * 3600 * 1000)   # 每4小时
 
         def _start_auto_verify(self):
             try:
+                if getattr(self, "_verify_worker", None) is not None and self._verify_worker.isRunning():
+                    return                                    # 上一次还没跑完，跳过本次，避免重叠
                 self._oplog("启动自动检测：正在后台核对已到期预测的真实准确率 ...")
                 self._verify_worker = VerifyWorker()
                 self._verify_worker.done_signal.connect(self._on_auto_verify_done)
@@ -5436,14 +5645,113 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_board_tab(), "板块行情")
+
+            # 按功能把散乱的标签页归并为「板块」二级导航：先选板块，再选板块内的具体页面
+            self._tab_categories = [
+                ("行情板块", ["行情K线图", "板块行情"]),
+                ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
+                ("机器学习板块", ["机器学习内部"]),
+                ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "批量扫描", "组合与仓位"]),
+                ("日志板块", ["运行日志", "操作日志"]),
+            ]
+            self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
+            self._tab_name_to_category = {
+                name: cat for cat, names in self._tab_categories for name in names
+            }
+            self._category_btns = {}
+            self._subtab_btns = {}
+
+            nav = self._build_tab_nav()
+            self.tabs.tabBar().hide()          # 原生标签条隐藏，改用上方的板块导航
             self.tabs.currentChanged.connect(self._on_tab_changed)
 
-            main_layout.addWidget(self.tabs, stretch=1)
+            right_panel = QWidget()
+            right_layout = QVBoxLayout(right_panel)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.addWidget(nav)
+            right_layout.addWidget(self.tabs, stretch=1)
+            main_layout.addWidget(right_panel, stretch=1)
+
+            self._on_category_clicked(self._tab_categories[0][0])   # 默认展开第一个板块
+
+        # ---- 9.2.1a 板块导航（板块按钮 + 板块内子标签按钮） ----
+        def _build_tab_nav(self):
+            nav = QWidget()
+            nav_layout = QVBoxLayout(nav)
+            nav_layout.setContentsMargins(0, 0, 0, 4)
+            nav_layout.setSpacing(4)
+
+            cat_row = QHBoxLayout()
+            for cat_name, _ in self._tab_categories:
+                btn = QPushButton(cat_name)
+                btn.setCheckable(True)
+                btn.setStyleSheet(
+                    "QPushButton{font-weight:bold; padding:6px 16px; border:1px solid #999; border-radius:4px;}"
+                    "QPushButton:checked{background:#2c6fbb; color:white; border-color:#2c6fbb;}"
+                )
+                btn.clicked.connect(lambda checked, c=cat_name: self._on_category_clicked(c))
+                cat_row.addWidget(btn)
+                self._category_btns[cat_name] = btn
+            cat_row.addStretch()
+            nav_layout.addLayout(cat_row)
+
+            self.sub_row_widget = QWidget()
+            self.sub_row_layout = QHBoxLayout(self.sub_row_widget)
+            self.sub_row_layout.setContentsMargins(16, 2, 0, 2)
+            nav_layout.addWidget(self.sub_row_widget)
+
+            line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)
+            nav_layout.addWidget(line)
+            return nav
+
+        def _on_category_clicked(self, cat_name):
+            """点击板块按钮：高亮该板块，并在下方展开该板块内的子页面按钮。"""
+            for name, btn in self._category_btns.items():
+                btn.setChecked(name == cat_name)
+
+            while self.sub_row_layout.count():
+                item = self.sub_row_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            self._subtab_btns = {}
+
+            tab_names = dict(self._tab_categories)[cat_name]
+            for tname in tab_names:
+                btn = QPushButton(tname)
+                btn.setCheckable(True)
+                btn.setStyleSheet(
+                    "QPushButton{padding:4px 10px;} QPushButton:checked{background:#5ba3e0; color:white;}"
+                )
+                btn.clicked.connect(lambda checked, t=tname: self._select_tab_by_name(t))
+                self.sub_row_layout.addWidget(btn)
+                self._subtab_btns[tname] = btn
+            self.sub_row_layout.addStretch()
+
+            current_name = self.tabs.tabText(self.tabs.currentIndex())
+            if current_name in tab_names:
+                self._subtab_btns[current_name].setChecked(True)
+            else:
+                self._select_tab_by_name(tab_names[0])
+
+        def _select_tab_by_name(self, name):
+            idx = self._tab_name_to_index.get(name)
+            if idx is not None:
+                self.tabs.setCurrentIndex(idx)
 
         def _on_tab_changed(self, idx):
-            """进入『预测跟踪』页时，自动把模型下拉跳到 DA 最高的模型。"""
+            """标签页切换时：同步板块导航高亮；进入『预测跟踪』页自动把模型下拉跳到 DA 最高的模型。"""
             try:
-                if self.tabs.tabText(idx) == "预测跟踪":
+                name = self.tabs.tabText(idx)
+                cat = self._tab_name_to_category.get(name)
+                if cat is not None:
+                    if not self._category_btns[cat].isChecked():
+                        self._on_category_clicked(cat)
+                    else:
+                        for n, btn in self._subtab_btns.items():
+                            btn.setChecked(n == name)
+                if name == "预测跟踪":
                     self._auto_select_best_da(notify=False)
             except Exception:
                 pass
@@ -5457,6 +5765,10 @@ if HAS_PYSIDE6:
             """
             panel = QWidget()
             layout = QVBoxLayout(panel)
+
+            toolbar_content = QWidget()
+            toolbar_layout = QVBoxLayout(toolbar_content)
+            toolbar_layout.setContentsMargins(0, 0, 0, 0)
 
             top = QHBoxLayout()
             top.addWidget(QLabel("周期:"))
@@ -5474,11 +5786,14 @@ if HAS_PYSIDE6:
             self.kline_hint = QLabel("红涨绿跌；虚线=区间平均线；图下方工具条可放大缩小。")
             self.kline_hint.setStyleSheet("color:#666;")
             top.addWidget(self.kline_hint, stretch=1)
-            layout.addLayout(top)
+            toolbar_layout.addLayout(top)
 
             self.kline_figure = Figure(figsize=(8, 5))
             self.kline_canvas = FigureCanvas(self.kline_figure)
-            layout.addWidget(NavigationToolbar(self.kline_canvas, panel))    # 缩放/平移工具条
+            toolbar_layout.addWidget(NavigationToolbar(self.kline_canvas, panel))    # 缩放/平移工具条
+
+            # 工具条可折叠：收起后图表区域更大，需要时再点标题展开
+            layout.addWidget(CollapsibleSection("🛠 周期 / 刷新 / 缩放工具条", toolbar_content, expanded=True))
             layout.addWidget(self.kline_canvas, stretch=1)
             return panel
 
@@ -7000,6 +7315,15 @@ if HAS_PYSIDE6:
             risk_intro.setStyleSheet("color:#555;background:#fef9e7;padding:6px;border-radius:4px")
             risk_layout.addWidget(risk_intro)
 
+            risk_disclaimer = QLabel(
+                "⚠ 本工具仅做数学换算：把你自己输入的\"风险比例/止损幅度\"换算成金额与股数，"
+                "不核实、不评估这些假设是否合理，也不判断该不该买、买多少合适。"
+                "所有参数均为使用者自行设定，不构成任何形式的投资建议或证券投资咨询意见，盈亏自负。"
+            )
+            risk_disclaimer.setWordWrap(True)
+            risk_disclaimer.setStyleSheet("color:#c0392b;font-size:12px;background:#fdecea;padding:6px;border-radius:4px")
+            risk_layout.addWidget(risk_disclaimer)
+
             # 输入参数行
             inp_row = QGridLayout()
             inp_row.addWidget(QLabel("账户总资产(元):"), 0, 0)
@@ -7286,9 +7610,9 @@ if HAS_PYSIDE6:
             param_layout.addWidget(self._tail_require_bull, 2, 0, 1, 4)
 
             # 股票代码输入
-            param_layout.addWidget(QLabel("股票代码(空=全A股):"), 2, 4)
+            param_layout.addWidget(QLabel("股票代码(必填):"), 2, 4)
             self._tail_codes_edit = QLineEdit()
-            self._tail_codes_edit.setPlaceholderText("如: 600519,000858,300750 (留空则扫描全部)")
+            self._tail_codes_edit.setPlaceholderText("如: 600519,000858,300750 (全市场扫描暂未实现，请手动列出代码)")
             param_layout.addWidget(self._tail_codes_edit, 2, 5, 1, 3)
 
             layout.addWidget(param_box)
@@ -7302,10 +7626,15 @@ if HAS_PYSIDE6:
             self._tail_stop_btn.setStyleSheet("background:#c0392b;color:white;font-weight:bold;padding:6px 12px;border-radius:4px")
             self._tail_stop_btn.setEnabled(False)
             self._tail_stop_btn.clicked.connect(self._on_tail_scan_stop)
+            self._tail_backtest_btn = QPushButton("📊 历史有效性验证")
+            self._tail_backtest_btn.setToolTip("检验\"满足条件数越多，未来收益是否真的越好\"这个假设在这批股票的历史上站不站得住脚")
+            self._tail_backtest_btn.setStyleSheet("background:#8e44ad;color:white;font-weight:bold;padding:6px 12px;border-radius:4px")
+            self._tail_backtest_btn.clicked.connect(self._on_tail_backtest_start)
             self._tail_progress = QProgressBar(); self._tail_progress.setRange(0, 100); self._tail_progress.setValue(0)
             self._tail_status_lbl = QLabel("就绪")
             btn_row.addWidget(self._tail_scan_btn)
             btn_row.addWidget(self._tail_stop_btn)
+            btn_row.addWidget(self._tail_backtest_btn)
             btn_row.addWidget(self._tail_progress, 1)
             btn_row.addWidget(self._tail_status_lbl)
             layout.addLayout(btn_row)
@@ -7315,19 +7644,28 @@ if HAS_PYSIDE6:
                 "<span style='color:#888;font-size:12px'>"
                 "五维条件：①涨幅3-5%  ②换手率5-20%  ③流通市值50-500亿  "
                 "④量比>1且连续3日放量  ⑤均线多头排列(MA5>MA10>MA20)  "
-                "| 综合分=满足条件数/5×100，全部满足=100分"
+                "| 综合分=满足条件数(0-5)，全部满足=5分"
                 "</span>"
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
+            risk_hint = QLabel(
+                "<span style='color:#c0392b;font-size:12px'>"
+                "⚠ 纯规则打分，未做历史有效性验证，条件多≠未来收益好；同样的\"涨幅放大+换手放大+尾盘临近\"特征，"
+                "既可能是主力启动，也可能是拉高出货，本工具无法区分。数据源切到 baostock 兜底时会缺换手率等字段，"
+                "分数会如实标注\"实际按几维评分\"。仅供研究参考，不构成买卖建议，风险自负。"
+                "</span>"
+            )
+            risk_hint.setWordWrap(True)
+            layout.addWidget(risk_hint)
 
             # ── 结果表格 ──
-            self._tail_table = QTableWidget(0, 15)
+            self._tail_table = QTableWidget(0, 16)
             self._tail_table.setHorizontalHeaderLabels([
                 "排名", "代码", "名称", "最新价",
                 "①涨幅%", "②换手率%", "③市值(亿)",
                 "④量比", "连续放量天", "⑤均线多头",
-                "涨幅✓", "换手✓", "市值✓", "放量✓", "多头✓"
+                "涨幅✓", "换手✓", "市值✓", "放量✓", "多头✓", "数据完整性"
             ])
             self._tail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             self._tail_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -7358,10 +7696,10 @@ if HAS_PYSIDE6:
 
         def _on_tail_scan_start(self):
             codes_text = self._tail_codes_edit.text().strip()
-            if codes_text:
-                codes = [c.strip() for c in codes_text.replace("，", ",").split(",") if c.strip()]
-            else:
-                codes = []
+            codes = [c.strip() for c in codes_text.replace("，", ",").split(",") if c.strip()]
+            if not codes:
+                QMessageBox.warning(self, "提示", "请先填写股票代码（全市场扫描暂未实现，逐只取历史行情成本很高，请勿留空）。")
+                return
             params = dict(
                 codes=codes,
                 min_amp=self._tail_amp_min.value() / 100,
@@ -7412,6 +7750,65 @@ if HAS_PYSIDE6:
             self._tail_scan_btn.setEnabled(True)
             self._tail_stop_btn.setEnabled(False)
             self._tail_status_lbl.setText("已停止")
+
+        def _on_tail_backtest_start(self):
+            codes_text = self._tail_codes_edit.text().strip()
+            codes = [c.strip() for c in codes_text.replace("，", ",").split(",") if c.strip()]
+            if not codes:
+                QMessageBox.warning(self, "提示", "请先填写股票代码。"); return
+            params = dict(
+                codes=codes,
+                min_amp=self._tail_amp_min.value() / 100, max_amp=self._tail_amp_max.value() / 100,
+                min_turn=self._tail_turn_min.value() / 100, max_turn=self._tail_turn_max.value() / 100,
+                min_mv=self._tail_mv_min.value() * 1e8, max_mv=self._tail_mv_max.value() * 1e8,
+                min_vol_ratio=self._tail_vr_min.value(), vol_expand_days=self._tail_expand_days.value(),
+            )
+            self._tail_backtest_btn.setEnabled(False)
+            self._tail_status_lbl.setText("历史验证计算中(需逐只拉一年历史，较慢)...")
+
+            class _TailBacktestWorker(QThread):
+                progress_sig = Signal(int, str)
+                done_sig = Signal(dict)
+                def __init__(self, p): super().__init__(); self._p = p
+                def run(self):
+                    n = len(self._p["codes"])
+                    def cb(done, total, code):
+                        if total > 0: self.progress_sig.emit(int(done / total * 100), f"[{done}/{total}] {code}")
+                    r = tail_market_scan_backtest(
+                        codes=self._p["codes"],
+                        min_amp=self._p["min_amp"], max_amp=self._p["max_amp"],
+                        min_turn=self._p["min_turn"], max_turn=self._p["max_turn"],
+                        min_mv=self._p["min_mv"], max_mv=self._p["max_mv"],
+                        min_vol_ratio=self._p["min_vol_ratio"], vol_expand_days=self._p["vol_expand_days"],
+                        progress_cb=cb,
+                    )
+                    self.done_sig.emit(r)
+
+            w = _TailBacktestWorker(params)
+            w.progress_sig.connect(lambda v, s: (self._tail_progress.setValue(v), self._tail_status_lbl.setText(s)))
+            w.done_sig.connect(self._on_tail_backtest_done)
+            self._tail_backtest_worker = w
+            w.start()
+
+        def _on_tail_backtest_done(self, r: dict):
+            self._tail_backtest_btn.setEnabled(True)
+            self._tail_status_lbl.setText("历史验证完成")
+            if "rows" not in r:
+                QMessageBox.warning(self, "历史有效性验证", r.get("error", "无有效结果")); return
+            lines = [f"未来{r['fwd_days']}日收益 vs 当日满足条件数（共{r['n_stocks']}只股票、{r['total_days']}个样本日）\n"]
+            for row in r["rows"]:
+                if row["n"] < 5:
+                    lines.append(f"  满足{row['score']}条：样本太少(n={row['n']})，跳过")
+                    continue
+                sig_txt = row["sig_vs_50pct"]["text"]
+                lines.append(f"  满足{row['score']}条：n={row['n']}，未来均收益{row['mean_fwd_ret_pct']}%，"
+                             f"胜率{row['win_rate_pct']}%（{sig_txt}）")
+            lines.append(f"\n结论：{r['high_vs_low_verdict']}")
+            if r.get("dims_missing_ratio_pct", 0) > 0:
+                lines.append(f"\n提示：{r['dims_missing_ratio_pct']}% 的样本日存在数据缺失维度(可能落到 baostock 兜底)，"
+                              f"实际按不足5维评分。")
+            lines.append(f"\n{r['note']}")
+            QMessageBox.information(self, "尾盘选股·历史有效性验证", "\n".join(lines))
 
         def _on_tail_scan_done(self, results: list):
             self._tail_scan_btn.setEnabled(True)
@@ -7477,14 +7874,21 @@ if HAS_PYSIDE6:
                 self._tail_table.setItem(i, 13, _check_item(bool(r.get("c4_vol", False))))
                 self._tail_table.setItem(i, 14, _check_item(bool(r.get("c5_bull", False))))
 
-                # 整行颜色：满足全部5条件=绿色底
+                # 数据完整性列：如实标注本次实际按几维评分(缺维不等于条件真不满足)
+                note_item = QTableWidgetItem(r.get("score_note", f"{r.get('score', 0)}/5"))
+                if r.get("missing_dims"):
+                    note_item.setForeground(YELLOW)
+                    note_item.setToolTip("缺失维度：" + "、".join(r["missing_dims"]))
+                self._tail_table.setItem(i, 15, note_item)
+
+                # 整行颜色：score 是"满足条件数"(0-5整数，非百分制)——5=全部满足、≥3=多数满足
                 score = r.get("score", 0)
-                if score >= 100:
+                if score >= 5:
                     for col in range(15):
                         item = self._tail_table.item(i, col)
                         if item:
                             item.setBackground(QColor("#1a472a"))
-                elif score >= 60:
+                elif score >= 3:
                     for col in range(15):
                         item = self._tail_table.item(i, col)
                         if item:
@@ -7872,10 +8276,11 @@ if HAS_PYSIDE6:
             layout = QVBoxLayout(panel)
             top = QHBoxLayout()
             top.addWidget(QLabel("模型:"))
-            self.trk_model_combo = QComboBox()
-            self.trk_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
-            self.trk_model_combo.setCurrentText("Lasso")
+            self.trk_model_combo = QComboBox()   # 只在训练完成后填入"已训练"的模型，见 _refresh_model_combos
             top.addWidget(self.trk_model_combo)
+            self.trk_hint = QLabel("先在左侧「运行选中配置模型」训练，这里才会出现已训练模型。")
+            self.trk_hint.setStyleSheet("color:#888;")
+            top.addWidget(self.trk_hint)
             b1 = QPushButton("📌 记录当前预测(1/3/5/10/20/30/40/60日)")
             b1.setStyleSheet("font-weight:bold; padding:6px;")
             b1.clicked.connect(self._on_record_prediction)
@@ -7913,6 +8318,9 @@ if HAS_PYSIDE6:
         def _on_record_prediction(self):
             if self.data_source_combo.currentIndex() == 1:
                 QMessageBox.information(self, "提示", "预测跟踪需真实数据(合成数据无意义)。请把数据源切到真实数据。")
+                return
+            if self.trk_model_combo.count() == 0:
+                QMessageBox.information(self, "提示", "请先在左侧「运行选中配置模型」训练模型，再来记录预测。")
                 return
             code = self.code_edit.text().strip()
             model = self.trk_model_combo.currentText()
@@ -7957,7 +8365,7 @@ if HAS_PYSIDE6:
                         "pred_close": p["pred_close"], "pred_change_pct": p["change_pct"],
                         "pred_dir": "涨" if p["pred_close"] >= base_close else "跌",
                         "pred_lo": p.get("lo", ""), "pred_hi": p.get("hi", ""),  # 约80%置信区间(供校准检验)
-                        "target_date": tgt, "status": "pending"})
+                        "target_date": tgt, "status": "pending", "source": "manual"})
                 save_predictions(rows)
                 self._oplog(f"记录预测：{code} {model}，{len(rows)} 个周期。")
                 self._refresh_tracking()
@@ -7997,14 +8405,17 @@ if HAS_PYSIDE6:
                     f"<td>{_fmt(v['err_median'])}</td><td>{_fmt(v['err_min'])}</td>"
                     f"<td>{_cov(v)}</td></tr>"
                     for k, v in acc.items())
-                html = ("<h3>真实预测准确率与误差统计（仅统计已到期、已用真实股价验证的记录）</h3>"
+                html = (f"<h3>真实预测准确率与误差统计（仅统计最近{PRED_RETENTION_DAYS}日内已验证的记录）</h3>"
                         "<table border=1 cellpadding=3 cellspacing=0 width=100%>"
                         "<tr bgcolor=#eef><th>周期</th><th>已验证条数</th><th>方向准确率</th>"
                         "<th>最大误差</th><th>平均误差</th><th>中位数误差</th><th>最小误差</th>"
-                        "<th>区间覆盖率(≈80%)</th></tr>"
+                        "<th>股价准确性(区间命中率≈80%)</th></tr>"
                         f"{rows}</table>"
                         "<p style='color:#c0392b'>误差% = |预测涨跌% − 实际涨跌%|(收益率口径，越小越准)。"
-                        "方向准确率需明显&gt;50%才有意义；区间覆盖率接近80%才说明置信区间靠谱。"
+                        "<b>方向准确率</b>=涨跌方向猜对的比例，需明显&gt;50%才有意义；"
+                        "<b>股价准确性</b>=真实价落在预测约80%置信区间内的比例，接近80%才说明价格预测靠谱——"
+                        "两者是两回事，方向猜对不代表价格准。"
+                        f"只统计最近{PRED_RETENTION_DAYS}日验证的记录，更早的旧记录会被自动清理(见 prune_pred_log)；"
                         "全部用真实到期股价验算；样本少仅供参考，不构成投资建议。</p>")
             else:
                 html = ("<h3>真实预测准确率</h3><p style='color:#888'>还没有已验证的预测。"
@@ -8030,9 +8441,11 @@ if HAS_PYSIDE6:
             df = load_pred_log()
             cols = ["made_at", "code", "name", "model", "horizon", "model_da", "base_date", "base_close",
                     "pred_close", "pred_change_pct", "pred_dir", "pred_lo", "pred_hi", "target_date", "status",
-                    "actual_close", "actual_change_pct", "hit_dir", "in_interval"]
+                    "actual_close", "actual_change_pct", "hit_dir", "in_interval", "source"]
+            # "命中"改名"方向命中"、"落区间"改名"股价命中"：两者不是一回事，方向对不代表价格准(见下方高亮说明)
             heads = ["记录时间", "代码", "名称", "模型", "周期", "记录时DA%", "基准日", "基准价", "预测价",
-                     "预测涨跌%", "方向", "区间下", "区间上", "目标日", "状态", "实际价", "实际涨跌%", "命中", "落区间"]
+                     "预测涨跌%", "方向", "区间下", "区间上", "目标日", "状态", "实际价", "实际涨跌%",
+                     "方向命中", "股价命中(±80%区间)", "来源"]
             # 应用筛选(状态 + 代码)
             if len(df):
                 fi = self.trk_filter.currentIndex() if hasattr(self, "trk_filter") else 0
@@ -8050,14 +8463,33 @@ if HAS_PYSIDE6:
             if hasattr(self, "trk_count"):
                 self.trk_count.setText(f"共 {total} 条" + ("（显示最近1000）" if total > 1000 else ""))
             self.trk_table.setRowCount(len(df))
+            UP_C, DOWN_C = QColor("#c0392b"), QColor("#1a9d5a")            # 红涨绿跌(A股传统配色)，用于"方向"列
+            GOOD_C, BAD_C = QColor("#1a9d5a"), QColor("#c0392b")           # 绿=命中/对，红=未中/错，用于命中类列
+            HIT_BG, MISS_BG = QColor("#eafaf1"), QColor("#fdecea")         # 浅绿=方向命中 浅红=方向未中
             for i in range(len(df)):
+                hit_dir = str(df.at[i, "hit_dir"]) if "hit_dir" in df.columns else ""
                 for j, c in enumerate(cols):
                     val = str(df.at[i, c]) if c in df.columns else ""
                     if c == "hit_dir":
-                        val = "✓命中" if val == "1" else ("✗未中" if val == "0" else "-")
+                        val = "✓方向命中" if val == "1" else ("✗方向未中" if val == "0" else "-")
                     elif c == "in_interval":
-                        val = "✓在内" if val == "1" else ("✗出界" if val == "0" else "-")
-                    self.trk_table.setItem(i, j, QTableWidgetItem(val))
+                        val = "✓股价命中" if val == "1" else ("✗股价未中" if val == "0" else "-")
+                    elif c == "source":
+                        val = {"chart": "图表同步", "manual": "手动记录"}.get(val, "手动记录")
+                    item = QTableWidgetItem(val)
+                    if c == "pred_dir" and val in ("涨", "跌"):
+                        item.setForeground(UP_C if val == "涨" else DOWN_C)
+                        f = item.font(); f.setBold(True); item.setFont(f)
+                    elif c in ("pred_close", "actual_close") and hit_dir in ("0", "1"):
+                        # 预测价/实际价两格一起按"方向是否命中"上色背景，方便一眼对比这一对数字
+                        item.setBackground(HIT_BG if hit_dir == "1" else MISS_BG)
+                    elif c == "hit_dir" and hit_dir in ("0", "1"):
+                        item.setForeground(GOOD_C if hit_dir == "1" else BAD_C)
+                        f = item.font(); f.setBold(True); item.setFont(f)
+                    elif c == "in_interval" and val in ("✓股价命中", "✗股价未中"):
+                        item.setForeground(GOOD_C if "✓" in val else BAD_C)
+                        f = item.font(); f.setBold(True); item.setFont(f)
+                    self.trk_table.setItem(i, j, item)
             self.trk_table.resizeColumnsToContents()
 
         # ---- 9.2.1f 策略回测标签页 ----
@@ -8257,9 +8689,7 @@ if HAS_PYSIDE6:
             layout = QVBoxLayout(panel)
             top = QHBoxLayout()
             top.addWidget(QLabel("模型:"))
-            self.fc_model_combo = QComboBox()
-            self.fc_model_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
-            self.fc_model_combo.setCurrentText("Lasso")
+            self.fc_model_combo = QComboBox()   # 只在训练完成后填入"已训练"的模型，见 _refresh_model_combos
             top.addWidget(self.fc_model_combo)
             top.addWidget(QLabel("范围:"))
             self.fc_range_combo = QComboBox()
@@ -8290,13 +8720,24 @@ if HAS_PYSIDE6:
             left.addWidget(NavigationToolbar(self.fc_canvas, panel))   # 缩放/平移工具条
             left.addWidget(self.fc_canvas, stretch=1)
             body.addLayout(left, stretch=3)
+            right = QVBoxLayout()
             self.fc_side = QTextEdit(); self.fc_side.setReadOnly(True)
             self.fc_side.setFixedWidth(260)
-            body.addWidget(self.fc_side)
+            right.addWidget(self.fc_side, stretch=3)
+            # 策略信号快照：展示 520均线战法/八大经典买入法/10个核心技术指标/五维尾盘选股法 相关信号的当前读数，
+            # 全部已作为特征参与本页模型训练(见 FeatureEngineer.add_technical_indicators)，此处只做可视化呈现。
+            self.fc_strategy_panel = QTextBrowser()
+            self.fc_strategy_panel.setFixedWidth(260)
+            self.fc_strategy_panel.setHtml("<p style='color:#888'>点「预测未来走势」后，这里显示当前策略信号读数。</p>")
+            right.addWidget(self.fc_strategy_panel, stretch=2)
+            body.addLayout(right)
             layout.addLayout(body, stretch=1)
             return panel
 
         def _on_run_forecast(self):
+            if self.fc_model_combo.count() == 0:
+                QMessageBox.information(self, "提示", "请先在左侧「运行选中配置模型」训练模型，再来预测未来走势。")
+                return
             self.fc_btn.setEnabled(False); self.fc_hint.setText("⏳ 正在训练多周期预测模型 ...")
             QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open(); QApplication.processEvents()
             try:
@@ -8325,12 +8766,106 @@ if HAS_PYSIDE6:
                 fc = forecast_curve(algo, df, target_mode=target_mode,
                                     horizons=horizons, vol_method=vm, progress_cb=self._log)
                 self._draw_forecast(code, df, fc, weekly=weekly)
+                self._draw_strategy_panel(df)
                 self._oplog(f"未来预测：{code}，模型{algo}。")
+                if weekly and not use_synthetic and code:
+                    try:
+                        self._sync_forecast_to_tracking(code, algo, fc)
+                    except Exception as e2:
+                        self._oplog(f"同步预测跟踪失败(不影响本次图表)：{e2}")
             except Exception as e:
                 QMessageBox.critical(self, "未来预测失败", str(e))
                 self.fc_hint.setText("失败，详见弹窗。可先用合成数据看效果。")
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.fc_btn.setEnabled(True)
+
+        def _sync_forecast_to_tracking(self, code: str, algo: str, fc: Dict[str, Any]):
+            """把「未来预测图」未来一周·逐日(1~5交易日)的预测，自动同步进「预测跟踪」表，
+            等真实交易日到了由自动/手动验证核对真实股价——不用再去「预测跟踪」页手动点一次「记录当前预测」。"""
+            base_date = fc.get("last_date"); base_close = fc.get("last_close")
+            ok_points = [p for p in fc.get("points", []) if "pred_close" in p]
+            if not base_date or base_close is None or not ok_points:
+                return
+            name = StockDataFetcher.fetch_stock_name(code)
+            max_h = max(p["horizon"] for p in ok_points)
+            tgt_days = next_trading_days(pd.to_datetime(base_date), max_h, progress_cb=self._log)
+            rows = []
+            for p in ok_points:
+                h = p["horizon"]
+                tgt = tgt_days[h - 1].strftime("%Y-%m-%d")
+                rows.append({
+                    "id": f"{code}_{algo}_{h}_{base_date}",
+                    "made_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "code": code, "name": name, "model": algo, "horizon": h,
+                    "model_da": "",   # 图表同步不额外多训练一次算DA，保持"点一下就出图"的响应速度
+                    "base_date": base_date, "base_close": base_close,
+                    "pred_close": p["pred_close"], "pred_change_pct": p["change_pct"],
+                    "pred_dir": "涨" if p["pred_close"] >= base_close else "跌",
+                    "pred_lo": p.get("lo", ""), "pred_hi": p.get("hi", ""),
+                    "target_date": tgt, "status": "pending", "source": "chart"})
+            save_predictions(rows)
+            self._oplog(f"未来预测已自动同步进「预测跟踪」：{code} {algo}，{len(rows)} 条(来源=图表同步)。")
+            if hasattr(self, "trk_table"):
+                try:
+                    self._refresh_tracking()
+                except Exception:
+                    pass
+
+        def _draw_strategy_panel(self, df: pd.DataFrame):
+            """在「未来预测图」页展示策略信号快照：520均线战法(MA5/MA20+BIAS)、八大经典买入法(MACD金叉/死叉)、
+            10个核心技术指标(RSI/KDJ/布林)、五维尾盘选股法(尾盘强弱/量比) 的当前读数。
+            这些信号本来就是 FeatureEngineer.add_technical_indicators() 算出的特征列，已经参与本页每个模型的训练，
+            此处只是把"模型吃进去的东西"可视化出来，不是另外叠加一套规则。"""
+            if not hasattr(self, "fc_strategy_panel"):
+                return
+            try:
+                ind = FeatureEngineer().add_technical_indicators(df)
+                last = ind.iloc[-1]
+                def v(col):
+                    x = last.get(col)
+                    return float(x) if pd.notna(x) else None
+                ma5, ma10, ma20, ma60 = v("ma5"), v("ma10"), v("ma20"), v("ma60")
+                bull = (ma5 is not None and ma10 is not None and ma20 is not None and ma60 is not None
+                        and ma5 > ma10 > ma20 > ma60)
+                bear = (ma5 is not None and ma10 is not None and ma20 is not None and ma60 is not None
+                        and ma5 < ma10 < ma20 < ma60)
+                ma_state = "多头排列(强势)" if bull else ("空头排列(弱势)" if bear else "无明确排列")
+                bias5, bias20 = v("bias_5"), v("bias_20")
+                macd_c = v("macd_cross")
+                macd_state = "金叉" if (macd_c is not None and macd_c > 0) else \
+                             ("死叉" if (macd_c is not None and macd_c < 0) else "无信号")
+                rsi = v("rsi14")
+                rsi_tag = "(超卖)" if (rsi is not None and rsi < 30) else \
+                          ("(超买)" if (rsi is not None and rsi > 70) else "")
+                kdj_j = v("kdj_j")
+                kdj_tag = "(超卖)" if (kdj_j is not None and kdj_j < 20) else \
+                          ("(超买)" if (kdj_j is not None and kdj_j > 90) else "")
+                boll_pos = v("boll_pos")
+                tail5 = v("tail_strength_5d")
+                vol_ratio = v("vol_ratio")
+                def f(x, unit="", nd=2):
+                    return f"{x:.{nd}f}{unit}" if x is not None else "-"
+                html = (
+                    "<h4>策略信号快照</h4>"
+                    "<p style='color:#888;font-size:12px'>以下均为当天可得的真实行情特征，已作为模型训练输入"
+                    "(见 add_technical_indicators)，不是另一套独立规则。</p>"
+                    "<table cellpadding=3 cellspacing=0 width=100%>"
+                    f"<tr><td>MA5/10/20/60</td><td><b>{ma_state}</b></td></tr>"
+                    f"<tr><td colspan=2 style='color:#888;font-size:11px'>520均线战法：均线多头/空头排列</td></tr>"
+                    f"<tr><td>BIAS5 / BIAS20</td><td>{f(bias5,'%')} / {f(bias20,'%')}</td></tr>"
+                    f"<tr><td>MACD</td><td><b>{macd_state}</b></td></tr>"
+                    f"<tr><td colspan=2 style='color:#888;font-size:11px'>八大经典买入法：金叉/死叉信号</td></tr>"
+                    f"<tr><td>RSI14</td><td>{f(rsi,'',1)}{rsi_tag}</td></tr>"
+                    f"<tr><td>KDJ-J</td><td>{f(kdj_j,'',1)}{kdj_tag}</td></tr>"
+                    f"<tr><td>布林带位置</td><td>{f(boll_pos,'',2)}(0=下轨,1=上轨)</td></tr>"
+                    f"<tr><td colspan=2 style='color:#888;font-size:11px'>10个核心技术指标(K线/MA/MACD/RSI/KDJ/BOLL)</td></tr>"
+                    f"<tr><td>尾盘强弱(5日均)</td><td>{f(tail5,'',2)}</td></tr>"
+                    f"<tr><td>量比</td><td>{f(vol_ratio,'',2)}</td></tr>"
+                    f"<td colspan=2 style='color:#888;font-size:11px'>五维尾盘选股法：尾盘强弱/连续放量因子</td></tr>"
+                    "</table>")
+                self.fc_strategy_panel.setHtml(html)
+            except Exception as e:
+                self.fc_strategy_panel.setHtml(f"<p style='color:#888'>策略信号计算失败：{e}</p>")
 
         @staticmethod
         def _cn_weekday(d):
@@ -8712,15 +9247,28 @@ if HAS_PYSIDE6:
             self._log("全部模型训练完成。")
             self._update_result_table()
             self._update_chart()
-            # 用成功训练的模型填充"策略回测"页的模型下拉（基准行也可回测，作为对照）
-            self.bt_model_combo.clear()
-            self.bt_model_combo.addItems([r.algo_name for r in results if not r.error])
-            self._refresh_model_combos()          # 「机器学习内部」的模型选择下拉也刷新
+            # 用成功训练的模型填充"策略回测"/"预测跟踪"/"未来预测图"的模型下拉（基准行也可回测，作为对照）
+            # ——未训练的模型不应出现在任何模型选择下拉里，全部只列本次成功训练的模型
+            trained_names = [r.algo_name for r in results if not r.error]
+            for combo_name in ("bt_model_combo", "trk_model_combo", "fc_model_combo"):
+                combo = getattr(self, combo_name, None)
+                if combo is None:
+                    continue
+                prev = combo.currentText()
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItems(trained_names)
+                if prev in trained_names:
+                    combo.setCurrentText(prev)
+                combo.blockSignals(False)
+            if hasattr(self, "trk_hint"):
+                self.trk_hint.setVisible(len(trained_names) == 0)
+            self._refresh_model_combos()          # 「机器学习内部」的模型选择下拉也刷新，并把全部下拉跳到DA最高的模型
             ok = sum(1 for r in results if not r.error)
             self._html_reco = self._build_recommendation_html(results)   # 供报告复用
             self.reco_view.setHtml(self._html_reco)
             self._oplog(f"训练完成：{ok} 个模型成功；结果见「指标结果表格」(每格=训练/验证/测试)。")
-            self.tabs.setCurrentIndex(2)          # 直接跳到「指标结果表格」看误差对比
+            self._select_tab_by_name("指标结果表格")   # 直接跳到「指标结果表格」看误差对比
 
         # 常见特征的中文可读名（找不到就用原名）
         _FEATURE_LABELS = {
