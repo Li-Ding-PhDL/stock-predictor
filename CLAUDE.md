@@ -50,17 +50,17 @@ docker build -t stock-predictor . && docker run --rm stock-predictor --cli --syn
 
 | 节 | 行范围（约） | 内容 |
 |---|---|---|
-| 一 | 1–197 | 依赖导入（核心 + try/except 可选依赖） |
-| 二 | 198–243 | 全局常量、`TrainConfig`（dataclass 配置） |
-| 三 | 244–1051 | `StockDataFetcher`：多源取数、parquet 缓存、估值、资金流、新闻、实时盘口 |
-| 四 | 1052–1275 | `FeatureEngineer`：技术指标 → 滑动窗口 → 标准化 → 时间序列三分 |
-| 五 | 1276–1430 | `Metrics`：12 个指标，统一入口 `calc_all()`，含 DA 方向准确率 |
-| 六 | 1431–2306 | `BaseModel` (ABC) + 34 个子类 + `ALGO_REGISTRY` / `ALGO_AVAILABILITY` |
-| 七 | 2307–2528 | 超参数优化：PSO / GA / FA / SOA / BO(optuna) |
-| 八 | 2529– | `TrainingPipeline`（调度 + CV 前扩窗口）+ 回测 + 未来预测 + 风险 + 因子选股 + 预测跟踪 |
-| 九 | 4628– | `MainWindow`（PySide6 GUI，12 页签） |
-| 十 | 7593– | `run_experiment`（可编程 API） |
-| 十一 | 7706– | CLI 解析 + `main()` 入口 |
+| 一 | 1–201 | 依赖导入（核心 + try/except 可选依赖） |
+| 二 | 202–251 | 全局常量、`TrainConfig`（dataclass 配置） |
+| 三 | 252–1406 | `StockDataFetcher`：多源取数、parquet 缓存、估值、资金流、新闻、实时盘口 |
+| 四 | 1407–1734 | `FeatureEngineer`：技术指标 → 滑动窗口 → 标准化 → 时间序列三分 |
+| 五 | 1735–1889 | `Metrics`：12 个指标，统一入口 `calc_all()`，含 DA 方向准确率 |
+| 六 | 1890–2765 | `BaseModel` (ABC) + 35 个子类 + `ALGO_REGISTRY` / `ALGO_AVAILABILITY` |
+| 七 | 2766–2987 | 超参数优化：PSO / GA / FA / SOA / BO(optuna) |
+| 八 | 2988–6583 | `TrainingPipeline`（调度 + CV 前扩窗口）+ 回测(含 Beta/Jensen's Alpha) + 未来预测 + 风险 + 因子选股(含盈余质量/税率异常/因子权重优化) + 预测跟踪 + 校准检验 + 尾盘选股 + 监管观察名单 + 模拟交易账户 |
+| 九 | 6584–11508 | `MainWindow`（PySide6 GUI，13 页签，含「模拟交易」） |
+| 十 | 11509–11621 | `run_experiment`（可编程 API） |
+| 十一 | 11622– | CLI 解析 + `main()` 入口 |
 
 ### 关键设计点
 

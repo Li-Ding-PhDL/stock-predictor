@@ -212,6 +212,9 @@ PRED_DIR = os.path.join(BASE_DIR, "predictions")      # 预测跟踪：保存每
 os.makedirs(PRED_DIR, exist_ok=True)
 PRED_LOG = os.path.join(PRED_DIR, "pred_log.csv")     # 旧 CSV 路径（仅用于一次性迁移，新数据写 SQLite）
 PRED_DB  = os.path.join(PRED_DIR, "pred_log.db")      # SQLite 数据库：结构化存储，支持 SQL 查询
+PAPER_DIR = os.path.join(BASE_DIR, "paper_trading")   # 模拟交易账户：持久化本地状态(现金/持仓/流水)，不入库
+os.makedirs(PAPER_DIR, exist_ok=True)
+PAPER_DB = os.path.join(PAPER_DIR, "paper_trading.db")
 
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
@@ -744,10 +747,13 @@ class StockDataFetcher:
 
     @staticmethod
     def fetch_quality(code: str, bypass_proxy: bool = True) -> Dict[str, Optional[float]]:
-        """优雅获取基本面『质量/成长』因子：ROE(净资产收益率) 与 营收同比增长率。
-        取数失败(无网络/接口变动/该股无数据)时返回空 → 因子缺失、绝不编造。"""
+        """优雅获取基本面『质量/成长』因子：ROE(净资产收益率) 与 营收同比增长率，
+        以及三项会计学"盈余质量"预警因子(经营现金流/净利润、应收账款与存货周转天数同比)、
+        有效税率异常筛查。取数失败(无网络/接口变动/该股无数据)时返回空 → 因子缺失、绝不编造。"""
         out: Dict[str, Any] = {"roe": None, "rev_growth": None, "debt_ratio": None,
-                               "f_score": None, "f_available": 0, "f_detail": []}
+                               "f_score": None, "f_available": 0, "f_detail": [],
+                               "cfo_np_ratio": None, "ar_days_yoy_delta": None, "inv_days_yoy_delta": None,
+                               "eff_tax_rate": None, "tax_anomaly": False, "tax_msg": None}
         if not HAS_AKSHARE:
             return out
         try:
@@ -777,9 +783,112 @@ class StockDataFetcher:
             for k in ("roe", "rev_growth", "debt_ratio"):
                 if out[k] is not None and (pd.isna(out[k]) or np.isinf(out[k])):
                     out[k] = None
+
+            # ---- 会计学"盈余质量"三因子：复用同一张新浪财务指标表，零额外网络请求 ----
+            # 方法论说明(诚实边界，供审阅)：
+            #   · 经营现金流/净利润：表里已有现成的"经营现金净流量与净利润的比率(%)"列，直接取——
+            #     该比值明显<100%是中级财务会计"应计盈余质量"章节的经典信号(净利润没有现金流支撑)。
+            #   · 应收账款/存货堆积：没有现成的"应收账款/营收增速差"列，但"周转天数"本身就正比于
+            #     "应收账款(或存货)/营业收入"(天数=365/周转率)，用它的**同比**变化(涨=账款/存货比
+            #     营收涨得快)在数学上等价地反映同一件事，且不必自己拿原始应收账款/存货和营收去凑增速差、
+            #     不会因分母(单季/累计)口径不一致引入新误差。用"约1年前同期"而非"上一期"比较，
+            #     避免季节性(如白酒Q4集中备货)被误判成异常。
+            def find_col(*kws):
+                for c in fi.columns:
+                    if all(k in str(c) for k in kws):
+                        return c
+                return None
+
+            c_cfo_np = find_col("经营现金净流量与净利润的比率")
+            if c_cfo_np is not None:
+                v = pd.to_numeric(row.get(c_cfo_np), errors="coerce")
+                # 数据源quirk核实：该列虽标"(%)"，实际存的是原始小数比率(如1.54=154%)，
+                # 不像同表 ROE 等列那样已经是百分数(17.72=17.72%)——用"每股经营性现金流/EPS"
+                # 交叉验证过换算关系，此处需×100 才是真实的"现金流/净利润(%)"，否则会把154%的健康
+                # 公司误判成1.5%的盈余质量极差(错得离谱，必须按真实换算关系处理，不能照搬列名字面意思)。
+                out["cfo_np_ratio"] = None if pd.isna(v) or np.isinf(v) else round(float(v) * 100, 1)
+
+            def yoy_delta(*kws):
+                c = find_col(*kws)
+                if c is None or "日期" not in fi.columns:
+                    return None
+                dates = pd.to_datetime(fi["日期"], errors="coerce")
+                cur_d = dates.iloc[-1]
+                cur_v = pd.to_numeric(row.get(c), errors="coerce")
+                if pd.isna(cur_d) or pd.isna(cur_v):
+                    return None
+                target = cur_d - pd.Timedelta(days=365)
+                diffs = (dates - target).abs()
+                pos = int(diffs.values.argmin())
+                if pd.isna(diffs.iloc[pos]) or diffs.iloc[pos] > pd.Timedelta(days=60):
+                    return None                                # 找不到约1年前同期数据，不编造
+                prev_v = pd.to_numeric(fi[c].iloc[pos], errors="coerce")
+                return None if pd.isna(prev_v) else float(cur_v - prev_v)
+
+            out["ar_days_yoy_delta"] = yoy_delta("应收账款周转天数")
+            out["inv_days_yoy_delta"] = yoy_delta("存货周转天数")
+
             # 复用同一份财报指标算 Piotroski F-Score(客观质量分，借鉴 trading_skills)
             pf = StockDataFetcher._piotroski_from_fi(fi)
             out.update(pf)
+            # 有效税率异常(需另一张利润表，独立一次网络请求；失败不影响上面已算出的其它因子)
+            try:
+                out.update(StockDataFetcher._fetch_tax_anomaly(code, bypass_proxy))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _fetch_tax_anomaly(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
+        """有效税率异常筛查(税收筹划知识判断"异常"的合理阈值)：有效税率 = 利润表「所得税」/「利润总额」。
+        诚实边界：低有效税率完全可能是合法的高新技术企业15%优惠税率、地方招商引资返还等正当情形，
+        这里只给出**警示信号**、不下"避税/造假"结论——具体原因需要看公司公告/审计报告核实。"""
+        out = {"eff_tax_rate": None, "tax_anomaly": False, "tax_msg": None}
+        if not HAS_AKSHARE:
+            return out
+        market = "SH" if code.startswith("6") else ("BJ" if code.startswith(("4", "8", "920")) else "SZ")
+        try:
+            ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+            with ctx:
+                ps = StockDataFetcher._retry(
+                    lambda: ak.stock_profit_sheet_by_report_em(symbol=f"{market}{code}"), tries=2)
+            if ps is None or len(ps) == 0 or not {"TOTAL_PROFIT", "INCOME_TAX", "REPORT_DATE"} <= set(ps.columns):
+                return out
+            ps = ps.copy()
+            ps["REPORT_DATE"] = pd.to_datetime(ps["REPORT_DATE"], errors="coerce")
+            ps = ps.sort_values("REPORT_DATE")
+            # 优先用年报(口径最干净，不受季度累计/多退少补影响)，年报不足2期再退回全部报告期
+            ann = ps[ps["REPORT_TYPE"] == "年报"] if "REPORT_TYPE" in ps.columns else ps.iloc[0:0]
+            use = ann if len(ann) >= 2 else ps
+            tp = pd.to_numeric(use["TOTAL_PROFIT"], errors="coerce")
+            it = pd.to_numeric(use["INCOME_TAX"], errors="coerce")
+            rate = (it / tp).where(tp > 0).dropna()             # 利润总额<=0(亏损)时税率没有意义，不编造
+            if len(rate) == 0:
+                return out
+            cur_rate = float(rate.iloc[-1])
+            out["eff_tax_rate"] = round(cur_rate * 100, 2)
+            msgs = []
+            # 阈值参考：企业所得税法定税率25%，高新技术企业/西部大开发等最低法定优惠档15%——
+            # 明显低于15%已超出常规合法优惠区间下限，值得关注(不代表造假，仅为警示信号)。
+            if cur_rate < 0.10:
+                msgs.append(f"最新一期有效税率仅{cur_rate*100:.1f}%，明显低于法定最低优惠档15%，"
+                            f"建议核查是否存在税收返还/递延所得税资产等特殊事项")
+            if len(rate) >= 2:
+                prev_rate = float(rate.iloc[-2])
+                np_s = pd.to_numeric(use.get("NETPROFIT"), errors="coerce") if "NETPROFIT" in use.columns else None
+                np_now = float(np_s.iloc[-1]) if np_s is not None and not pd.isna(np_s.iloc[-1]) else None
+                np_prev = float(np_s.iloc[-2]) if np_s is not None and not pd.isna(np_s.iloc[-2]) else None
+                delta = cur_rate - prev_rate
+                if (delta <= -0.10 and np_now is not None and np_prev is not None
+                        and np_prev > 0 and np_now >= np_prev * 0.95):
+                    msgs.append(f"有效税率同比骤降{abs(delta)*100:.1f}个百分点，但净利润未同向下滑——"
+                                f"可能是税收优惠到期后仍维持异常低税率(需核实公告)，也可能是合规的一次性"
+                                f"退税/递延税调整，仅供关注，不构成结论")
+            if msgs:
+                out["tax_anomaly"] = True
+                out["tax_msg"] = "；".join(msgs)
         except Exception:
             pass
         return out
@@ -3554,6 +3663,18 @@ def backtest_directional(prev_close, close_target, pred_price, dates,
                     out["information_ratio"] = round(ir, 3)
                 else:
                     out["information_ratio"] = None
+                # Beta(系统性风险) + Jensen's Alpha：CAPM 经典标准做线——把策略收益对基准收益做线性回归，
+                # 回归斜率 Beta = "基准涨1%，策略平均跟着涨多少"，截距(超额) Jensen's Alpha = 扣掉"光跟着大盘涨"
+                # 就能拿到的那部分收益后，策略自己还能不能挣钱。和信息比率同属CFA二级"业绩归因"框架，
+                # 比只看"相对强弱RS涨跌幅之差"多了一层线性回归支撑的相关性量化。
+                var_bench = float(np.var(bench_seg_ret))
+                if var_bench > 1e-12:
+                    beta = float(np.cov(strat_ret[1:], bench_seg_ret, ddof=0)[0, 1] / var_bench)
+                    alpha_seg = float(np.mean(strat_ret[1:] - rf_seg) - beta * np.mean(bench_seg_ret - rf_seg))
+                    out["beta"] = round(beta, 3)
+                    out["jensen_alpha_annual_pct"] = round(alpha_seg * (ann_days / max(1, horizon)) * 100, 2)
+                else:
+                    out["beta"] = None; out["jensen_alpha_annual_pct"] = None
     return out
 
 
@@ -3966,12 +4087,35 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             # 低波动因子：近60日日收益年化波动率(越低越好)
             rr = close.pct_change().dropna()
             vol60 = float(rr.tail(60).std() * np.sqrt(252)) if len(rr) >= 20 else None
-            # 质量/成长因子：ROE、营收同比(取不到即缺省，不编造)
-            roe = rev_g = fscore = None
+            # 质量/成长因子：ROE、营收同比、会计学盈余质量三因子、有效税率异常(取不到即缺省，不编造)
+            roe = rev_g = fscore = cfo_np = ar_delta = inv_delta = None
+            q: Dict[str, Any] = {}
             if use_quality:
                 q = StockDataFetcher.fetch_quality(code)
                 roe, rev_g, fscore = q.get("roe"), q.get("rev_growth"), q.get("f_score")
+                cfo_np, ar_delta, inv_delta = (q.get("cfo_np_ratio"), q.get("ar_days_yoy_delta"),
+                                               q.get("inv_days_yoy_delta"))
             warns = assess_risks(code, name, df, news=None)
+            if use_quality:
+                # 会计学盈余质量预警(阈值为经验启发式，非统计校验过的定论，仅供关注、不下结论)
+                if cfo_np is not None and cfo_np < 50:
+                    warns.append({"level": "中", "category": "盈余质量弱",
+                                  "msg": f"经营现金流/净利润比 {cfo_np:.0f}%，明显低于100%——净利润缺乏"
+                                         f"经营现金流支撑，中级财务会计\"应计盈余质量\"警示信号。",
+                                  "source": "新浪财务指标", "url": ""})
+                if ar_delta is not None and ar_delta > 15:
+                    warns.append({"level": "中", "category": "应收账款堆积",
+                                  "msg": f"应收账款周转天数同比拉长 {ar_delta:.0f} 天，应收账款比营业收入"
+                                         f"涨得快，回款变慢的经典预警信号。",
+                                  "source": "新浪财务指标", "url": ""})
+                if inv_delta is not None and inv_delta > 15:
+                    warns.append({"level": "中", "category": "存货堆积",
+                                  "msg": f"存货周转天数同比拉长 {inv_delta:.0f} 天，存货可能滞销/积压，"
+                                         f"中级会计\"存货计价\"章节的经典预警信号。",
+                                  "source": "新浪财务指标", "url": ""})
+                if q.get("tax_anomaly"):
+                    warns.append({"level": "低", "category": "税率异常",
+                                  "msg": q.get("tax_msg") or "", "source": "东方财富·利润表", "url": ""})
             # ---- 技术面信号打分（用于第6因子）----
             # 加入 FeatureEngineer 衍生指标后，从末行取当前值
             try:
@@ -4004,6 +4148,8 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
                          "pe": last("val_pe_ttm"), "pb": last("val_pb"),
                          "mom1m": mom1, "mom3m": mom3, "mf5": mf5,
                          "vol60": vol60, "roe": roe, "rev_growth": rev_g, "f_score": fscore,
+                         "cfo_np_ratio": cfo_np, "ar_days_yoy_delta": ar_delta, "inv_days_yoy_delta": inv_delta,
+                         "eff_tax_rate": q.get("eff_tax_rate"),
                          "tech_sig": tech_sig, "rsi": rsi_v, "kdj_j": kdj_j_v,
                          "macd_cross": macd_c_v, "tail_strength": tail_v,
                          "risk_n": len(warns), "risk_hi": sum(1 for w in warns if w["level"] == "高"),
@@ -4038,11 +4184,15 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
                         ok[i]["val_in_industry"] = True
         s_mom = pct([r["mom3m"] for r in ok], True)                            # 动量越高越好
         s_mon = pct([r["mf5"] for r in ok], True)                             # 资金流入越多越好
-        # 质量：ROE + 营收增速 + Piotroski F-Score 三者百分位取平均(有几个算几个)；低波动：波动率越低越好
+        # 质量：ROE/营收增速/Piotroski F-Score + 会计学盈余质量三因子(经营现金流/净利润、应收账款与
+        # 存货周转天数同比)，六者百分位取平均(有几个算几个)；低波动：波动率越低越好
         s_roe = pct([r.get("roe") for r in ok], True)
         s_revg = pct([r.get("rev_growth") for r in ok], True)
         s_fsc = pct([r.get("f_score") for r in ok], True)
-        s_qual = pd.concat([s_roe, s_revg, s_fsc], axis=1).mean(axis=1)
+        s_cfo = pct([r.get("cfo_np_ratio") for r in ok], True)                 # 现金流/净利润越高越好
+        s_ar = pct([r.get("ar_days_yoy_delta") for r in ok], False)            # 应收账款周转天数同比涨越多越差
+        s_inv = pct([r.get("inv_days_yoy_delta") for r in ok], False)          # 存货周转天数同比涨越多越差
+        s_qual = pd.concat([s_roe, s_revg, s_fsc, s_cfo, s_ar, s_inv], axis=1).mean(axis=1)
         s_lowvol = pct([r.get("vol60") for r in ok], False)                   # 波动越低分越高
         # 技术面信号分：已在 per-code 循环算出0~100的绝对分，转百分位
         s_tech = pct([r.get("tech_sig") for r in ok], True)                   # 技术信号越高越好
@@ -4063,6 +4213,105 @@ def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[s
             r["score"] = round(float(base) - 12.0 * r["risk_hi"] - 3.0 * (r["risk_n"] - r["risk_hi"]), 1)
     recs.sort(key=lambda r: (r.get("score") if r.get("score") is not None else -1e9), reverse=True)
     return recs
+
+
+def _rolling_z(s: pd.Series, window: int = 120, min_periods: int = 20) -> pd.Series:
+    """滚动窗口 z-score(只用当天及以前的数据算均值/标准差，逐日展开、无未来信息)。"""
+    m = s.rolling(window, min_periods=min_periods).mean()
+    sd = s.rolling(window, min_periods=min_periods).std()
+    return (s - m) / (sd + 1e-9)
+
+
+def optimize_factor_weights(codes: List[str], lookback_days: int = 252, fwd_days: int = 5,
+                            sample_step: int = 5, alpha: float = 1.0,
+                            progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """用线性代数(岭回归 Ridge)从历史数据里学"因子该怎么加权"，替代 batch_factor_scan() 默认的
+    简单等权平均——这是量化多因子模型的经典做法(Barra/Fama-French式的因子合成)，用回归系数代替拍脑袋权重。
+
+    诚实边界(供审阅，这不是"自动更准的模型"，是给用户一个数据驱动的参考权重，别神化)：
+      · 只优化【价值(value)/动量(momentum)/低波动(lowvol)】三个"有逐日历史序列、可以真实回放"的因子——
+        资金流(money)噪声太大、技术面(tech)信号定义复杂、质量(quality)因子只有 fetch_quality() 返回的
+        "最近一期财报"、没有可回放的任意历史日期时点值，拿当前值冒充历史值等于用了未来信息(违反项目
+        "外部数据向后对齐"的红线)，这三个因子的权重仍由用户手动设定、不参与本次优化——比编一个
+        看似"优化过"实则悄悄用了未来数据的假权重更诚实。
+      · 每只股票在自己的滚动窗口内独立做标准化(z-score)，再把多只股票的(标准化因子值, 未来收益)观测点
+        池在一起做一次岭回归(Ridge，L2正则防止三因子间共线性导致系数暴涨、过拟合)——回归系数即为
+        建议权重，可正可负；系数为负说明这个因子在这批股票的这段历史里，方向和"越高越好"的原始假设
+        (如"低估值更值得买")相反，如实报告，不強行拗成正数。
+      · 这是历史拟合出来的权重，样本内 R² 通常很低(单期收益噪声天然很大，这是正常现象，不代表回归失败，
+        判断标准是权重方向是否合理，而非追求高 R²)，不保证样本外(未来)继续有效，不构成投资建议。
+    """
+    log = progress_cb or (lambda m: None)
+    X_rows: List[List[float]] = []
+    y_rows: List[float] = []
+    n_codes_ok = 0
+    for i, code in enumerate(codes):
+        code = code.strip()
+        if not code:
+            continue
+        log(f"[因子权重优化 {i+1}/{len(codes)}] {code} 取历史数据+构造因子序列 ...")
+        try:
+            end = dt.date.today().strftime("%Y%m%d")
+            start = (dt.date.today() - dt.timedelta(days=int(lookback_days * 1.6) + 200)).strftime("%Y%m%d")
+            df = StockDataFetcher().fetch(code, start, end)
+            if df is None or len(df) < 150:
+                continue
+            df, _ = StockDataFetcher.enrich(df, code, want_valuation=True, want_index=False,
+                                            want_fundflow=False, want_us=False, want_northbound=False)
+            df = df.tail(lookback_days + fwd_days + 130).reset_index(drop=True)
+            close = pd.to_numeric(df["close"], errors="coerce")
+            fwd_ret = close.shift(-fwd_days) / close - 1.0             # 事后已实现收益，仅用作回归标签y
+
+            pe = pd.to_numeric(df["val_pe_ttm"], errors="coerce") if "val_pe_ttm" in df.columns \
+                else pd.Series(np.nan, index=df.index)
+            pb = pd.to_numeric(df["val_pb"], errors="coerce") if "val_pb" in df.columns \
+                else pd.Series(np.nan, index=df.index)
+            value_raw = -(_rolling_z(pe) + _rolling_z(pb)) / 2.0        # 低估值(低PE/PB)=正分
+
+            mom = close / close.shift(63) - 1.0
+            momentum_raw = _rolling_z(mom)
+
+            vol60 = close.pct_change().rolling(60, min_periods=20).std()
+            lowvol_raw = -_rolling_z(vol60)                              # 低波动=正分
+
+            n_start = max(130, len(df) - lookback_days - fwd_days)
+            for j in range(n_start, len(df) - fwd_days, max(1, sample_step)):
+                vv, mv, lv, rv = value_raw.iloc[j], momentum_raw.iloc[j], lowvol_raw.iloc[j], fwd_ret.iloc[j]
+                if any(pd.isna(x) for x in (vv, mv, lv, rv)):
+                    continue
+                X_rows.append([float(vv), float(mv), float(lv)]); y_rows.append(float(rv))
+            n_codes_ok += 1
+        except Exception as e:
+            log(f"[因子权重优化] {code} 失败：{e}")
+
+    if len(X_rows) < 50:
+        return {"error": f"有效样本点太少(n={len(X_rows)}<50)，无法回归，换更长历史/更多股票再试"}
+
+    X = np.array(X_rows); y = np.array(y_rows)
+    model = Ridge(alpha=alpha)
+    model.fit(X, y)
+    r2 = float(model.score(X, y))
+    raw_w = {"value": float(model.coef_[0]), "momentum": float(model.coef_[1]), "lowvol": float(model.coef_[2])}
+    # 归一化：只在系数为正的因子间按比例分配到0~1(契合"分数越高越该加分"的原始打分框架)；
+    # 全部为负则如实退回等权、不強行归一化出虚假的"最优权重"。
+    pos = {k: v for k, v in raw_w.items() if v > 0}
+    if pos:
+        s = sum(pos.values())
+        norm_w = {k: round(v / s, 3) for k, v in pos.items()}
+        for k in raw_w:
+            norm_w.setdefault(k, 0.0)
+    else:
+        norm_w = {k: round(1 / 3, 3) for k in raw_w}
+    return {
+        "raw_coef": {k: round(v, 4) for k, v in raw_w.items()},
+        "normalized_weights": norm_w,
+        "r2": round(r2, 4), "n_obs": len(X_rows), "n_codes": n_codes_ok,
+        "fwd_days": fwd_days, "alpha": alpha,
+        "not_optimized": ["资金流(money)", "质量(quality)", "技术面(tech)"],
+        "note": ("样本内R²通常很低(单期收益噪声天然大，属正常现象，判断标准是权重方向是否合理，"
+                "而不是追求高R²)；资金流/质量/技术面因子未参与优化(见 not_optimized，缺可回放的历史"
+                "点位序列)，权重仍需手动设定；这是历史拟合结果，不保证样本外有效，不构成投资建议。"),
+    }
 
 
 # ==================== 第八部分补充4b：组合与仓位（借鉴 kelly/correlation/portfolio 等交易 skill） ====================
@@ -4442,7 +4691,7 @@ def verify_predictions(progress_cb: Optional[Callable[[str], None]] = None,
                 continue
     _save_pred_db(df)
     prune_pred_log()
-    return n_ok
+    return n_ok, aborted
 
 
 def prune_pred_log(days: int = PRED_RETENTION_DAYS) -> int:
@@ -4558,11 +4807,35 @@ def prediction_accuracy() -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _calibration_sig_test(stated_prob_pct: float, realized_pct: float, n: int) -> Dict[str, Any]:
+    """校准桶内"声称概率 vs 真实命中率"是否有统计显著差异——双侧二项检验的正态近似，
+    与 da_significance() 同一套思路，只是原假设从固定的50%换成本桶"声称的概率"：
+    H0: 真实上涨概率 = 声称概率。不做这一步，光比较两个数字差多少，桶内样本一多就是噪声、
+    样本一少差距再大也可能只是运气，不能凭"看起来差多少"下"校准好/不好"的结论。"""
+    if n is None or n < 5 or stated_prob_pct is None or not (0 < stated_prob_pct < 100):
+        return {"p": None, "sig": False, "text": "样本太少，无法判断"}
+    import math
+    p0 = stated_prob_pct / 100.0
+    phat = realized_pct / 100.0
+    se = math.sqrt(p0 * (1 - p0) / n)
+    z = (phat - p0) / (se + 1e-12)
+    p = math.erfc(abs(z) / math.sqrt(2))                    # 双侧正态近似
+    if p < 0.05:
+        txt = (f"与声称概率有统计显著差异(p={p:.3f}, n={n})，"
+              + ("模型可能高估了概率(过度自信)" if phat < p0 else "模型可能低估了概率(过度保守)"))
+    else:
+        txt = f"与声称概率无显著差异(p={p:.2f}, n={n})，校准良好"
+    return {"p": round(p, 4), "sig": p < 0.05, "text": txt}
+
+
 def calibration_check() -> Dict[str, Any]:
     """Y3(概率输出)方案B原型的**校准检验(calibration check)**——两份 memo/《机器学习输入输出设计报告》
     强调的强制项："模型说70%涨"的历史预测里，真实上涨比例是不是真的接近70%。
     只用已验证(status=verified)且记录时存了 pred_prob_up 的记录(见 estimate_direction_probability，
-    目前仅"未来预测图"页对1日周期预测调用)，按预测概率分桶，逐桶比较"平均声称概率" vs "真实上涨占比"。
+    目前仅"未来预测图"页对1日周期预测调用)，按预测概率分桶，逐桶比较"平均声称概率" vs "真实上涨占比"，
+    并对每桶做显著性检验(H0:真实概率=声称概率)，再对全部桶做多重比较校验(与 _build_recommendation_html()
+    里"34选1"用的是同一套 multiple_comparison_correct()，同一套完整统计方法体系，不是另起一套)——
+    分桶越多、越容易凑出"看起来偏差很大"的桶，不校验就下结论会重蹈"矮子里选将军"的虚高覆辙。
     只要还没积累到足够样本，如实返回"数据不足"——不能拿一两条记录就下"概率准不准"的结论。"""
     df = load_pred_log()
     if len(df) == 0 or "pred_prob_up" not in df.columns:
@@ -4582,13 +4855,21 @@ def calibration_check() -> Dict[str, Any]:
         # hit=1 表示"预测方向为涨且命中"或"预测方向为跌且命中"，校准检验需要的是"实际是否上涨"，
         # 用 pred_dir 还原：pred_dir=涨且hit=1 → 真实涨；pred_dir=跌且hit=1 → 真实跌；hit=0 则相反
         up_actual = ((g["pred_dir"] == "涨") & (g["hit"] == 1)) | ((g["pred_dir"] == "跌") & (g["hit"] == 0))
+        stated = round(float(g["prob"].mean()), 1)
+        realized = round(float(up_actual.mean() * 100), 1)
         rows.append({
             "bucket": f"{lo}-{hi}%", "n": int(len(g)),
-            "mean_stated_prob": round(float(g["prob"].mean()), 1),
-            "realized_up_rate": round(float(up_actual.mean() * 100), 1),
+            "mean_stated_prob": stated, "realized_up_rate": realized,
+            "sig": _calibration_sig_test(stated, realized, len(g)),
         })
-    return {"enough": True, "n": int(len(v)), "rows": rows,
-            "note": "样本仍偏少时，逐桶结果会有噪声；「平均声称概率」应与「真实上涨占比」大致接近才说明概率靠谱。"}
+    # 多重比较校验：同时对多个桶做显著性检验，比较后再挑"偏差最大的桶"下结论，需和 34选1模型 同样校验
+    mc = multiple_comparison_correct([r["sig"]["p"] for r in rows])
+    for i, r in enumerate(rows):
+        r["bh_q"] = mc["bh_qvals"][i]
+        r["sig_after_mc"] = r["bh_q"] is not None and r["bh_q"] < 0.05
+    return {"enough": True, "n": int(len(v)), "rows": rows, "mc": mc,
+            "note": "样本仍偏少时，逐桶结果会有噪声；「平均声称概率」应与「真实上涨占比」大致接近才说明概率靠谱，"
+                   "且要看多重比较校验(bh_q)后是否仍显著，而不是只看单桶的原始p值。"}
 
 
 # ==================== 第八部分补充6：盘口快照记录 + 挂单量变化分析 ====================
@@ -4728,6 +5009,12 @@ GLOSSARY = {
          "回撤-30%的卡玛高3倍，说明前者赚得更\"平稳\"，不是靠一次大冒险赌出来的。"),
         ("信息比率(Information Ratio)", "承担的\"跟踪误差\"风险，换来多少跑赢基准(如沪深300)的超额收益，"
          "是基金经理最常用的业绩考核指标之一。和夏普的区别：夏普相对<b>无风险利率</b>，IR相对<b>业绩基准</b>。"),
+        ("Beta(系统性风险)", "策略收益对沪深300收益做线性回归的<b>斜率</b>：大盘涨1%，策略平均跟着涨多少。"
+         "Beta&gt;1 = 比大盘更暴涨暴跌，Beta&lt;1 = 更平稳，Beta≈0 = 和大盘走势基本不相关。"
+         "是CAPM(资本资产定价模型)里最经典的风险度量，也是给\"相对强弱RS\"补上的严谨线性回归版本。"),
+        ("Jensen's Alpha(詹森指数)", "上面那条回归线的<b>截距</b>(年化)：把\"光跟着大盘涨\"能拿到的那部分收益(Beta×大盘涨幅)"
+         "扣掉之后，策略自己还能不能挣钱。Alpha&gt;0 才说明策略有\"超出承担的系统性风险应得回报\"的真本事，"
+         "Alpha≈0 说明赚的钱基本就是\"跟涨大盘\"换来的，没有额外的选股/择时价值。"),
         ("索提诺比率(Sortino Ratio)", "和夏普类似，但分母只算<b>下行波动</b>（亏损段的波动），不惩罚上涨的波动。"
          "因为投资者真正不喜欢的是亏钱，而不是涨太快——所以索提诺比夏普更适合评估A股单边多头策略。"
          "无亏损段时未定义（显示None）。"),
@@ -4882,6 +5169,35 @@ def stock_character(close) -> Dict[str, Any]:
     return out
 
 
+# 宏观经济学"为什么要关注"解释文字：纯文本、不改变任何计算逻辑，只是把"能看"的趋势图变成"能读懂"。
+# 写的是教科书级别、无争议的一般性经济学关系(需求拉动通胀/成本推动通胀、货币政策传导、行业周期敏感性)，
+# 用"通常/历史上"等措辞、不做"一定会怎样"的确定性断言，更不针对任何具体股票下结论——不构成投资建议。
+MACRO_EXPLAIN = {
+    "GDP 同比%": "国民经济增长的总体温度计。GDP增速走高通常对应企业盈利环境改善，历史上顺周期行业"
+                "(原材料/工业/可选消费)对经济景气度更敏感；GDP走弱时防御性行业(公用事业/必需消费/医药)"
+                "相对抗跌。但股价反映的是市场预期而非当期数据本身，GDP公布时往往已被提前price in，"
+                "GDP数据发布的\"意外程度\"(超预期/不及预期)通常比数值本身对市场影响更大。",
+    "CPI 同比%": "消费者价格指数，衡量终端消费品价格变化，是央行货币政策(尤其利率决策)最重要的参照系之一。"
+                "CPI走高(通胀压力)可能促使货币政策收紧，压制估值(尤其高估值成长股，因为未来现金流的"
+                "折现率上升)；CPI走低甚至通缩风险，可能倒逼货币宽松，历史上相对利好利率敏感型资产。"
+                "CPI里食品和能源分项波动大，剔除这两项的\"核心CPI\"更能反映真实通胀趋势，这里展示的是整体同比。",
+    "PPI 同比%": "生产者价格指数，衡量工业品出厂价格，反映上游原材料/中游制造的成本压力，通常领先于CPI"
+                "(上游价格传导到下游消费品需要时间)。PPI持续走高，对提价能力强的上游资源类企业"
+                "(煤炭/有色/化工)通常是盈利利好；但若下游议价能力弱，PPI与CPI的\"剪刀差\"扩大反而会"
+                "挤压中下游制造业的利润率。",
+    "制造业 PMI": "采购经理人指数，50为荣枯分界线，高于50代表制造业扩张、低于50代表收缩。PMI是月度"
+                "高频指标，通常比季度GDP更快反映当月景气度变化，是常用的经济周期领先指标。PMI连续处于"
+                "扩张区间，历史上通常对应工业/制造/出口链条相对强势；PMI分项里的新订单、新出口订单、"
+                "原材料库存等，对判断当前所处的周期位置比总指数本身更有信息量。",
+    "M2 同比%": "广义货币供应量增速，直接体现货币政策的松紧程度。M2增速走高通常意味着市场流动性趋于"
+               "宽松，历史上对权益市场(尤其成长股/小盘股)整体是相对有利的资金环境；但单看M2同比容易片面——"
+               "M2与社融增速的\"剪刀差\"(M2-社融)更能反映资金是流向了实体经济还是在金融体系内空转。",
+    "LPR 1年%": "贷款市场报价利率，是当前中国实际的基准利率(替代了传统的存贷款基准利率)，直接决定企业/"
+               "居民的融资成本。LPR下调即变相降息，历史上通常利好利率敏感型行业(地产/基建/高杠杆企业)，"
+               "同时压低无风险利率，对应抬升权益资产(尤其高股息资产)的相对吸引力；LPR上调则相反。",
+}
+
+
 def fetch_macro_snapshot(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """中国宏观经济快照(GDP/CPI/PPI/PMI/M2/LPR)——**仅作研究背景，绝不接入训练特征**。
     数据来自 akshare(国家统计局/金十)免费接口；取不到的指标自动跳过、绝不臆造。
@@ -4956,6 +5272,36 @@ def da_significance(da_pct: Optional[float], n: int) -> Dict[str, Any]:
     else:
         txt = f"不显著(p={p:.2f}, n={n})，可能只是运气"
     return {"p": round(p, 4), "sig": p < 0.05, "text": txt}
+
+
+def multiple_comparison_correct(pvals: List[Optional[float]], alpha: float = 0.05) -> Dict[str, Any]:
+    """对一组"各自独立算出来的" da_significance() p 值做多重比较校验。
+
+    诚实要点：像 _build_recommendation_html() 那样"同时训练 N 个模型、自动挑 DA 最高的那个"，
+    本质是同时做了 N 次"DA是否显著>50%"的假设检验再挑最小 p 值——单独看被挑中模型的 p<0.05，
+    不能直接采信为"这个模型真的强"，因为 N 次检验里只要有一个纯属运气达到 p<0.05 的概率远高于 5%
+    (掷的骰子越多，最大点数越可能很大)。需要用族错误率校验(Bonferroni，更保守)或
+    错误发现率校验(Benjamini-Hochberg/FDR，更常用、没那么保守)重新判断"挑出来的这个"是否还站得住。
+
+    返回 {"n": 参与校验的有效样本数, "bonferroni_alpha": 每个原始p需低于此阈值才算通过Bonferroni校验,
+          "bh_qvals": 与 pvals 等长的 BH 校验后 q 值列表(None 对齐跳过的 None 项)}。
+    """
+    idx_valid = [i for i, p in enumerate(pvals) if p is not None]
+    m = len(idx_valid)
+    bonf_alpha = (alpha / m) if m else alpha
+    q: List[Optional[float]] = [None] * len(pvals)
+    if m:
+        order = sorted(idx_valid, key=lambda i: pvals[i])          # 按 p 从小到大排序做 BH 递推
+        q_sorted = [0.0] * m
+        running_min = 1.0
+        for rank in range(m, 0, -1):                                # 从最大 p 往回累计取最小值，保证 q 单调不减
+            i = order[rank - 1]
+            qval = pvals[i] * m / rank
+            running_min = min(running_min, qval)
+            q_sorted[rank - 1] = running_min
+        for pos, i in enumerate(order):
+            q[i] = round(min(1.0, q_sorted[pos]), 4)
+    return {"n": m, "bonferroni_alpha": round(bonf_alpha, 5), "bh_qvals": q}
 
 
 def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
@@ -5700,11 +6046,20 @@ def regulatory_watchlist_backtest(codes: List[str], lookback_days: int = 252, fw
     按"当天满足几条条件"(0~3)分组统计：n、平均未来收益、上涨占比(胜率)，并用项目已有的
     da_significance() 对高分组胜率做二项显著性检验(而不是想当然认为分越高越好)。
 
+    合规披露分析补充：只看"满足几条"回答不了"到底是哪种披露更管用"——大股东增减持是内部人交易，
+    受《证券法》强制披露约束、信息含量理论上最直接；龙虎榜是次日盘后公布的机构/游资席位成交，
+    披露滞后于交易行为本身；大宗交易折溢价则是买卖双方议价的结果，折价收窄可能只反映"接盘方更有信心"
+    而非公开的确定性信息。所以额外对**每个维度单独**(不看其它两维、不要求同时满足)拆成"触发/未触发"
+    两组做对比，用同一套显著性检验，才能回答"哪个披露维度真的更能提前反映后续走势"这个专业问题——
+    结果见返回值里的 dim_rows，而不是只凭直觉认为"披露越多越可信"。
+
     诚实要点：三个数据源任一取不到时该维当天历史记录里如实标记缺失，不编造；龙虎榜数据较慢且
     _fetch_dragon_tiger 只取最近30次上榜，lookback_days 越长、越早期的窗口越可能因覆盖不到而记为缺失
     (不是取数失败)。这是历史统计，不保证未来重演，不构成买卖建议。"""
     log = progress_cb or (lambda m: None)
     buckets: Dict[int, List[float]] = {s: [] for s in range(4)}   # score(0-3) -> 未来收益率列表
+    dim_names = {"c9": "x9折价收窄(大宗交易)", "c10": "x10近5日净增持(大股东/高管)", "c11": "x11龙虎榜近5日净买入"}
+    dim_buckets = {k: {"true": [], "false": []} for k in dim_names}  # 每维单独拆"触发/未触发"，互不控制其它维
     dims_missing_days = 0
     total_days = 0
     for i, code in enumerate(codes):
@@ -5750,7 +6105,14 @@ def regulatory_watchlist_backtest(codes: List[str], lookback_days: int = 252, fw
                 if bt_p.isna().iloc[j] or hc_s.isna().iloc[j] or (use_dragon_tiger and lhb_a.isna().iloc[j]):
                     dims_missing_days += 1
                 s = int(score.iloc[j])
-                buckets[s].append(float(fwd_ret.iloc[j]))
+                r_j = float(fwd_ret.iloc[j])
+                buckets[s].append(r_j)
+                if not bt_p.isna().iloc[j]:
+                    dim_buckets["c9"]["true" if bool(c9.iloc[j]) else "false"].append(r_j)
+                if not hc_s.isna().iloc[j]:
+                    dim_buckets["c10"]["true" if bool(c10.iloc[j]) else "false"].append(r_j)
+                if use_dragon_tiger and not lhb_a.isna().iloc[j]:
+                    dim_buckets["c11"]["true" if bool(c11.iloc[j]) else "false"].append(r_j)
         except Exception as e:
             log(f"[监管披露观察回测] {code} 失败：{e}")
     log("完成")
@@ -5780,12 +6142,404 @@ def regulatory_watchlist_backtest(codes: List[str], lookback_days: int = 252, fw
     if high_mean is not None and low_mean is not None:
         verdict = (f"高分组(≥2)未来{fwd_days}日均收益{high_mean:.2f}% vs 低分组(0){low_mean:.2f}%，"
                     + ("高分组确实更高" if high_mean > low_mean else "高分组反而不比低分组高，条件多不代表未来收益好"))
+
+    # ---- 各维度单独有效性(哪种披露更管用)：触发 vs 未触发，两两独立对比，不要求同时满足其它维 ----
+    dim_rows = []
+    for key, name in dim_names.items():
+        if key == "c11" and not use_dragon_tiger:
+            dim_rows.append({"dim": name, "n_true": 0, "n_false": 0, "note": "未勾选龙虎榜，未纳入本次验证"})
+            continue
+        t, f = dim_buckets[key]["true"], dim_buckets[key]["false"]
+        if len(t) < 5 or len(f) < 5:
+            dim_rows.append({"dim": name, "n_true": len(t), "n_false": len(f), "note": "样本不足，无法判断"})
+            continue
+        ta, fa = np.array(t), np.array(f)
+        twin = float((ta > 0).mean() * 100)
+        dim_rows.append({
+            "dim": name, "n_true": len(ta), "n_false": len(fa),
+            "mean_fwd_ret_true_pct": round(float(ta.mean()) * 100, 3),
+            "mean_fwd_ret_false_pct": round(float(fa.mean()) * 100, 3),
+            "win_rate_true_pct": round(twin, 1),
+            "sig_true_vs_50pct": da_significance(twin, len(ta)),
+            "verdict": ("触发时未来收益更高" if ta.mean() > fa.mean()
+                       else "触发时未来收益不比未触发时高，该维度单独看没有额外预测力"),
+        })
     return {
-        "rows": rows, "fwd_days": fwd_days, "n_stocks": len(codes), "total_days": total_days,
+        "rows": rows, "dim_rows": dim_rows, "fwd_days": fwd_days, "n_stocks": len(codes),
+        "total_days": total_days,
         "dims_missing_ratio_pct": round(dims_missing_days / total_days * 100, 1) if total_days else 0.0,
         "high_vs_low_verdict": verdict,
         "note": "历史统计，样本外未来不保证重演；不构成买卖建议，风险自负。",
     }
+
+
+# ==================== 第八部分补充8c：模拟交易账户（虚拟盘，按A股真实规则逐周期自动买卖）====================
+# 设计取舍：不是"历史回测"(那是 backtest_directional 已经做的事——一次性算出"如果当年这样交易"的
+# 历史曲线)，而是**从创建那一刻起持续推进的模拟账户**——每次调用 run_paper_account() 都用【当前能拉到
+# 的最新真实行情】做一次"如果我现在照着模型信号操作，会怎样"的真实推进，账户状态(现金/持仓/交易流水/
+# 净值曲线)落盘到 SQLite，支持多次运行、跨会话延续，不是一次性算出来的历史曲线，更接近真实"纸上炒股"。
+#
+# 交易规则(与 backtest_directional 同一套 A 股红线，但这里是"真金白银的整数股"而非抽象净值倍数)：
+#   · 买入必须是 100 股(一手)的整数倍，预算不够买一手就跳过——如实标注"资金不足"，不编造零股买入。
+#   · T+1：只在"决策周期"(间隔=模型 horizon 个交易日)对已持有仓位判断是否卖出，且同一决策周期内
+#     先卖后买——新买入的仓位天然到不了本周期内被卖出，无需额外记录 buy_date 判断。
+#   · 涨停(一字板)买不进、跌停(一字板)卖不出、停牌不可交易，判定口径同 backtest_directional。
+#   · 佣金：双边 万2.5(0.025%)，单笔最低 5 元(多数券商规则，小额账户占比不可忽略，不能省略)；
+#     印花税：仅卖出收 0.05%(2023-08-28起新规)；滑点：买卖各按 0.1% 冲击成本估算(用信号日收盘价
+#     成交是理想化，现实排队到收盘价撮合仍有偏差，用滑点体现，不假装100%精确成交)。
+#   · 股票池：不凭空"发现"股票(项目没有全市场爬虫式选股器)，而是复用已有的 batch_factor_scan() 对
+#     用户指定的候选池打分排名，每个决策周期只从排名前 pool_top_n 只里挑"模型预测涨"的买入——这就是
+#     "自动选股"：候选范围由用户给定，具体买哪几只、买不买、卖不卖，由因子排名+模型预测共同决定。
+#
+# 诚实边界：这是纸面模拟(paper trading)，不是实盘；A股不能做空，"模型预测跌"只表示"卖出手中已有的
+# 仓位"，不表示融券做空；模拟结果不代表未来必然重演，不构成投资建议，盈亏自负。
+PAPER_LOT_SIZE = 100                  # A股最小交易单位：1手=100股，买入必须是整百股
+PAPER_COMMISSION_RATE = 0.00025       # 佣金费率(双边)：万2.5，主流互联网券商常见费率
+PAPER_COMMISSION_MIN = 5.0            # 单笔最低佣金(元)：多数券商规则，小额账户占比不可忽略
+PAPER_STAMP_DUTY_RATE = 0.0005        # 印花税：仅卖出收 0.05%(2023-08-28起新规，此前为0.1%)
+PAPER_SLIPPAGE_RATE = 0.001           # 滑点/冲击成本估算：买卖各0.1%，体现"收盘价成交"的理想化偏差
+
+PAPER_ACCOUNT_COLS = ["account_id", "cash", "initial_capital", "algo", "horizon", "pool_codes",
+                      "pool_top_n", "max_positions", "created_at", "next_check_date", "status", "note"]
+PAPER_POSITION_COLS = ["account_id", "code", "name", "shares", "buy_price", "buy_date"]
+PAPER_TRADE_COLS = ["account_id", "date", "code", "name", "action", "price", "shares", "amount",
+                    "fee", "cash_after", "pred_change_pct", "reason"]
+PAPER_EQUITY_COLS = ["account_id", "date", "cash", "market_value", "total_equity"]
+
+
+def _init_paper_db() -> None:
+    """建表(首次)。四张表：accounts(账户配置+现金)/positions(当前持仓)/trades(逐笔交易流水)/
+    equity_log(逐次运行的净值快照，用于画资金曲线)。"""
+    with sqlite3.connect(PAPER_DB) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
+            account_id TEXT PRIMARY KEY, cash REAL, initial_capital REAL, algo TEXT, horizon INTEGER,
+            pool_codes TEXT, pool_top_n INTEGER, max_positions INTEGER, created_at TEXT,
+            next_check_date TEXT, status TEXT, note TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS positions (
+            account_id TEXT, code TEXT, name TEXT, shares INTEGER, buy_price REAL, buy_date TEXT,
+            PRIMARY KEY (account_id, code))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, date TEXT, code TEXT, name TEXT,
+            action TEXT, price REAL, shares INTEGER, amount REAL, fee REAL, cash_after REAL,
+            pred_change_pct REAL, reason TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS equity_log (
+            account_id TEXT, date TEXT, cash REAL, market_value REAL, total_equity REAL,
+            PRIMARY KEY (account_id, date))""")
+        conn.commit()
+
+
+def list_paper_accounts() -> pd.DataFrame:
+    """列出全部模拟账户配置(不含逐笔交易，逐笔见 get_paper_trades)。"""
+    _init_paper_db()
+    with sqlite3.connect(PAPER_DB) as conn:
+        try:
+            return pd.read_sql_query("SELECT * FROM accounts", conn)
+        except Exception:
+            return pd.DataFrame(columns=PAPER_ACCOUNT_COLS)
+
+
+def create_paper_account(account_id: str, initial_capital: float = 10000.0, algo: str = "RF",
+                         horizon: int = 5, pool_codes: Optional[List[str]] = None,
+                         pool_top_n: int = 5, max_positions: int = 3) -> Dict[str, Any]:
+    """新建一个模拟账户(id 重复则报错，避免误覆盖已有历史)。初始现金=initial_capital(默认1万元)，
+    pool_codes 为候选股票池(用户指定，账户每个决策周期用 batch_factor_scan 对它打分取前 pool_top_n 只
+    作为"本轮可考虑买入"的范围)。max_positions 控制同时最多持有几只(小账户过度分散会导致每只都买不满一手)。"""
+    _init_paper_db()
+    if not pool_codes:
+        return {"error": "候选股票池不能为空(至少给1只股票代码，模拟账户只在这个池子里选股买卖)"}
+    existing = list_paper_accounts()
+    if len(existing) and account_id in set(existing["account_id"]):
+        return {"error": f"账户 '{account_id}' 已存在，换个名字或先删除旧账户(delete_paper_account)"}
+    row = {"account_id": account_id, "cash": float(initial_capital), "initial_capital": float(initial_capital),
+          "algo": algo, "horizon": int(horizon), "pool_codes": ",".join(pool_codes),
+          "pool_top_n": int(pool_top_n), "max_positions": int(max_positions),
+          "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+          "next_check_date": "", "status": "active", "note": ""}
+    with sqlite3.connect(PAPER_DB) as conn:
+        cols = ", ".join(f'"{c}"' for c in PAPER_ACCOUNT_COLS)
+        ph = ", ".join(["?"] * len(PAPER_ACCOUNT_COLS))
+        conn.execute(f"INSERT INTO accounts ({cols}) VALUES ({ph})",
+                    tuple(row[c] for c in PAPER_ACCOUNT_COLS))
+        conn.commit()
+    return {"ok": True, "account": row}
+
+
+def delete_paper_account(account_id: str) -> None:
+    """删除账户及其持仓/交易/净值记录(不可恢复，删前建议先看一眼 get_paper_trades 存档)。"""
+    _init_paper_db()
+    with sqlite3.connect(PAPER_DB) as conn:
+        for tbl in ("accounts", "positions", "trades", "equity_log"):
+            conn.execute(f"DELETE FROM {tbl} WHERE account_id=?", (account_id,))
+        conn.commit()
+
+
+def get_paper_positions(account_id: str) -> pd.DataFrame:
+    _init_paper_db()
+    with sqlite3.connect(PAPER_DB) as conn:
+        return pd.read_sql_query("SELECT * FROM positions WHERE account_id=?", conn, params=(account_id,))
+
+
+def get_paper_trades(account_id: str) -> pd.DataFrame:
+    _init_paper_db()
+    with sqlite3.connect(PAPER_DB) as conn:
+        return pd.read_sql_query("SELECT * FROM trades WHERE account_id=? ORDER BY id DESC",
+                                 conn, params=(account_id,))
+
+
+def get_paper_equity_curve(account_id: str) -> pd.DataFrame:
+    _init_paper_db()
+    with sqlite3.connect(PAPER_DB) as conn:
+        return pd.read_sql_query("SELECT * FROM equity_log WHERE account_id=? ORDER BY date",
+                                 conn, params=(account_id,))
+
+
+def _paper_lock_info(df: pd.DataFrame, code: str, is_st: bool = False) -> Dict[str, Any]:
+    """判断最新一根K线是否一字涨停/一字跌停/停牌，用于阻止"实际不可能成交"的买卖(与
+    backtest_directional 的 bar_info 同一套判定口径，只是这里只看最后一天)。"""
+    if len(df) < 2:
+        c = float(df["close"].iloc[-1])
+        return {"up_locked": False, "down_locked": False, "suspended": False, "close": c}
+    row = df.iloc[-1]
+    prev_close = float(df["close"].iloc[-2])
+    h, l, c = float(row["high"]), float(row["low"]), float(row["close"])
+    v = float(row.get("volume", 0) or 0)
+    limit = board_limit_pct(code, is_st)
+    ret = (c / prev_close - 1.0) if prev_close else 0.0
+    locked = (h - l) <= 1e-9
+    eps = 0.005
+    return {"up_locked": bool(locked and ret >= limit - eps),
+           "down_locked": bool(locked and ret <= -limit + eps),
+           "suspended": bool(v <= 0), "close": c}
+
+
+def _paper_fee(amount: float, side: str) -> float:
+    """按 A 股真实规则算一笔交易的费用：佣金(双边，最低5元) + 印花税(仅卖出0.05%)。"""
+    commission = max(PAPER_COMMISSION_MIN, amount * PAPER_COMMISSION_RATE)
+    stamp = amount * PAPER_STAMP_DUTY_RATE if side == "sell" else 0.0
+    return commission + stamp
+
+
+def run_paper_account(account_id: str, force: bool = False,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """推进一次模拟账户：①用当前最新真实行情给已持仓标记市值、记一条净值快照(每次运行都做，不受
+    决策周期限制，让资金曲线尽量密)；②只有到了"决策周期"(next_check_date 为空、或 ≤ 最新真实交易日，
+    或 force=True 强制立即检查)才真正跑模型信号决定买卖，跑完后把下一次决策日期推到
+    "最新交易日 + horizon 个交易日"之后。
+
+    诚实边界：这是【纸面模拟】——用当前最新可得的真实收盘价与真实模型预测做决策，不保证未来重演，
+    不构成投资建议、盈亏自负；账户小时常买不满一手是真实约束，如实标注，不允许零股/负现金。"""
+    log = progress_cb or (lambda m: None)
+    _init_paper_db()
+    accs = list_paper_accounts()
+    hit = accs[accs["account_id"] == account_id]
+    if len(hit) == 0:
+        return {"error": f"账户 '{account_id}' 不存在"}
+    acc = hit.iloc[0].to_dict()
+    if acc.get("status") != "active":
+        return {"error": f"账户 '{account_id}' 状态为 {acc.get('status')}，未运行"}
+    cash = float(acc["cash"]); algo = acc["algo"]; horizon = int(acc["horizon"])
+    pool_codes = [c for c in str(acc["pool_codes"]).split(",") if c.strip()]
+    pool_top_n = int(acc["pool_top_n"]); max_positions = int(acc["max_positions"])
+
+    positions = get_paper_positions(account_id)
+    trades_log: List[Dict[str, Any]] = []
+    messages: List[str] = []
+
+    # ---- 1) 给持仓+候选池拉最新行情(顺带得到 today 锚点：账户以"能拉到的最新一天真实收盘"为当前日) ----
+    held_codes0 = list(positions["code"]) if len(positions) else []
+    price_cache: Dict[str, pd.DataFrame] = {}
+    latest_date = None
+    for code in held_codes0 + [c for c in pool_codes if c not in set(held_codes0)]:
+        try:
+            df = StockDataFetcher().fetch(code, "20220101", dt.date.today().strftime("%Y%m%d"))
+            price_cache[code] = df
+            d = pd.to_datetime(df["date"].iloc[-1])
+            if latest_date is None or d > latest_date:
+                latest_date = d
+        except Exception as e:
+            log(f"[模拟账户] {code} 取行情失败：{e}")
+    if latest_date is None:
+        return {"error": "候选池/持仓全部取数失败，本次未能推进(网络或数据源异常，请稍后重试)"}
+    today_str = latest_date.strftime("%Y-%m-%d")
+
+    # ---- 2) 净值快照(无论是否到决策周期都记，让资金曲线更密) ----
+    mv = 0.0
+    for _, p in positions.iterrows():
+        df = price_cache.get(p["code"])
+        mv += (float(df["close"].iloc[-1]) if df is not None else float(p["buy_price"])) * int(p["shares"])
+    with sqlite3.connect(PAPER_DB) as conn:
+        conn.execute("INSERT OR REPLACE INTO equity_log (account_id,date,cash,market_value,total_equity) "
+                    "VALUES (?,?,?,?,?)", (account_id, today_str, cash, mv, cash + mv))
+        conn.commit()
+
+    due = force or (not acc["next_check_date"]) or (today_str >= str(acc["next_check_date"]))
+    if not due:
+        return {"date": today_str, "decided": False, "cash": round(cash, 2), "market_value": round(mv, 2),
+               "total_equity": round(cash + mv, 2),
+               "note": f"未到决策日(下次决策 {acc['next_check_date']})，本次仅刷新净值快照。"}
+
+    log(f"[模拟账户 {account_id}] {today_str} 到达决策周期，开始跑模型信号 ...")
+    cfg = TrainConfig(horizon=horizon, target_mode="return", hpo_method="关闭")
+
+    # ---- 3) 卖出检查：已持仓(必然是上个决策周期买的，天然满足T+1)逐只跑预测，预测跌就卖 ----
+    still_held = []
+    for _, p in positions.iterrows():
+        code, shares, name = p["code"], int(p["shares"]), p["name"]
+        df = price_cache.get(code)
+        if df is None or len(df) < cfg.window_size + 5:
+            still_held.append(p); messages.append(f"{code}{name} 本轮取不到有效行情，暂不处理，继续持有")
+            continue
+        try:
+            fc = TrainingPipeline(cfg).predict_next(algo, df)
+        except Exception as e:
+            still_held.append(p); messages.append(f"{code}{name} 预测失败({e})，继续持有")
+            continue
+        if fc["pred_change_pct"] >= 0:
+            still_held.append(p); continue           # 预测涨/持平：继续持有
+        is_st = "ST" in str(name).upper()
+        lock = _paper_lock_info(df, code, is_st)
+        if lock["suspended"]:
+            still_held.append(p); messages.append(f"{code}{name} 预测跌但今日停牌，卖不出，继续持有")
+            continue
+        if lock["down_locked"]:
+            still_held.append(p); messages.append(f"{code}{name} 预测跌但今日一字跌停，卖不出，继续持有")
+            continue
+        sell_price = lock["close"] * (1 - PAPER_SLIPPAGE_RATE)
+        amount = sell_price * shares
+        fee = _paper_fee(amount, "sell")
+        proceeds = amount - fee
+        cash += proceeds
+        trades_log.append({"account_id": account_id, "date": today_str, "code": code, "name": name,
+                          "action": "sell", "price": round(sell_price, 3), "shares": shares,
+                          "amount": round(amount, 2), "fee": round(fee, 2), "cash_after": round(cash, 2),
+                          "pred_change_pct": fc["pred_change_pct"],
+                          "reason": f"模型预测跌{fc['pred_change_pct']:.2f}%，卖出"})
+        messages.append(f"卖出 {code}{name} {shares}股 @{sell_price:.2f}，回笼{proceeds:.2f}元")
+    positions = pd.DataFrame(still_held) if still_held else pd.DataFrame(columns=PAPER_POSITION_COLS)
+
+    # ---- 4) 买入检查：候选池因子打分取前 pool_top_n，剔除已持有，逐只跑预测，预测涨的按均分预算买入 ----
+    held_codes = set(positions["code"]) if len(positions) else set()
+    slots_left = max_positions - len(held_codes)
+    buy_candidates = []
+    if slots_left > 0 and pool_codes:
+        try:
+            scored = batch_factor_scan(pool_codes, progress_cb=log)
+            top = [r for r in scored if not r.get("error")][:pool_top_n]
+        except Exception as e:
+            top = []; messages.append(f"候选池因子打分失败，本轮不买入：{e}")
+        for r in top:
+            code = r["code"]
+            if code in held_codes:
+                continue
+            df = price_cache.get(code)
+            if df is None:
+                continue
+            if len(df) < cfg.window_size + 5:
+                continue
+            try:
+                fc = TrainingPipeline(cfg).predict_next(algo, df)
+            except Exception:
+                continue
+            if fc["pred_change_pct"] > 0:
+                buy_candidates.append((code, r["name"], fc["pred_change_pct"], df))
+        buy_candidates.sort(key=lambda x: x[2], reverse=True)          # 模型更看涨的优先
+        buy_candidates = buy_candidates[:slots_left]
+
+    if buy_candidates:
+        budget_each = cash / len(buy_candidates)
+        for code, name, pred_chg, df in buy_candidates:
+            is_st = "ST" in str(name).upper()
+            lock = _paper_lock_info(df, code, is_st)
+            if lock["suspended"]:
+                messages.append(f"{code}{name} 预测涨但今日停牌，买不进"); continue
+            if lock["up_locked"]:
+                messages.append(f"{code}{name} 预测涨但今日一字涨停，买不进"); continue
+            buy_price = lock["close"] * (1 + PAPER_SLIPPAGE_RATE)
+            lot_cost = buy_price * PAPER_LOT_SIZE
+            n_lots = int(budget_each // lot_cost)
+            if n_lots < 1:
+                messages.append(f"{code}{name} 预测涨但预算{budget_each:.0f}元不够买1手(需{lot_cost:.0f}元)，跳过")
+                continue
+            shares = n_lots * PAPER_LOT_SIZE
+            amount = buy_price * shares
+            fee = _paper_fee(amount, "buy")
+            cost = amount + fee
+            if cost > cash:
+                continue
+            cash -= cost
+            trades_log.append({"account_id": account_id, "date": today_str, "code": code, "name": name,
+                              "action": "buy", "price": round(buy_price, 3), "shares": shares,
+                              "amount": round(amount, 2), "fee": round(fee, 2), "cash_after": round(cash, 2),
+                              "pred_change_pct": pred_chg,
+                              "reason": f"因子池Top{pool_top_n}入选 + 模型预测涨{pred_chg:.2f}%，买入"})
+            messages.append(f"买入 {code}{name} {shares}股 @{buy_price:.2f}，花费{cost:.2f}元")
+            new_pos = {"account_id": account_id, "code": code, "name": name, "shares": shares,
+                      "buy_price": buy_price, "buy_date": today_str}
+            positions = pd.concat([positions, pd.DataFrame([new_pos])], ignore_index=True)
+
+    # ---- 5) 落盘：现金/持仓/交易流水/下次决策日 ----
+    next_dates = next_trading_days(latest_date, horizon, progress_cb=log)
+    next_check = next_dates[-1].strftime("%Y-%m-%d") if next_dates else today_str
+    with sqlite3.connect(PAPER_DB) as conn:
+        conn.execute("UPDATE accounts SET cash=?, next_check_date=? WHERE account_id=?",
+                    (cash, next_check, account_id))
+        conn.execute("DELETE FROM positions WHERE account_id=?", (account_id,))
+        if len(positions):
+            cols = ", ".join(f'"{c}"' for c in PAPER_POSITION_COLS)
+            ph = ", ".join(["?"] * len(PAPER_POSITION_COLS))
+            conn.executemany(f"INSERT INTO positions ({cols}) VALUES ({ph})",
+                            [tuple(row[c] for c in PAPER_POSITION_COLS) for _, row in positions.iterrows()])
+        if trades_log:
+            cols = ", ".join(f'"{c}"' for c in PAPER_TRADE_COLS)
+            ph = ", ".join(["?"] * len(PAPER_TRADE_COLS))
+            conn.executemany(f"INSERT INTO trades ({cols}) VALUES ({ph})",
+                            [tuple(t[c] for c in PAPER_TRADE_COLS) for t in trades_log])
+        conn.commit()
+
+    mv_after = sum((float(price_cache[p["code"]]["close"].iloc[-1]) if p["code"] in price_cache
+                    else float(p["buy_price"])) * int(p["shares"]) for _, p in positions.iterrows())
+    return {"date": today_str, "decided": True, "n_sell": sum(1 for t in trades_log if t["action"] == "sell"),
+           "n_buy": sum(1 for t in trades_log if t["action"] == "buy"), "trades": trades_log,
+           "messages": messages, "cash": round(cash, 2), "market_value": round(mv_after, 2),
+           "total_equity": round(cash + mv_after, 2), "next_check_date": next_check,
+           "note": "纸面模拟(paper trading)，非实盘、非投资建议，盈亏自负；结果不保证未来重演。"}
+
+
+def paper_account_report(account_id: str) -> Dict[str, Any]:
+    """账户报告：总资产/收益率(相对initial_capital)，并与"等额买入持有沪深300"做诚实对比
+    (项目一贯的双基准原则——光看策略自己的收益没有意义，必须有参照物)。"""
+    accs = list_paper_accounts()
+    hit = accs[accs["account_id"] == account_id]
+    if len(hit) == 0:
+        return {"error": f"账户 '{account_id}' 不存在"}
+    acc = hit.iloc[0].to_dict()
+    eq = get_paper_equity_curve(account_id)
+    positions = get_paper_positions(account_id)
+    trades = get_paper_trades(account_id)
+    if len(eq) == 0:
+        return {"account": acc, "note": "尚未运行过 run_paper_account()，无净值记录"}
+    total_equity = float(eq["total_equity"].iloc[-1])
+    total_return_pct = (total_equity / float(acc["initial_capital"]) - 1.0) * 100
+    out = {"account_id": account_id, "algo": acc["algo"], "horizon": acc["horizon"],
+          "created_at": acc["created_at"], "initial_capital": float(acc["initial_capital"]),
+          "cash": float(eq["cash"].iloc[-1]), "market_value": float(eq["market_value"].iloc[-1]),
+          "total_equity": round(total_equity, 2), "total_return_pct": round(total_return_pct, 2),
+          "n_positions": len(positions), "n_trades": len(trades),
+          "equity_curve": eq[["date", "total_equity"]].to_dict("records")}
+    # 基准：沪深300 同期买入持有(项目一贯要求：任何策略收益都必须有参照物，光看自己涨了多少没有意义)
+    try:
+        idx = StockDataFetcher.fetch_index_close()
+        idx = idx.copy(); idx["date"] = pd.to_datetime(idx["date"])
+        start_d, end_d = pd.to_datetime(eq["date"].iloc[0]), pd.to_datetime(eq["date"].iloc[-1])
+        seg = idx[(idx["date"] >= start_d) & (idx["date"] <= end_d)]
+        if len(seg) >= 2:
+            bench_ret = float(seg["idx_px"].iloc[-1] / seg["idx_px"].iloc[0] - 1.0) * 100
+            out["bench_return_pct"] = round(bench_ret, 2)
+            out["excess_vs_bench_pct"] = round(total_return_pct - bench_ret, 2)
+    except Exception:
+        pass
+    out["disclaimer"] = "纸面模拟结果，非实盘、非投资建议、盈亏自负；历史/当下表现不保证未来重演。"
+    return out
 
 
 # ==================== 第八部分补充9：板块行情（概念板块/行业板块实时涨跌） ====================
@@ -5885,16 +6639,34 @@ if HAS_PYSIDE6:
         finished_signal = Signal(list)
         error_signal = Signal(str)
 
-        def __init__(self, codes, start, end):
+        def __init__(self, codes, start, end, weights=None):
             super().__init__()
             # 同上：避免 self.start 覆盖 QThread.start()
-            self.codes = codes; self.d_start = start; self.d_end = end
+            self.codes = codes; self.d_start = start; self.d_end = end; self.weights = weights or {}
 
         def run(self):
             try:
+                kw = {f"w_{k}": v for k, v in self.weights.items()}
                 rows = batch_factor_scan(self.codes, start=self.d_start, end=self.d_end,
-                                         progress_cb=lambda m: self.progress_signal.emit(m))
+                                         progress_cb=lambda m: self.progress_signal.emit(m), **kw)
                 self.finished_signal.emit(rows)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class FactorWeightOptimizeWorker(QThread):
+        """因子权重优化(岭回归)后台线程：逐只拉历史数据+构造因子序列较慢，避免卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, codes):
+            super().__init__()
+            self.codes = codes
+
+        def run(self):
+            try:
+                r = optimize_factor_weights(self.codes, progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
             except Exception as e:
                 self.error_signal.emit(str(e))
 
@@ -5916,6 +6688,24 @@ if HAS_PYSIDE6:
                                                  use_dragon_tiger=self.use_dragon_tiger,
                                                  progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(rows)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class PaperTradeWorker(QThread):
+        """模拟交易账户后台线程：拉最新行情 + 跑模型信号 + (到决策周期时)自动买卖，避免卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, account_id, force=False):
+            super().__init__()
+            self.account_id = account_id; self.force = force
+
+        def run(self):
+            try:
+                r = run_paper_account(self.account_id, force=self.force,
+                                      progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
             except Exception as e:
                 self.error_signal.emit(str(e))
 
@@ -6157,6 +6947,7 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
+            self.tabs.addTab(self._build_paper_trade_tab(), "模拟交易")
             self.tabs.addTab(self._build_board_tab(), "板块行情")
 
             # 按功能把散乱的标签页归并为「板块」二级导航：先选板块，再选板块内的具体页面
@@ -6165,7 +6956,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "批量扫描", "组合与仓位"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "组合与仓位"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -7677,6 +8468,17 @@ if HAS_PYSIDE6:
             self.reg_bt_table.setAlternatingRowColors(True)
             self.reg_bt_table.setMaximumHeight(180)
             bt_layout.addWidget(self.reg_bt_table)
+            dim_hint = QLabel("各维度单独有效性（哪种披露真的更管用——不要求同时满足其它维，两两独立对比）：")
+            dim_hint.setStyleSheet("color:#555;font-size:12px;")
+            bt_layout.addWidget(dim_hint)
+            self.reg_dim_table = QTableWidget(0, 6)
+            self.reg_dim_table.setHorizontalHeaderLabels(
+                ["维度", "触发n", "未触发n", "触发均收益%", "未触发均收益%", "结论"])
+            self.reg_dim_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.reg_dim_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.reg_dim_table.setAlternatingRowColors(True)
+            self.reg_dim_table.setMaximumHeight(140)
+            bt_layout.addWidget(self.reg_dim_table)
             layout.addWidget(bt_box)
             return panel
 
@@ -7733,6 +8535,18 @@ if HAS_PYSIDE6:
                 for j, v in enumerate([str(row["score"]), str(row["n"]), mean_s, win_s, concl]):
                     self.reg_bt_table.setItem(i, j, QTableWidgetItem(v))
             self.reg_bt_table.resizeColumnsToContents()
+            dim_rows = r.get("dim_rows", [])
+            self.reg_dim_table.setRowCount(len(dim_rows))
+            for i, row in enumerate(dim_rows):
+                if "note" in row:
+                    vals = [row["dim"], str(row["n_true"]), str(row["n_false"]), "-", "-", row["note"]]
+                else:
+                    concl = f"{row['verdict']}（{row['sig_true_vs_50pct']['text']}）"
+                    vals = [row["dim"], str(row["n_true"]), str(row["n_false"]),
+                           f"{row['mean_fwd_ret_true_pct']}", f"{row['mean_fwd_ret_false_pct']}", concl]
+                for j, v in enumerate(vals):
+                    self.reg_dim_table.setItem(i, j, QTableWidgetItem(v))
+            self.reg_dim_table.resizeColumnsToContents()
             self._oplog(f"监管披露观察·历史有效性验证完成：{r['n_stocks']}只，{r['total_days']}个样本日。")
 
         def _on_regulatory_run(self):
@@ -7791,6 +8605,230 @@ if HAS_PYSIDE6:
             self.reg_table.resizeColumnsToContents()
             self._oplog(f"监管披露观察扫描完成：{sum(1 for r in rows if not r.get('error'))} 只已完成。")
 
+        # ---- 9.2.1i2 模拟交易账户标签页 ----
+        def _build_paper_trade_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            intro = QLabel(
+                "💡 <b>模拟交易账户</b>（纸面模拟 paper trading，非实盘）：给定候选股票池，账户按"
+                "「因子打分选股Top N + 模型独立预测涨跌」自动决定买卖，贴合A股真实规则——"
+                "买入按<b>整百股</b>、<b>T+1</b>、<b>涨停买不进/跌停卖不出/停牌不可交易</b>、"
+                "佣金(万2.5,最低5元)+印花税(卖出0.05%)+滑点(各0.1%)。"
+                "每个「运行」按当前最新真实行情推进一次；只有到了模型预测周期(horizon个交易日)才真正调仓，"
+                "其余时候只刷新净值快照。<b>结果不构成投资建议，盈亏自负，历史/当下表现不保证未来重演。</b>"
+            )
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#f6f8fb;padding:6px;")
+            layout.addWidget(intro)
+
+            # --- 新建账户 ---
+            new_box = QGroupBox("新建模拟账户")
+            ng = QGridLayout(new_box)
+            ng.addWidget(QLabel("账户名:"), 0, 0)
+            self.pt_new_id = QLineEdit("默认账户")
+            ng.addWidget(self.pt_new_id, 0, 1)
+            ng.addWidget(QLabel("初始资金(元):"), 0, 2)
+            self.pt_new_capital = QDoubleSpinBox(); self.pt_new_capital.setRange(1000, 10_000_000)
+            self.pt_new_capital.setDecimals(0); self.pt_new_capital.setSingleStep(1000)
+            self.pt_new_capital.setValue(10000)
+            ng.addWidget(self.pt_new_capital, 0, 3)
+            ng.addWidget(QLabel("模型:"), 1, 0)
+            self.pt_new_algo = QComboBox()
+            self.pt_new_algo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
+            self.pt_new_algo.setCurrentText("RF")
+            ng.addWidget(self.pt_new_algo, 1, 1)
+            ng.addWidget(QLabel("调仓周期(交易日):"), 1, 2)
+            self.pt_new_horizon = QSpinBox(); self.pt_new_horizon.setRange(1, 60); self.pt_new_horizon.setValue(5)
+            ng.addWidget(self.pt_new_horizon, 1, 3)
+            ng.addWidget(QLabel("候选股票池(逗号分隔):"), 2, 0)
+            self.pt_new_pool = QLineEdit("600519,000858,601318,000001,600036,300750,002594,600030")
+            ng.addWidget(self.pt_new_pool, 2, 1, 1, 3)
+            ng.addWidget(QLabel("候选池取前N只打分:"), 3, 0)
+            self.pt_new_topn = QSpinBox(); self.pt_new_topn.setRange(1, 30); self.pt_new_topn.setValue(5)
+            ng.addWidget(self.pt_new_topn, 3, 1)
+            ng.addWidget(QLabel("最多同时持仓:"), 3, 2)
+            self.pt_new_maxpos = QSpinBox(); self.pt_new_maxpos.setRange(1, 10); self.pt_new_maxpos.setValue(3)
+            ng.addWidget(self.pt_new_maxpos, 3, 3)
+            self.pt_create_btn = QPushButton("➕ 创建账户")
+            self.pt_create_btn.setStyleSheet("font-weight:bold;padding:5px;")
+            self.pt_create_btn.clicked.connect(self._on_paper_create_account)
+            ng.addWidget(self.pt_create_btn, 4, 0, 1, 4)
+            layout.addWidget(new_box)
+
+            # --- 账户操作 ---
+            op_row = QHBoxLayout()
+            op_row.addWidget(QLabel("当前账户:"))
+            self.pt_account_combo = QComboBox()
+            self.pt_account_combo.currentTextChanged.connect(self._on_paper_account_changed)
+            op_row.addWidget(self.pt_account_combo, stretch=1)
+            self.pt_run_btn = QPushButton("▶ 运行(检查净值/到期调仓)")
+            self.pt_run_btn.setStyleSheet("font-weight:bold;padding:5px;background:#2c6fbb;color:white;")
+            self.pt_run_btn.clicked.connect(lambda: self._on_paper_run(force=False))
+            op_row.addWidget(self.pt_run_btn)
+            self.pt_force_btn = QPushButton("⏩ 强制立即调仓")
+            self.pt_force_btn.setToolTip("不等决策周期到，立即用最新行情跑一次买卖信号(仍遵守T+1/涨跌停/整百股规则)。")
+            self.pt_force_btn.clicked.connect(lambda: self._on_paper_run(force=True))
+            op_row.addWidget(self.pt_force_btn)
+            self.pt_del_btn = QPushButton("🗑 删除账户")
+            self.pt_del_btn.clicked.connect(self._on_paper_delete_account)
+            op_row.addWidget(self.pt_del_btn)
+            layout.addLayout(op_row)
+
+            self.pt_summary = QLabel("尚无账户，先在上方创建一个。")
+            self.pt_summary.setWordWrap(True)
+            self.pt_summary.setStyleSheet("padding:6px;background:#fdf3d0;")
+            layout.addWidget(self.pt_summary)
+
+            # --- 持仓 + 交易流水 ---
+            split = QHBoxLayout()
+            pos_box = QGroupBox("当前持仓")
+            pos_l = QVBoxLayout(pos_box)
+            self.pt_pos_table = QTableWidget(0, 5)
+            self.pt_pos_table.setHorizontalHeaderLabels(["代码", "名称", "股数", "买入价", "买入日"])
+            self.pt_pos_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.pt_pos_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            pos_l.addWidget(self.pt_pos_table)
+            split.addWidget(pos_box, stretch=1)
+
+            trade_box = QGroupBox("交易流水(最新在前)")
+            trade_l = QVBoxLayout(trade_box)
+            self.pt_trade_table = QTableWidget(0, 8)
+            self.pt_trade_table.setHorizontalHeaderLabels(
+                ["日期", "代码", "名称", "操作", "价格", "股数", "金额", "原因"])
+            self.pt_trade_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.pt_trade_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            trade_l.addWidget(self.pt_trade_table)
+            split.addWidget(trade_box, stretch=1)
+            layout.addLayout(split, stretch=1)
+
+            # --- 本轮运行消息 + 资金曲线 ---
+            self.pt_msg_view = QTextBrowser(); self.pt_msg_view.setMaximumHeight(120)
+            layout.addWidget(self.pt_msg_view)
+            self.pt_figure = Figure(figsize=(8, 3))
+            self.pt_canvas = FigureCanvas(self.pt_figure)
+            layout.addWidget(self.pt_canvas)
+
+            self._refresh_paper_account_combo()
+            return panel
+
+        def _refresh_paper_account_combo(self, select: Optional[str] = None):
+            accs = list_paper_accounts()
+            self.pt_account_combo.blockSignals(True)
+            self.pt_account_combo.clear()
+            self.pt_account_combo.addItems(list(accs["account_id"]) if len(accs) else [])
+            self.pt_account_combo.blockSignals(False)
+            if select and select in [self.pt_account_combo.itemText(i) for i in range(self.pt_account_combo.count())]:
+                self.pt_account_combo.setCurrentText(select)
+            self._on_paper_account_changed()
+
+        def _on_paper_create_account(self):
+            aid = self.pt_new_id.text().strip()
+            if not aid:
+                QMessageBox.warning(self, "提示", "请填账户名。"); return
+            raw = self.pt_new_pool.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            r = create_paper_account(aid, initial_capital=self.pt_new_capital.value(),
+                                     algo=self.pt_new_algo.currentText(), horizon=self.pt_new_horizon.value(),
+                                     pool_codes=codes, pool_top_n=self.pt_new_topn.value(),
+                                     max_positions=self.pt_new_maxpos.value())
+            if r.get("error"):
+                QMessageBox.warning(self, "创建失败", r["error"]); return
+            self._oplog(f"模拟账户「{aid}」已创建：初始资金{self.pt_new_capital.value():.0f}元，"
+                       f"模型{self.pt_new_algo.currentText()}，调仓周期{self.pt_new_horizon.value()}日，"
+                       f"候选池{len(codes)}只。")
+            self._refresh_paper_account_combo(select=aid)
+
+        def _on_paper_delete_account(self):
+            aid = self.pt_account_combo.currentText()
+            if not aid:
+                return
+            box = QMessageBox(self); box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("确认删除")
+            box.setText(f"确定删除模拟账户「{aid}」？其持仓/交易/净值历史将一并删除，不可恢复。")
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            if box.exec() == QMessageBox.Yes:
+                delete_paper_account(aid)
+                self._oplog(f"模拟账户「{aid}」已删除。")
+                self._refresh_paper_account_combo()
+
+        def _on_paper_run(self, force: bool = False):
+            aid = self.pt_account_combo.currentText()
+            if not aid:
+                QMessageBox.information(self, "提示", "请先创建一个模拟账户。"); return
+            self.pt_run_btn.setEnabled(False); self.pt_force_btn.setEnabled(False)
+            self.pt_msg_view.setPlainText("运行中(需拉最新行情+训练模型，请稍候)...")
+            self.pt_worker = PaperTradeWorker(aid, force=force)
+            self.pt_worker.progress_signal.connect(self._log)
+            self.pt_worker.finished_signal.connect(lambda r: self._on_paper_run_finished(aid, r))
+            self.pt_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "模拟交易出错", m),
+                                                            self._paper_reset_btn()))
+            self.pt_worker.start()
+
+        def _paper_reset_btn(self):
+            self.pt_run_btn.setEnabled(True); self.pt_force_btn.setEnabled(True)
+
+        def _on_paper_run_finished(self, account_id: str, r: dict):
+            self._paper_reset_btn()
+            if r.get("error"):
+                QMessageBox.warning(self, "运行失败", r["error"]); return
+            if r.get("decided"):
+                self._oplog(f"模拟账户「{account_id}」{r['date']} 调仓完成：卖出{r['n_sell']}笔/买入{r['n_buy']}笔，"
+                           f"现金{r['cash']:.2f}元，持仓市值{r['market_value']:.2f}元，总资产{r['total_equity']:.2f}元。")
+                self.pt_msg_view.setPlainText("\n".join(r.get("messages", [])) or "本轮无可执行的买卖信号。")
+            else:
+                self._oplog(f"模拟账户「{account_id}」{r['date']} 未到调仓日，仅刷新净值：{r.get('note','')}")
+                self.pt_msg_view.setPlainText(r.get("note", ""))
+            self._refresh_paper_display(account_id)
+
+        def _on_paper_account_changed(self):
+            aid = self.pt_account_combo.currentText()
+            if not aid:
+                self.pt_summary.setText("尚无账户，先在上方创建一个。")
+                self.pt_pos_table.setRowCount(0); self.pt_trade_table.setRowCount(0)
+                self.pt_figure.clear(); self.pt_canvas.draw()
+                return
+            self._refresh_paper_display(aid)
+
+        def _refresh_paper_display(self, account_id: str):
+            rep = paper_account_report(account_id)
+            if rep.get("total_equity") is None:
+                self.pt_summary.setText(f"账户「{account_id}」：{rep.get('note','尚未运行过，点「运行」推进第一次。')}")
+            else:
+                bench = (f" ｜ 同期沪深300买入持有 {rep['bench_return_pct']:+.2f}%，超额 {rep['excess_vs_bench_pct']:+.2f}%"
+                        if "bench_return_pct" in rep else "")
+                self.pt_summary.setText(
+                    f"账户「{account_id}」({rep['algo']}，调仓周期{rep['horizon']}日) ｜ 初始资金 {rep['initial_capital']:.0f}元 → "
+                    f"总资产 {rep['total_equity']:.2f}元（现金{rep['cash']:.2f} + 持仓市值{rep['market_value']:.2f}）｜ "
+                    f"收益率 {rep['total_return_pct']:+.2f}%{bench} ｜ 持仓{rep['n_positions']}只 / 累计交易{rep['n_trades']}笔 ｜ "
+                    f"{rep['disclaimer']}")
+            positions = get_paper_positions(account_id)
+            self.pt_pos_table.setRowCount(len(positions))
+            for i, (_, p) in enumerate(positions.iterrows()):
+                vals = [p["code"], p["name"], str(int(p["shares"])), f"{float(p['buy_price']):.2f}", p["buy_date"]]
+                for j, v in enumerate(vals):
+                    self.pt_pos_table.setItem(i, j, QTableWidgetItem(str(v)))
+            trades = get_paper_trades(account_id).head(50)
+            self.pt_trade_table.setRowCount(len(trades))
+            for i, (_, t) in enumerate(trades.iterrows()):
+                vals = [t["date"], t["code"], t["name"], "买入" if t["action"] == "buy" else "卖出",
+                       f"{float(t['price']):.2f}", str(int(t["shares"])), f"{float(t['amount']):.2f}", t["reason"]]
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(str(v))
+                    if j == 3:
+                        item.setForeground(QColor("#c0392b" if t["action"] == "buy" else "#1a9d5a"))
+                    self.pt_trade_table.setItem(i, j, item)
+            eq = get_paper_equity_curve(account_id)
+            self.pt_figure.clear()
+            ax = self.pt_figure.add_subplot(111)
+            if len(eq) >= 1:
+                dates = pd.to_datetime(eq["date"])
+                ax.plot(dates, eq["total_equity"], marker="o", label="总资产")
+                ax.axhline(float(list_paper_accounts().set_index("account_id").loc[account_id, "initial_capital"])
+                          if account_id in set(list_paper_accounts()["account_id"]) else eq["total_equity"].iloc[0],
+                          color="#999", linestyle="--", linewidth=1, label="初始资金")
+                ax.set_title(f"账户「{account_id}」资金曲线（纸面模拟，非投资建议）")
+                ax.set_ylabel("总资产(元)"); ax.legend(); self.pt_figure.autofmt_xdate()
+            self.pt_canvas.draw()
+
         # ---- 9.2.1j 批量扫描标签页 ----
         def _build_batch_tab(self) -> QWidget:
             panel = QWidget()
@@ -7816,6 +8854,25 @@ if HAS_PYSIDE6:
             self.batch_export_btn.clicked.connect(self._on_batch_export)
             top.addWidget(self.batch_export_btn)
             layout.addLayout(top)
+            # 因子权重(供「因子打分选股」使用)：默认等权，可手动调，也可用下方岭回归按钮从历史数据学价值/动量/低波动三项
+            wrow = QHBoxLayout()
+            wrow.addWidget(QLabel("因子权重:"))
+            self._factor_weight_spins: Dict[str, QDoubleSpinBox] = {}
+            for key, label in [("value", "价值"), ("momentum", "动量"), ("money", "资金"),
+                               ("quality", "质量"), ("lowvol", "低波动"), ("tech", "技术")]:
+                wrow.addWidget(QLabel(f"{label}:"))
+                sp_ = QDoubleSpinBox(); sp_.setRange(0.0, 5.0); sp_.setSingleStep(0.1); sp_.setValue(1.0)
+                sp_.setFixedWidth(60)
+                self._factor_weight_spins[key] = sp_
+                wrow.addWidget(sp_)
+            self.factor_optimize_btn = QPushButton("🧮 用历史回归优化权重(价值/动量/低波动)")
+            self.factor_optimize_btn.setToolTip(
+                "用岭回归(Ridge)从历史数据里学价值/动量/低波动三个因子该怎么加权，替代拍脑袋的等权——"
+                "资金/质量/技术面因子缺可回放的历史点位序列，权重仍需手动调，不参与本次优化。")
+            self.factor_optimize_btn.clicked.connect(self._on_optimize_factor_weights)
+            wrow.addWidget(self.factor_optimize_btn)
+            wrow.addStretch(1)
+            layout.addLayout(wrow)
             self.batch_hint = QLabel("研究筛查工具，非荐股：用风险列避开雷；预测/DA高不等于该买。逐只训练，股票多会慢。")
             self.batch_hint.setStyleSheet("color:#c0392b;")
             layout.addWidget(self.batch_hint)
@@ -7854,6 +8911,44 @@ if HAS_PYSIDE6:
             self.batch_run_btn.setEnabled(True); self.batch_run_btn.setText("▶ 预测扫描")
             self.factor_run_btn.setEnabled(True); self.factor_run_btn.setText("🏆 因子打分选股")
 
+        def _on_optimize_factor_weights(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "权重优化需真实历史数据，请把数据源切换为「真实数据」。"); return
+            raw = self.batch_codes.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if len(codes) < 1:
+                QMessageBox.warning(self, "提示", "请先填写股票代码。"); return
+            self.factor_optimize_btn.setEnabled(False); self.factor_optimize_btn.setText("优化中...")
+            self.batch_hint.setText("⏳ 正在用历史数据做岭回归优化因子权重(逐只拉取，较慢)... 进度见「运行日志」。")
+            self.fw_opt_worker = FactorWeightOptimizeWorker(codes)
+            self.fw_opt_worker.progress_signal.connect(self._log)
+            self.fw_opt_worker.finished_signal.connect(self._on_optimize_factor_weights_done)
+            self.fw_opt_worker.error_signal.connect(lambda m: (
+                QMessageBox.critical(self, "权重优化出错", m), self._fw_opt_reset_btn()))
+            self.fw_opt_worker.start()
+
+        def _fw_opt_reset_btn(self):
+            self.factor_optimize_btn.setEnabled(True)
+            self.factor_optimize_btn.setText("🧮 用历史回归优化权重(价值/动量/低波动)")
+
+        def _on_optimize_factor_weights_done(self, r: dict):
+            self._fw_opt_reset_btn()
+            if r.get("error"):
+                QMessageBox.warning(self, "无法优化", r["error"]); return
+            w = r["normalized_weights"]
+            self._factor_weight_spins["value"].setValue(w.get("value", 1.0))
+            self._factor_weight_spins["momentum"].setValue(w.get("momentum", 1.0))
+            self._factor_weight_spins["lowvol"].setValue(w.get("lowvol", 1.0))
+            self._oplog(f"因子权重优化完成：价值={w.get('value')} 动量={w.get('momentum')} "
+                       f"低波动={w.get('lowvol')}（回归系数 {r['raw_coef']}，样本内R²={r['r2']}，"
+                       f"n_obs={r['n_obs']}，{r['n_codes']}只股票）。")
+            QMessageBox.information(self, "因子权重优化完成",
+                f"已把「价值/动量/低波动」权重更新为岭回归学出的建议值：\n"
+                f"价值={w.get('value')}　动量={w.get('momentum')}　低波动={w.get('lowvol')}\n\n"
+                f"原始回归系数：{r['raw_coef']}\n样本内R²={r['r2']}（单期收益噪声大，R²低是正常现象）\n"
+                f"样本点数={r['n_obs']}，覆盖{r['n_codes']}只股票\n\n"
+                f"未参与优化(仍需手动设定)：{', '.join(r['not_optimized'])}\n\n{r['note']}")
+
         def _on_factor_run(self):
             if self.data_source_combo.currentIndex() == 1:
                 QMessageBox.information(self, "提示", "因子选股需真实数据，请把数据源切换为「真实数据」。"); return
@@ -7868,7 +8963,8 @@ if HAS_PYSIDE6:
             self._oplog(f"因子打分选股 {len(codes)} 只：{', '.join(codes)}")
             self.batch_hint.setText("⏳ 正在因子打分选股(逐只采集因子)... 进度见下方；也可切到「运行日志」看细节。")
             self._prog_open("⏳ 因子打分进行中：逐只采集因子并排名，请稍候 ……")
-            self.factor_worker = FactorWorker(codes, start, end)
+            weights = {k: sp_.value() for k, sp_ in self._factor_weight_spins.items()}
+            self.factor_worker = FactorWorker(codes, start, end, weights)
             self.factor_worker.progress_signal.connect(self._log)
             self.factor_worker.progress_signal.connect(self.batch_hint.setText)
             self.factor_worker.finished_signal.connect(self._on_factor_finished)
@@ -8246,9 +9342,11 @@ if HAS_PYSIDE6:
                 self._show_fig_dialog(fig, "宏观经济快照")
                 summ = "　｜　".join(f"{nm} {mac[nm]['latest']:.2f}" for nm in names)
                 self._oplog(f"宏观快照：{summ}")
+                explain = "\n\n".join(f"【{nm}】{MACRO_EXPLAIN[nm]}" for nm in names if nm in MACRO_EXPLAIN)
                 QMessageBox.information(self, "宏观经济快照",
                     summ + "\n\n⚠ 宏观数据低频且发布滞后2-4周，若直接喂日频模型=前视泄漏+信息冗余；"
-                    "故本模块只画趋势供你判断大环境(牛/熊/景气)，不参与任何预测训练。非投资建议。")
+                    "故本模块只画趋势供你判断大环境(牛/熊/景气)，不参与任何预测训练。非投资建议。"
+                    + ("\n\n—— 为什么要关注这些指标 ——\n" + explain if explain else ""))
             except Exception as e:
                 QMessageBox.critical(self, "宏观取数失败", str(e))
             finally:
@@ -9053,9 +10151,9 @@ if HAS_PYSIDE6:
             self.trk_calib_hint.setWordWrap(True)
             self.trk_calib_hint.setStyleSheet("color:#888;font-size:12px;")
             calib_layout.addWidget(self.trk_calib_hint)
-            self.trk_calib_table = QTableWidget(0, 5)
+            self.trk_calib_table = QTableWidget(0, 6)
             self.trk_calib_table.setHorizontalHeaderLabels(
-                ["声称概率区间", "样本量n", "平均声称概率%", "真实上涨占比%", "校准偏差(声称-真实)"])
+                ["声称概率区间", "样本量n", "平均声称概率%", "真实上涨占比%", "校准偏差(声称-真实)", "统计显著性(多重比较校验后)"])
             self.trk_calib_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             self.trk_calib_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self.trk_calib_table.setAlternatingRowColors(True)
@@ -9220,8 +10318,11 @@ if HAS_PYSIDE6:
                 self.trk_calib_table.setRowCount(len(rows))
                 for i, row in enumerate(rows):
                     diff = round(row["mean_stated_prob"] - row["realized_up_rate"], 1)
+                    bh_q = row.get("bh_q")
+                    sig_txt = (f"q={bh_q}，{'显著偏离' if row.get('sig_after_mc') else '不显著(可能是噪声)'}"
+                              if bh_q is not None else row["sig"]["text"])
                     vals = [row["bucket"], str(row["n"]), f"{row['mean_stated_prob']}",
-                            f"{row['realized_up_rate']}", f"{diff:+.1f}"]
+                            f"{row['realized_up_rate']}", f"{diff:+.1f}", sig_txt]
                     for j, v in enumerate(vals):
                         item = QTableWidgetItem(v)
                         if j == 4:
@@ -9229,6 +10330,8 @@ if HAS_PYSIDE6:
                                 item.setForeground(QColor("#1a9d5a"))
                             elif abs(diff) > 20:
                                 item.setForeground(QColor("#c0392b"))
+                        if j == 5:
+                            item.setForeground(QColor("#c0392b") if row.get("sig_after_mc") else QColor("#1a9d5a"))
                         self.trk_calib_table.setItem(i, j, item)
                 self.trk_calib_table.resizeColumnsToContents()
             else:
@@ -9449,6 +10552,8 @@ if HAS_PYSIDE6:
                              f" · 超大盘 {bt['excess_vs_bench_pct']}%")
                 if bt.get("information_ratio") is not None:
                     bench_txt += f" · 信息比率(IR) {bt['information_ratio']}"
+                if bt.get("beta") is not None:
+                    bench_txt += f" · Beta {bt['beta']} · Jensen's Alpha(年化) {bt['jensen_alpha_annual_pct']}%"
             # A 股制度真实化统计
             inst = (f" · 涨停买不进{bt['n_block_buy']}段/停牌{bt['n_suspend']}段/跌停卖不出{bt['n_stuck_sell']}段"
                     f"(涨跌停幅{bt['limit_pct']}%)")
@@ -10189,24 +11294,43 @@ if HAS_PYSIDE6:
             n_te = int(len(best.y_test_true)) if best.y_test_true is not None else 0
             sig = da_significance(da, n_te)        # 最佳 DA 是否统计显著>50%(而非运气/挑出来的)
             n_models = len(models)
-            # 判定：DA 要①明显高于"总是涨"基准(+3%且>52%) ②统计显著，才推荐；否则诚实劝退
+            # 多重比较校验：34个模型各自算一遍 p 值，再挑DA最高的那个报"显著"，等价于同时做 n_models 次
+            # 假设检验挑最小 p——单独看被挑中模型的 p<0.05 会虚高，需要 Bonferroni/BH(FDR) 重新判断。
+            pvals_all = []
+            for r in models:
+                r_da = r.metrics.get("DA")
+                r_n = int(len(r.y_test_true)) if r.y_test_true is not None else 0
+                pvals_all.append(da_significance(r_da, r_n)["p"])
+            mc = multiple_comparison_correct(pvals_all)
+            best_pos = models.index(best)
+            bonf_sig = (sig["p"] is not None and sig["p"] < mc["bonferroni_alpha"])
+            bh_q = mc["bh_qvals"][best_pos]
+            bh_sig = bh_q is not None and bh_q < 0.05
+            # 判定：DA 要①明显高于"总是涨"基准(+3%且>52%) ②单模型统计显著 ③多重比较校验(FDR)后仍显著，才推荐
             good = (up_rate is not None and da is not None and da >= up_rate + 3.0
-                    and da >= 52.0 and sig["sig"])
-            # 多重比较偏差：一次比了 n_models 个模型再挑最好的，最好那个的 DA 天然偏乐观
+                    and da >= 52.0 and sig["sig"] and (mc["n"] < 2 or bh_sig))
             mc_note = ""
-            if n_models >= 3:
-                mc_note = (f"<p style='color:#c0392b;font-size:13px'>⚠ <b>多重比较偏差提醒</b>："
-                           f"本次同时比了 {n_models} 个模型再挑出 DA 最高的——"
-                           f"「挑出来的最好」本身就偏乐观(像掷一堆骰子只报最大点)。"
+            if mc["n"] >= 2:
+                mc_note = (f"<p style='color:#c0392b;font-size:13px'>⚠ <b>多重比较校验</b>："
+                           f"本次对 {mc['n']} 个模型都算了显著性 p 值、挑出DA最高的一个——"
+                           f"单独看这一个的 p 值会虚高。Bonferroni 校验后需 p&lt;{mc['bonferroni_alpha']:.4f}"
+                           f"(当前 p={sig['p']}，{'通过' if bonf_sig else '未通过'})；"
+                           f"Benjamini-Hochberg(FDR) 校验后 q={bh_q}"
+                           f"({'通过' if bh_sig else '未通过'}，控制假发现率&lt;5%，比 Bonferroni 更常用)。"
                            f"务必用「预测跟踪」页做<b>样本外</b>验证，别只信这个回测数字。</p>")
             if good:
                 verdict = (f"<div style='background:#f2fbf2;border:2px solid #1e8449;padding:8px'>"
                            f"<b style='color:#1e8449'>🎯 建议用 {best.algo_name} 做本次预测</b>　"
                            f"（测试方向准确率 DA <b>{da}%</b>，明显高于「总是涨」基准 {up_rate}%、"
-                           f"且{sig['text']}；预测上涨时精确率 UP_P {up_p}%）。仍仅供参考，不构成投资建议。{mc_note}</div>")
+                           f"且{sig['text']}，多重比较校验(FDR)后仍显著；预测上涨时精确率 UP_P {up_p}%）。"
+                           f"仍仅供参考，不构成投资建议。{mc_note}</div>")
             else:
+                corr_note = ""
+                if sig.get("sig") and mc["n"] >= 2 and not bh_sig:
+                    corr_note = (f"——原始 p={sig['p']} 单独看显著，但对 {mc['n']} 个模型做"
+                                 f"多重比较校验(FDR)后 q={bh_q} 不再显著，这正是「矮子里选将军」式虚高的例子")
                 why_bad = (f"最高的 {best.algo_name} DA={da}%" +
-                           (f"，虽高于基准但{sig['text']}" if (up_rate and da and da >= up_rate + 3)
+                           (f"，虽高于基准但{sig['text']}{corr_note}" if (up_rate and da and da >= up_rate + 3)
                             else f"，未明显超基准 {up_rate}%"))
                 verdict = (f"<div style='background:#fff4f4;border:2px solid #c0392b;padding:8px'>"
                            f"<b style='color:#c0392b'>⚠️ 本次没有模型可靠地优于「总是涨」基准</b>"
