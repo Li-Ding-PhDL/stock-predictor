@@ -187,7 +187,7 @@ try:
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
         QFileDialog, QDialog, QProgressDialog, QSpinBox, QDoubleSpinBox, QHeaderView, QFrame,
-        QToolButton
+        QToolButton, QListWidget, QListWidgetItem, QInputDialog
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer, QEvent, QObject
     from PySide6.QtGui import QFont, QColor
@@ -215,6 +215,9 @@ PRED_DB  = os.path.join(PRED_DIR, "pred_log.db")      # SQLite 数据库：结�
 PAPER_DIR = os.path.join(BASE_DIR, "paper_trading")   # 模拟交易账户：持久化本地状态(现金/持仓/流水)，不入库
 os.makedirs(PAPER_DIR, exist_ok=True)
 PAPER_DB = os.path.join(PAPER_DIR, "paper_trading.db")
+WATCHLIST_DIR = os.path.join(BASE_DIR, "watchlist")   # 自选股票：分组+成分股，持久化到 SQLite
+os.makedirs(WATCHLIST_DIR, exist_ok=True)
+WATCHLIST_DB = os.path.join(WATCHLIST_DIR, "watchlist.db")
 
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
@@ -4048,6 +4051,203 @@ def batch_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
     return rows
 
 
+# ---------- 8.5.1 自选股票：分组批量预测(与 batch_scan 唯一区别是把 use_us/use_northbound 也真正传给 enrich，
+#            不像 batch_scan/BatchWorker 那样把这两个开关悄悄丢掉——见 watchlist_group_scan 函数注释) ----------
+def watchlist_group_scan(codes: List[str], algo: str = "Lasso", start: str = "20200101",
+                         end: Optional[str] = None, target_mode: str = "return", horizon: int = 5,
+                         flags5: Tuple[bool, bool, bool, bool, bool] = (True, True, True, True, True),
+                         progress_cb: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
+    """自选分组的批量预测引擎。逻辑与 batch_scan 完全一致(取真实数据→训练→测试DA→向前预测→风险筛查)，
+    唯一区别：batch_scan 调用 enrich() 时只传了 use_valuation/use_index/use_fundflow 三个位置参数，
+    导致 enrich() 的 want_us/want_northbound 一直落在默认值 True，GUI 上"美股"/"北向资金"两个勾选框
+    对批量扫描完全不生效(想关关不掉)。这里把 5 个真实开关原样传下去，做到"界面上关了什么，真的就不接入
+    什么"——不改 batch_scan/BatchWorker 本身，避免连带影响已上线的「批量扫描」页。
+    返回每只一行的字典列表，列结构与 batch_scan 相同(code/name/last_close/pred_close/pred_change_pct/
+    DA/UP_P/risk_n/risk_top/error)，可直接复用批量扫描页现成的结果表渲染代码。"""
+    log = progress_cb or (lambda m: None)
+    end = end or dt.date.today().strftime("%Y%m%d")
+    use_valuation, use_index, use_fundflow, use_us, use_northbound = flags5
+    rows = []
+    for i, code in enumerate(codes, 1):
+        code = code.strip()
+        if not code:
+            continue
+        log(f"[自选 {i}/{len(codes)}] {code} 取数+训练+预测 ...")
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            if use_valuation or use_index or use_fundflow or use_us or use_northbound:
+                df, _ = StockDataFetcher.enrich(df, code, use_valuation, use_index, use_fundflow,
+                                                use_us, use_northbound)
+            name = StockDataFetcher.fetch_stock_name(code)
+            cfg = TrainConfig(horizon=horizon, target_mode=target_mode, hpo_method="关闭",
+                              metrics=["RMSE", "DA", "UP_P"])
+            pipe = TrainingPipeline(cfg)
+            res = pipe.run_batch([algo], df)
+            mr = next((r for r in res if r.algo_name == algo and not r.error), None)
+            da = mr.metrics.get("DA") if mr else None
+            up_p = mr.metrics.get("UP_P") if mr else None
+            fc = pipe.predict_next(algo, df)
+            warns = assess_risks(code, name, df, news=None, check_report=True)
+            hi_risk = [w for w in warns if w["level"] == "高"]
+            rows.append({
+                "code": code, "name": name, "last_close": fc["last_close"],
+                "pred_close": fc["pred_close"], "pred_change_pct": fc["pred_change_pct"],
+                "DA": da, "UP_P": up_p, "risk_n": len(warns),
+                "risk_top": (hi_risk[0]["category"] if hi_risk else (warns[0]["category"] if warns else "")),
+                "error": None,
+            })
+        except Exception as e:
+            rows.append({"code": code, "name": "", "error": str(e)})
+    return rows
+
+
+def get_stock_feature_preview(code: str, start: str = "20200101", end: Optional[str] = None,
+                              window_size: int = 20, horizon: int = 5, target_mode: str = "return",
+                              use_valuation: bool = True, use_index: bool = True, use_fundflow: bool = True,
+                              use_us: bool = True, use_northbound: bool = True,
+                              n_rows: int = 20) -> Dict[str, Any]:
+    """自选股票"训练数据集预览"：给出该股票模型**真正吃进去**的特征列和数值，不是随机占位数。
+
+    只复用已有的 fetch/enrich/add_technical_indicators(跟 predict_next 用的是完全相同的三行清洗逻辑，
+    line 3354-3356 同款)，不触碰 TrainingPipeline/build_supervised_samples/predict_next 本身——避免
+    改动核心训练代码影响已有功能。当 n_rows>=window_size 时，返回的最后 window_size 行数值与
+    predict_next 真正喂给模型的那一个窗口逐行相同(同函数、同清洗步骤、同列推导规则)。
+
+    返回字典额外带 real_fwd_return_pct 一列：用**已经发生的**未来 horizon 天真实收盘价算出的前瞻收益，
+    是"历史上真实发生了什么"，不是模型预测——最近 horizon 行这个结果还没发生，明确留空，绝不瞎猜。
+    """
+    try:
+        end = end or dt.date.today().strftime("%Y%m%d")
+        df = StockDataFetcher().fetch(code, start, end)
+        name = StockDataFetcher.fetch_stock_name(code)
+        enrich_status: Dict[str, str] = {}
+        if use_valuation or use_index or use_fundflow or use_us or use_northbound:
+            df, enrich_status = StockDataFetcher.enrich(df, code, use_valuation, use_index, use_fundflow,
+                                                         use_us, use_northbound)
+        fe = FeatureEngineer(window_size=window_size, horizon=horizon, target_mode=target_mode)
+        df_ind = fe.add_technical_indicators(df)
+        # 与 predict_next(line 3354-3356)完全一致的三行清洗，保证这里看到的列/行跟真正预测时一致
+        df_ind = df_ind.replace([np.inf, -np.inf], np.nan)
+        df_ind = df_ind.dropna(axis=1, how="all").dropna().reset_index(drop=True)
+        if len(df_ind) == 0:
+            return {"code": code, "name": name, "error": "清洗后没有有效历史行(数据太短或大量缺失)"}
+        feature_cols = [c for c in df_ind.columns if c != "date"]   # 与 build_supervised_samples 默认推导一致
+        close = df_ind["close"].values
+        n = len(df_ind)
+        fwd_pct = [None] * n
+        for i in range(n - horizon):
+            fwd_pct[i] = round(float((close[i + horizon] / close[i] - 1.0) * 100.0), 3)
+        tail_n = min(n_rows, n)
+        preview_cols = ["date"] + feature_cols
+        preview_df = df_ind[preview_cols].tail(tail_n).copy().reset_index(drop=True)
+        preview_df["real_fwd_return_pct"] = fwd_pct[-tail_n:]
+        return {
+            "code": code, "name": name, "feature_cols": feature_cols,
+            "window_size": window_size, "n_total_rows": n, "enrich_status": enrich_status,
+            "preview_df": preview_df, "error": None,
+        }
+    except Exception as e:
+        return {"code": code, "name": "", "error": str(e)}
+
+
+# ---------- 8.5.2 自选股票：分组+成分股持久化(SQLite，写法对齐模拟交易账户 _init_paper_db 那一套) ----------
+def _init_watchlist_db() -> None:
+    """建表(首次)。两张表：wl_groups(分组)/wl_stocks(分组内的股票，group_id 外键关系靠约定不靠数据库约束)。"""
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS wl_groups (
+            group_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT, sort_order INTEGER DEFAULT 0)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS wl_stocks (
+            group_id TEXT, code TEXT, name TEXT DEFAULT '', added_at TEXT,
+            PRIMARY KEY (group_id, code))""")
+        conn.commit()
+
+
+def list_watchlist_groups() -> pd.DataFrame:
+    """列出全部自选分组，按创建顺序。"""
+    _init_watchlist_db()
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        try:
+            return pd.read_sql_query("SELECT * FROM wl_groups ORDER BY sort_order, created_at", conn)
+        except Exception:
+            return pd.DataFrame(columns=["group_id", "name", "created_at", "sort_order"])
+
+
+def create_watchlist_group(name: str) -> Dict[str, Any]:
+    """新建一个自选分组。group_id 用时间戳生成、与 name 脱钩，这样改名(rename_watchlist_group)不会
+    弄丢分组内已有股票(wl_stocks 按 group_id 关联，不按 name)。"""
+    _init_watchlist_db()
+    name = (name or "").strip()
+    if not name:
+        return {"error": "分组名称不能为空"}
+    existing = list_watchlist_groups()
+    if len(existing) and name in set(existing["name"]):
+        return {"error": f"分组「{name}」已存在，换个名字"}
+    group_id = dt.datetime.now().strftime("g%Y%m%d%H%M%S%f")
+    sort_order = int(existing["sort_order"].max()) + 1 if len(existing) else 0
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("INSERT INTO wl_groups (group_id, name, created_at, sort_order) VALUES (?,?,?,?)",
+                    (group_id, name, dt.datetime.now().strftime("%Y-%m-%d %H:%M"), sort_order))
+        conn.commit()
+    return {"ok": True, "group_id": group_id, "name": name}
+
+
+def rename_watchlist_group(group_id: str, new_name: str) -> Dict[str, Any]:
+    _init_watchlist_db()
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return {"error": "分组名称不能为空"}
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("UPDATE wl_groups SET name=? WHERE group_id=?", (new_name, group_id))
+        conn.commit()
+    return {"ok": True}
+
+
+def delete_watchlist_group(group_id: str) -> None:
+    """删除分组及其全部成分股(不可恢复)。"""
+    _init_watchlist_db()
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("DELETE FROM wl_stocks WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM wl_groups WHERE group_id=?", (group_id,))
+        conn.commit()
+
+
+def add_stock_to_group(group_id: str, code: str, name: str = "") -> Dict[str, Any]:
+    """加一只股票进分组。不传 name 时用 fetch_stock_name 解析真实名称，不留占位符/空名。"""
+    _init_watchlist_db()
+    code = (code or "").strip()
+    if not code:
+        return {"error": "股票代码不能为空"}
+    if not name:
+        try:
+            name = StockDataFetcher.fetch_stock_name(code)
+        except Exception:
+            name = ""
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("INSERT OR IGNORE INTO wl_stocks (group_id, code, name, added_at) VALUES (?,?,?,?)",
+                    (group_id, code, name, dt.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        conn.commit()
+    return {"ok": True, "code": code, "name": name}
+
+
+def remove_stock_from_group(group_id: str, code: str) -> None:
+    _init_watchlist_db()
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        conn.execute("DELETE FROM wl_stocks WHERE group_id=? AND code=?", (group_id, code))
+        conn.commit()
+
+
+def get_group_stocks(group_id: str) -> pd.DataFrame:
+    _init_watchlist_db()
+    with sqlite3.connect(WATCHLIST_DB) as conn:
+        return pd.read_sql_query("SELECT * FROM wl_stocks WHERE group_id=? ORDER BY added_at",
+                                 conn, params=(group_id,))
+
+
+def copy_stock_to_group(code: str, name: str, to_group_id: str) -> Dict[str, Any]:
+    """"＋收藏"：把一只股票复制进另一个分组(原分组保留，不是移动)。"""
+    return add_stock_to_group(to_group_id, code, name)
+
+
 def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
                       w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
                       w_quality: float = 1.0, w_lowvol: float = 1.0, w_tech: float = 1.0,
@@ -6633,6 +6833,64 @@ if HAS_PYSIDE6:
             except Exception as e:
                 self.error_signal.emit(str(e))
 
+    class GroupBatchWorker(QThread):
+        """自选分组批量预测后台线程：对分组内全部股票 取数(5个真实开关全部生效)→训练→预测→风险。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(list)          # List[dict]
+        error_signal = Signal(str)
+
+        def __init__(self, codes, algo, start, end, target_mode, horizon, flags5):
+            super().__init__()
+            self.codes = codes; self.algo = algo; self.d_start = start; self.d_end = end
+            self.target_mode = target_mode; self.horizon = horizon; self.flags5 = flags5
+
+        def run(self):
+            try:
+                rows = watchlist_group_scan(self.codes, algo=self.algo, start=self.d_start, end=self.d_end,
+                                            target_mode=self.target_mode, horizon=self.horizon,
+                                            flags5=self.flags5,
+                                            progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(rows)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class FeaturePreviewWorker(QThread):
+        """点自选结果行 → 后台重新取数+算真实特征，避免每次点击卡界面(要重新拉一次该股票的行情/外部数据)。"""
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, code, start, end, window_size, horizon, target_mode, flags5, n_rows=20):
+            super().__init__()
+            self.code = code; self.d_start = start; self.d_end = end
+            self.window_size = window_size; self.horizon = horizon; self.target_mode = target_mode
+            self.flags5 = flags5; self.n_rows = n_rows
+
+        def run(self):
+            try:
+                r = get_stock_feature_preview(self.code, self.d_start, self.d_end,
+                                              self.window_size, self.horizon, self.target_mode,
+                                              *self.flags5, n_rows=self.n_rows)
+                self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class WatchlistImportWorker(QThread):
+        """自选批量导入后台线程：一次粘贴多个代码时，逐个解析真实股票名称+写库，避免卡界面
+        (fetch_stock_name 是网络调用，代码多了在主线程跑会明显卡顿)。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(list)
+
+        def __init__(self, group_id, codes):
+            super().__init__()
+            self.group_id = group_id; self.codes = codes
+
+        def run(self):
+            results = []
+            for i, code in enumerate(self.codes, 1):
+                self.progress_signal.emit(f"[自选导入 {i}/{len(self.codes)}] {code} ...")
+                results.append(add_stock_to_group(self.group_id, code))
+            self.finished_signal.emit(results)
+
     class FactorWorker(QThread):
         """批量因子打分选股后台线程。"""
         progress_signal = Signal(str)
@@ -6776,8 +7034,12 @@ if HAS_PYSIDE6:
             screen = QApplication.primaryScreen()
             avail = screen.availableGeometry() if screen else None
             if avail is not None:
-                w = min(1500, max(1000, int(avail.width() * 0.82)))
-                h = min(950, max(680, int(avail.height() * 0.82)))
+                # 窗口取屏幕可用区域的一半左右(四周留出明显边距)，
+                # 保证任何分辨率下窗口都不会顶到屏幕边缘；同时留一个可用性下限，避免控件挤在一起。
+                w = min(1100, max(700, int(avail.width() * 0.5)))
+                h = min(780, max(560, int(avail.height() * 0.5)))
+                w = min(w, avail.width() - 48)
+                h = min(h, avail.height() - 48)
                 self.resize(w, h)
                 self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
             else:
@@ -6944,6 +7206,8 @@ if HAS_PYSIDE6:
 
             # 批量扫描：多股批量 取数→训练→预测→风险
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
+            # 自选股票：持久保存关注的分组股票，一键批量预测+看每只的真实特征数据集
+            self.tabs.addTab(self._build_watchlist_tab(), "自选股票")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
@@ -6956,7 +7220,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "组合与仓位"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "组合与仓位"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -6974,7 +7238,15 @@ if HAS_PYSIDE6:
             right_layout = QVBoxLayout(right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.addWidget(nav)
-            right_layout.addWidget(self.tabs, stretch=1)
+            # 用 QScrollArea 包住标签页区域(跟左侧配置区 line 7141 同一招)：Qt 的 QTabWidget 默认按
+            # "全部标签页里最宽/最高的那一个"算自己的最小尺寸，哪怕当前只显示其中一个标签页——
+            # 某个标签页内容一多(尤其在系统显示缩放125%/150%下，控件整体被放大)，就会把整个主窗口
+            # 撑得比屏幕还大、还缩不小。包一层可滚动区域后，最小尺寸不再传导到主窗口，
+            # 真正需要更多空间的那一个标签页自己出滚动条，不连累窗口本身。
+            tabs_scroll = QScrollArea()
+            tabs_scroll.setWidgetResizable(True)
+            tabs_scroll.setWidget(self.tabs)
+            right_layout.addWidget(tabs_scroll, stretch=1)
             main_layout.addWidget(right_panel, stretch=1)
 
             self._on_category_clicked(self._tab_categories[0][0])   # 默认展开第一个板块
@@ -9046,6 +9318,354 @@ if HAS_PYSIDE6:
                 QMessageBox.information(self, "导出成功", f"已导出：\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", str(e))
+
+        # ---- 9.2.1g2 自选股票标签页：持久分组 + 批量真实预测 + 点行看真实特征数据集 ----
+        def _build_watchlist_tab(self) -> QWidget:
+            panel = QWidget()
+            outer = QHBoxLayout(panel)
+
+            left = QVBoxLayout()
+            left.addWidget(QLabel("自选分组"))
+            self.wl_group_list = QListWidget()
+            self.wl_group_list.itemSelectionChanged.connect(self._on_wl_group_selected)
+            left.addWidget(self.wl_group_list, stretch=1)
+            grow = QHBoxLayout()
+            btn_new = QPushButton("＋新建"); btn_new.clicked.connect(self._on_wl_new_group)
+            btn_ren = QPushButton("✎ 改名"); btn_ren.clicked.connect(self._on_wl_rename_group)
+            btn_del = QPushButton("🗑 删除"); btn_del.clicked.connect(self._on_wl_delete_group)
+            for b in (btn_new, btn_ren, btn_del):
+                grow.addWidget(b)
+            left.addLayout(grow)
+            left_w = QWidget(); left_w.setLayout(left); left_w.setMaximumWidth(220)
+            outer.addWidget(left_w)
+
+            right = QVBoxLayout()
+            add_row = QHBoxLayout()
+            add_row.addWidget(QLabel("代码:"))
+            self.wl_add_code_edit = QLineEdit()
+            self.wl_add_code_edit.setPlaceholderText("支持逗号/换行分隔一次导入多只，如 600519,000001,300750")
+            add_row.addWidget(self.wl_add_code_edit, stretch=1)
+            self.wl_add_stock_btn = QPushButton("＋添加(支持批量导入)")
+            self.wl_add_stock_btn.clicked.connect(self._on_wl_add_stock)
+            add_row.addWidget(self.wl_add_stock_btn)
+            btn_rm_stock = QPushButton("－移除选中")
+            btn_rm_stock.clicked.connect(self._on_wl_remove_stock)
+            add_row.addWidget(btn_rm_stock)
+            add_row.addStretch(1)
+            right.addLayout(add_row)
+
+            self.wl_stock_list = QListWidget()
+            self.wl_stock_list.setMaximumHeight(90)
+            right.addWidget(self.wl_stock_list)
+
+            run_row = QHBoxLayout()
+            run_row.addWidget(QLabel("模型:"))
+            self.wl_algo_combo = QComboBox()
+            self.wl_algo_combo.addItems([n for n in ALGO_REGISTRY if ALGO_AVAILABILITY.get(n, True)])
+            self.wl_algo_combo.setCurrentText("Lasso")
+            run_row.addWidget(self.wl_algo_combo)
+            self.wl_run_btn = QPushButton("▶ 批量运行该分组")
+            self.wl_run_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2c6fbb; color:white;")
+            self.wl_run_btn.clicked.connect(self._on_wl_run)
+            run_row.addWidget(self.wl_run_btn)
+            run_row.addStretch(1)
+            right.addLayout(run_row)
+
+            self.wl_hint = QLabel("研究筛查工具，非荐股。跟「批量扫描」同一套真实取数+训练+预测引擎，"
+                                  "「财报估值/大盘/资金/美股/北向」开关跟下方主运行面板共用——这里关掉的，"
+                                  "真的不会接进模型。")
+            self.wl_hint.setStyleSheet("color:#c0392b;"); self.wl_hint.setWordWrap(True)
+            right.addWidget(self.wl_hint)
+
+            self.wl_split = QSplitter(Qt.Vertical)
+            self.wl_results_table = QTableWidget()
+            self.wl_results_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.wl_results_table.itemSelectionChanged.connect(self._on_wl_result_selected)
+            self.wl_split.addWidget(self.wl_results_table)
+
+            bottom = QWidget(); bl = QVBoxLayout(bottom); bl.setContentsMargins(0, 0, 0, 0)
+            fav_row = QHBoxLayout()
+            fav_row.addWidget(QLabel("把选中结果收藏到:"))
+            self.wl_fav_target_combo = QComboBox()
+            fav_row.addWidget(self.wl_fav_target_combo)
+            btn_fav = QPushButton("＋收藏(复制一份，原分组保留)")
+            btn_fav.clicked.connect(self._on_wl_favorite_to_group)
+            fav_row.addWidget(btn_fav)
+            fav_row.addStretch(1)
+            bl.addLayout(fav_row)
+            self.wl_feature_hint = QLabel("点上方一行结果，这里会显示该股票真正喂给模型的特征数据(真实计算，非模拟)。")
+            self.wl_feature_hint.setStyleSheet("color:#666;"); self.wl_feature_hint.setWordWrap(True)
+            bl.addWidget(self.wl_feature_hint)
+            self.wl_feature_table = QTableWidget()
+            bl.addWidget(self.wl_feature_table, stretch=1)
+            self.wl_split.addWidget(bottom)
+            self.wl_split.setStretchFactor(0, 1); self.wl_split.setStretchFactor(1, 1)
+            right.addWidget(self.wl_split, stretch=1)
+
+            outer.addLayout(right, stretch=1)
+
+            self._wl_current_group_id: Optional[str] = None
+            self._wl_last_rows: List[Dict[str, Any]] = []
+            self._wl_preview_worker = None
+            self._refresh_wl_group_list()
+            return panel
+
+        def _refresh_wl_group_list(self):
+            """重建左侧分组列表(名称+数量)，尽量保留当前选中的分组；不清空结果表/预览表——
+            那两个只在用户真正切换分组(_on_wl_group_selected)或重新跑批量时才应该变化。"""
+            df = list_watchlist_groups()
+            keep_id = self._wl_current_group_id
+            self.wl_group_list.blockSignals(True)
+            self.wl_group_list.clear()
+            found = False
+            for _, row in df.iterrows():
+                n_stocks = len(get_group_stocks(row["group_id"]))
+                it = QListWidgetItem(f"{row['name']} ({n_stocks})")
+                it.setData(Qt.UserRole, row["group_id"])
+                self.wl_group_list.addItem(it)
+                if row["group_id"] == keep_id:
+                    self.wl_group_list.setCurrentItem(it); found = True
+            if not found and self.wl_group_list.count() > 0:
+                self.wl_group_list.setCurrentRow(0)
+                keep_id = self.wl_group_list.item(0).data(Qt.UserRole)
+            self.wl_group_list.blockSignals(False)
+            self._wl_current_group_id = keep_id if self.wl_group_list.count() > 0 else None
+            self._refresh_wl_stock_list()
+
+        def _refresh_wl_stock_list(self):
+            """只刷新当前分组的成分股列表和收藏目标下拉，不动结果表/预览表。"""
+            self.wl_stock_list.clear()
+            self.wl_fav_target_combo.clear()
+            gid = self._wl_current_group_id
+            if gid is None:
+                return
+            for _, row in get_group_stocks(gid).iterrows():
+                it = QListWidgetItem(f"{row['code']}  {row['name']}")
+                it.setData(Qt.UserRole, row["code"])
+                self.wl_stock_list.addItem(it)
+            for _, g in list_watchlist_groups().iterrows():
+                if g["group_id"] != gid:
+                    self.wl_fav_target_combo.addItem(g["name"], g["group_id"])
+
+        def _on_wl_group_selected(self):
+            """用户在侧边栏真正点了另一个分组：切换当前分组，清空上一个分组遗留的结果/预览(避免张冠李戴)。"""
+            it = self.wl_group_list.currentItem()
+            self._wl_current_group_id = it.data(Qt.UserRole) if it else None
+            self._refresh_wl_stock_list()
+            self.wl_results_table.setRowCount(0); self.wl_results_table.setColumnCount(0)
+            self.wl_feature_table.setRowCount(0); self.wl_feature_table.setColumnCount(0)
+            self._wl_last_rows = []
+
+        def _on_wl_new_group(self):
+            name, ok = QInputDialog.getText(self, "新建自选分组", "分组名称：")
+            if not ok or not name.strip():
+                return
+            r = create_watchlist_group(name.strip())
+            if r.get("error"):
+                QMessageBox.warning(self, "新建失败", r["error"]); return
+            self._wl_current_group_id = r["group_id"]
+            self._refresh_wl_group_list()
+
+        def _on_wl_rename_group(self):
+            gid = self._wl_current_group_id
+            if not gid:
+                QMessageBox.information(self, "提示", "先选一个分组。"); return
+            cur_item = self.wl_group_list.currentItem()
+            cur_name = cur_item.text().rsplit(" (", 1)[0] if cur_item else ""
+            name, ok = QInputDialog.getText(self, "重命名分组", "新名称：", text=cur_name)
+            if not ok or not name.strip():
+                return
+            rename_watchlist_group(gid, name.strip())
+            self._refresh_wl_group_list()
+
+        def _on_wl_delete_group(self):
+            gid = self._wl_current_group_id
+            if not gid:
+                QMessageBox.information(self, "提示", "先选一个分组。"); return
+            cur_item = self.wl_group_list.currentItem()
+            name = cur_item.text() if cur_item else gid
+            if QMessageBox.question(self, "确认删除", f"删除分组「{name}」？其中的股票清单会一并删除，不可恢复。",
+                                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return
+            delete_watchlist_group(gid)
+            self._wl_current_group_id = None
+            self._refresh_wl_group_list()
+
+        def _on_wl_add_stock(self):
+            """支持批量一键导入：逗号/换行分隔一次粘贴多个代码(跟批量扫描页 self.batch_codes 同一个约定)，
+            后台逐个解析真实名称+写库，不卡界面。"""
+            gid = self._wl_current_group_id
+            if not gid:
+                QMessageBox.information(self, "提示", "先新建或选一个分组。"); return
+            raw = self.wl_add_code_edit.text().replace("\n", ",").replace("，", ",")
+            codes = [c.strip() for c in raw.split(",") if c.strip()]
+            if not codes:
+                QMessageBox.warning(self, "提示", "请先填写股票代码(支持逗号分隔一次导入多只)。"); return
+            group_name = self.wl_group_list.currentItem().text() if self.wl_group_list.currentItem() else gid
+            self.wl_add_stock_btn.setEnabled(False)
+            self.wl_add_stock_btn.setText("导入中..." if len(codes) > 1 else "添加中...")
+            self._oplog(f"自选导入 {len(codes)} 只到「{group_name}」：{', '.join(codes)}")
+            self.wl_import_worker = WatchlistImportWorker(gid, codes)
+            self.wl_import_worker.progress_signal.connect(self._log)
+            self.wl_import_worker.finished_signal.connect(self._on_wl_import_finished)
+            self.wl_import_worker.start()
+
+        def _on_wl_import_finished(self, results):
+            self.wl_add_stock_btn.setEnabled(True)
+            self.wl_add_stock_btn.setText("＋添加(支持批量导入)")
+            self.wl_add_code_edit.clear()
+            errs = [r for r in results if r.get("error")]
+            n_ok = len(results) - len(errs)
+            self._oplog(f"自选导入完成：成功 {n_ok} 只" + (f"，失败 {len(errs)} 只" if errs else "") + "。")
+            if errs:
+                msg = "\n".join(f"{e.get('code','?')}: {e['error']}" for e in errs[:10])
+                if len(errs) > 10:
+                    msg += f"\n... 还有 {len(errs) - 10} 条"
+                QMessageBox.warning(self, "部分导入失败", f"{len(errs)} 只导入失败：\n{msg}")
+            self._refresh_wl_group_list()
+
+        def _on_wl_remove_stock(self):
+            gid = self._wl_current_group_id
+            it = self.wl_stock_list.currentItem()
+            if not gid or not it:
+                QMessageBox.information(self, "提示", "先选一只要移除的股票。"); return
+            remove_stock_from_group(gid, it.data(Qt.UserRole))
+            self._refresh_wl_group_list()
+
+        def _on_wl_run(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "自选批量预测需真实数据，请把数据源切换为「真实数据」。"); return
+            gid = self._wl_current_group_id
+            if not gid:
+                QMessageBox.information(self, "提示", "先选一个分组。"); return
+            codes = get_group_stocks(gid)["code"].tolist()
+            if not codes:
+                QMessageBox.warning(self, "提示", "这个分组还没有股票，先在上方加几只。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            tm = "return" if self.target_combo.currentIndex() == 0 else "price"
+            horizon = self._horizon_options[self.horizon_combo.currentIndex()][1]
+            flags5 = (self.chk_val.isChecked(), self.chk_idx.isChecked(), self.chk_mf.isChecked(),
+                     self.chk_us.isChecked(), self.chk_nb.isChecked())
+            self._wl_run_ctx = (start, end, tm, horizon, flags5)   # 点结果行做特征预览时沿用同一批设置
+            self.wl_run_btn.setEnabled(False); self.wl_run_btn.setText("扫描中...")
+            self._oplog(f"自选批量预测 {len(codes)} 只：{', '.join(codes)}"
+                       f"（模型{self.wl_algo_combo.currentText()}，周期{horizon}日）")
+            self.wl_hint.setText("⏳ 正在批量预测(每只都要训练模型，请耐心)... 进度见「运行日志」。")
+            self._prog_open("⏳ 自选分组批量预测进行中：逐只训练模型，请稍候 ……")
+            self.wl_batch_worker = GroupBatchWorker(codes, self.wl_algo_combo.currentText(), start, end, tm,
+                                                     horizon, flags5)
+            self.wl_batch_worker.progress_signal.connect(self._log)
+            self.wl_batch_worker.finished_signal.connect(self._on_wl_run_finished)
+            self.wl_batch_worker.error_signal.connect(lambda m: (QMessageBox.critical(self, "自选批量预测出错", m),
+                                                                  self._wl_run_reset_btn()))
+            self.wl_batch_worker.start()
+
+        def _wl_run_reset_btn(self):
+            self._prog_close()
+            self.wl_run_btn.setEnabled(True); self.wl_run_btn.setText("▶ 批量运行该分组")
+
+        def _on_wl_run_finished(self, rows):
+            self._wl_run_reset_btn()
+            rows_sorted = sorted(rows, key=lambda r: (r.get("pred_change_pct") is None,
+                                                      -(r.get("pred_change_pct") or 0)))
+            self._wl_last_rows = rows_sorted
+            headers = ["代码", "名称", "最新价", "预测价", "预测涨跌%", "测试DA%", "UP_P%", "风险数", "主要风险"]
+            self.wl_results_table.setColumnCount(len(headers))
+            self.wl_results_table.setHorizontalHeaderLabels(headers)
+            self.wl_results_table.setRowCount(len(rows_sorted))
+            for i, r in enumerate(rows_sorted):
+                if r.get("error"):
+                    self.wl_results_table.setItem(i, 0, QTableWidgetItem(r["code"]))
+                    self.wl_results_table.setItem(i, 1, QTableWidgetItem(f"失败: {r['error'][:30]}"))
+                    continue
+                vals = [r["code"], r.get("name", ""), f"{r.get('last_close','')}",
+                        f"{r.get('pred_close','')}", f"{r.get('pred_change_pct','')}",
+                        f"{r.get('DA','')}", f"{r.get('UP_P','')}", str(r.get("risk_n", "")),
+                        r.get("risk_top", "")]
+                for c, v in enumerate(vals):
+                    it = QTableWidgetItem(str(v))
+                    if c == 7 and r.get("risk_n", 0) > 0:
+                        it.setForeground(Qt.red)
+                    self.wl_results_table.setItem(i, c, it)
+            self.wl_results_table.resizeColumnsToContents()
+            self.wl_hint.setText("研究筛查工具，非荐股：用风险列避开雷；预测/DA高不等于该买。点一行看真实特征数据集。")
+            self._oplog(f"自选批量预测完成：{sum(1 for r in rows if not r.get('error'))} 只成功。")
+
+        def _on_wl_result_selected(self):
+            sel = self.wl_results_table.selectionModel()
+            rows = sel.selectedRows() if sel else []
+            if not rows:
+                return
+            i = rows[0].row()
+            if i >= len(self._wl_last_rows):
+                return
+            r = self._wl_last_rows[i]
+            if r.get("error"):
+                return
+            if self._wl_preview_worker is not None and self._wl_preview_worker.isRunning():
+                return   # 上一次预览还没跑完，先不重复起线程
+            code = r["code"]
+            start, end, tm, horizon, flags5 = getattr(
+                self, "_wl_run_ctx",
+                (self.start_date.date().toString("yyyyMMdd"), self.end_date.date().toString("yyyyMMdd"),
+                 "return", 5, (True, True, True, True, True)))
+            self.wl_feature_table.setColumnCount(1); self.wl_feature_table.setRowCount(1)
+            self.wl_feature_table.setHorizontalHeaderLabels(["状态"])
+            self.wl_feature_table.setItem(0, 0, QTableWidgetItem(f"⏳ 正在取「{code}」真实特征数据..."))
+            self._wl_preview_worker = FeaturePreviewWorker(code, start, end, 20, horizon, tm, flags5, n_rows=20)
+            self._wl_preview_worker.finished_signal.connect(self._fill_wl_feature_table)
+            self._wl_preview_worker.error_signal.connect(lambda m: self._fill_wl_feature_table({"error": m}))
+            self._wl_preview_worker.start()
+
+        def _fill_wl_feature_table(self, preview: dict):
+            if preview.get("error"):
+                self.wl_feature_table.setColumnCount(1); self.wl_feature_table.setRowCount(1)
+                self.wl_feature_table.setHorizontalHeaderLabels(["状态"])
+                self.wl_feature_table.setItem(0, 0, QTableWidgetItem(f"取数失败：{preview['error']}"))
+                return
+            df = preview["preview_df"]
+            cols = list(df.columns)
+            self.wl_feature_table.setColumnCount(len(cols))
+            self.wl_feature_table.setHorizontalHeaderLabels(cols)
+            self.wl_feature_table.setRowCount(len(df))
+            for i in range(len(df)):
+                for c, col in enumerate(cols):
+                    v = df.iloc[i][col]
+                    if col == "real_fwd_return_pct" and pd.isna(v):
+                        s = "(未来，未发生)"
+                    elif isinstance(v, float):
+                        s = f"{v:.3f}"
+                    else:
+                        s = str(v)
+                    self.wl_feature_table.setItem(i, c, QTableWidgetItem(s))
+            self.wl_feature_table.resizeColumnsToContents()
+            n_feat = len(preview.get("feature_cols", []))
+            self.wl_feature_hint.setText(
+                f"「{preview.get('name','')}({preview.get('code','')})」真实特征共 {n_feat} 列"
+                f"(随财报估值/大盘/资金/美股/北向开关变化)，共 {preview.get('n_total_rows','?')} 行有效历史，"
+                f"下表是最近 {len(df)} 行。real_fwd_return_pct 是已经发生的真实前瞻收益(不是模型预测)；"
+                "最近几行显示「(未来，未发生)」是因为那段时间还没走完，不瞎猜。")
+
+        def _on_wl_favorite_to_group(self):
+            sel = self.wl_results_table.selectionModel()
+            rows = sel.selectedRows() if sel else []
+            if not rows:
+                QMessageBox.information(self, "提示", "先选一行结果。"); return
+            i = rows[0].row()
+            if i >= len(self._wl_last_rows):
+                return
+            r = self._wl_last_rows[i]
+            if r.get("error"):
+                return
+            target_gid = self.wl_fav_target_combo.currentData()
+            if not target_gid:
+                QMessageBox.information(self, "提示", "没有其它分组可收藏，先新建一个。"); return
+            target_name = self.wl_fav_target_combo.currentText()
+            copy_stock_to_group(r["code"], r.get("name", ""), target_gid)
+            self._oplog(f"自选收藏：{r['code']} {r.get('name','')} → 「{target_name}」")
+            QMessageBox.information(self, "已收藏", f"{r['code']} {r.get('name','')} 已复制进分组「{target_name}」。")
+            self._refresh_wl_group_list()
 
         # ---- 9.2.1h2 组合与仓位标签页（相关性分散化 + 凯利仓位；借鉴交易 skill） ----
         def _build_portfolio_tab(self) -> QWidget:
