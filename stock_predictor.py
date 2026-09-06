@@ -4465,7 +4465,7 @@ def rl_train_and_eval(code: str, start: str = "20200101", end: Optional[str] = N
                     target.load_state_dict(online.state_dict())
             eps = max(eps_min, eps * eps_decay)
             # 用当前策略在训练段贪心滚一遍净值，记录该回合"资金"(仅供观察训练进度)
-            pos_seq = _rl_eval_positions(online, env, feat_norm[:split], close_all[:split], window, device)
+            pos_seq = _rl_eval_positions(online, feat_norm[:split], close_all[:split], window, device)
             cap = _rl_equity_curve(pos_seq, close_all[:split], cost)[-1]
             train_log.append({"episode": ep, "cum_reward": round(float(cum_r), 2),
                               "epsilon": round(eps, 4), "capital": round(float(cap), 2)})
@@ -4478,23 +4478,23 @@ def rl_train_and_eval(code: str, start: str = "20200101", end: Optional[str] = N
         test_feat = feat_norm[split:]
         if len(test_close) < window + 2:
             return {"error": "测试段太短，无法评估(请拉长历史或调低训练占比)"}
-        test_env = RLTradingEnv(test_feat, test_close, window=window, cost=cost)
-        pos_seq = _rl_eval_positions(online, test_env, test_feat, test_close, window, device)
+        pos_seq = _rl_eval_positions(online, test_feat, test_close, window, device)
         # 公平对齐：前 window-1 天智能体凑不齐窗口、结构性只能空仓，两条曲线都从"能开始交易"那天(active)起、
         # 同起点 10000、覆盖完全相同的交易日，避免用不同长度/不同区间的曲线做不公平对比。
         active = window - 1
         rl_full = _rl_equity_curve(pos_seq, test_close, cost)          # 长度 = len(test_close)
         rl_curve = rl_full[active:] / rl_full[active] * 10000.0        # 从 active 起重新归一到 10000
-        bh_curve = test_close[active:] / test_close[active] * 10000.0  # 买入持有：同区间同起点
+        # 买入持有基准也扣一次建仓成本，与 RL 逐笔扣成本的口径对齐(否则基准占"免费建仓"便宜、对RL不公平)
+        bh_curve = test_close[active:] / test_close[active] * 10000.0 * (1 - cost)
         rl_m = _rl_metrics(rl_curve)
         bh_m = _rl_metrics(bh_curve)
         # 动作/持仓统计
         n_hold = int(np.sum(pos_seq == 1))
         n_days = len(pos_seq)
         trades = int(np.sum(np.abs(np.diff(np.concatenate([[0], pos_seq])))))   # 换仓次数
-        # 单步胜率：持仓日里次日上涨的比例
+        # 单步胜率：持仓日里次日上涨的比例(与净值曲线口径一致，都从 active 起算)
         win_days = 0; hold_days = 0
-        for i in range(len(test_close) - 1):
+        for i in range(active, len(test_close) - 1):
             if i < len(pos_seq) and pos_seq[i] == 1:
                 hold_days += 1
                 if test_close[i + 1] > test_close[i]:
@@ -4522,7 +4522,7 @@ def rl_train_and_eval(code: str, start: str = "20200101", end: Optional[str] = N
         return {"error": str(e)}
 
 
-def _rl_eval_positions(net, env_like, feat_norm: np.ndarray, close: np.ndarray,
+def _rl_eval_positions(net, feat_norm: np.ndarray, close: np.ndarray,
                        window: int, device) -> np.ndarray:
     """用贪心策略跑一遍，返回逐日持仓序列(长度 = len(close))。第 t 天的动作只用截至 t 的信息。"""
     pos_seq = np.zeros(len(close), dtype=np.int64)
