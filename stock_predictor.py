@@ -4248,6 +4248,300 @@ def copy_stock_to_group(code: str, name: str, to_group_id: str) -> Dict[str, Any
     return add_stock_to_group(to_group_id, code, name)
 
 
+# ==================== 第八部分补充6：强化学习(DQN)交易智能体 ====================
+# 借鉴参考文章《当AI学会炒股：基于强化学习的股票价格预测与智能交易实战》(机器学习之心HML, MATLAB/DQN)
+# 的思路——不预测具体价格，直接让智能体学"持有/买入/卖出"三个动作。但严格套用本项目"诚实优先"的做法：
+# 真实取数、训练/测试独立留出(无前视泄漏)、强制与"买入持有"基准比、如实标注"实验性/对随机种子敏感/
+# 单股小样本不足以下结论"。绝不用随机数冒充训练结果。
+# --------------------------------------------------------------------------------
+def rl_build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """从日线行情构造一组"当天即可获得"的紧凑特征(不引入未来泄漏)，供 RL 状态使用。
+    只用 close/high/low/volume 的滚动统计，公式与本项目其它技术指标一致。返回(带特征的df, 特征列名)。"""
+    d = df.copy().reset_index(drop=True)
+    close = d["close"]
+    feat: Dict[str, pd.Series] = {}
+    feat["ret1"] = close.pct_change()
+    for w in (5, 10, 20, 60):
+        feat[f"ma{w}_dev"] = close / close.rolling(w).mean() - 1.0
+    # RSI6 / RSI14
+    delta = close.diff()
+    for w in (6, 14):
+        gain = delta.clip(lower=0).rolling(w).mean()
+        loss = (-delta.clip(upper=0)).rolling(w).mean()
+        rs = gain / (loss + 1e-9)
+        feat[f"rsi{w}"] = (100 - 100 / (1 + rs)) / 100.0
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    feat["macd_dif"] = dif / close
+    feat["macd_hist"] = (dif - dea) * 2 / close
+    # 布林带位置/带宽
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    upper, lower = mid + 2 * std, mid - 2 * std
+    feat["boll_pos"] = (close - lower) / (upper - lower + 1e-9)
+    feat["boll_width"] = (upper - lower) / (mid + 1e-9)
+    # 波动率(5/20日收益率标准差)
+    feat["vol5"] = feat["ret1"].rolling(5).std()
+    feat["vol20"] = feat["ret1"].rolling(20).std()
+    # 量能变化 + 20日区间位置 + 日内振幅
+    feat["vol_change"] = d["volume"].pct_change().clip(-3, 3)
+    lo20, hi20 = close.rolling(20).min(), close.rolling(20).max()
+    feat["price_pos"] = (close - lo20) / (hi20 - lo20 + 1e-9)
+    if "high" in d.columns and "low" in d.columns:
+        feat["amplitude"] = (d["high"] - d["low"]) / close
+    cols = list(feat.keys())
+    for c in cols:
+        d[c] = feat[c]
+    d = d.replace([np.inf, -np.inf], np.nan)
+    return d, cols
+
+
+class RLTradingEnv:
+    """强化学习交易环境(MDP)。状态 = 过去 window 天的特征展平 + 当前持仓(0空/1满)；
+    动作 = 0持有/1买入/2卖出；奖励 = 新持仓 × 次日涨跌幅 × 100 − 换仓交易成本。
+    动作在第 t 天用的只有截至第 t 天的信息，奖励来自 t→t+1 的真实涨跌，无前视泄漏。纯 numpy，不依赖 torch。"""
+    def __init__(self, feat_matrix: np.ndarray, close: np.ndarray, window: int = 10, cost: float = 0.001):
+        self.F = feat_matrix
+        self.close = close
+        self.window = window
+        self.cost = cost
+        self.n = len(close)
+        self.state_dim = window * feat_matrix.shape[1] + 1
+
+    def reset(self):
+        self.t = self.window - 1        # 第一个能凑齐窗口的位置
+        self.pos = 0
+        return self._state()
+
+    def _state(self):
+        win = self.F[self.t - self.window + 1: self.t + 1].flatten()
+        return np.concatenate([win, [float(self.pos)]]).astype(np.float32)
+
+    def step(self, action: int):
+        # 动作 → 新持仓
+        new_pos = self.pos
+        if action == 1:
+            new_pos = 1
+        elif action == 2:
+            new_pos = 0
+        traded = int(new_pos != self.pos)
+        ret = self.close[self.t + 1] / self.close[self.t] - 1.0    # t→t+1 真实涨跌
+        reward = new_pos * ret * 100.0 - traded * self.cost * 100.0
+        self.pos = new_pos
+        self.t += 1
+        done = self.t >= self.n - 1
+        return self._state(), reward, done
+
+
+if HAS_TORCH:
+    class _DQNNet(nn.Module):
+        """Q 网络：state_dim → 128 → 64 → 3，ReLU 激活(与参考文章一致的结构)。"""
+        def __init__(self, state_dim: int, n_actions: int = 3):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(state_dim, 128), nn.ReLU(),
+                nn.Linear(128, 64), nn.ReLU(),
+                nn.Linear(64, n_actions),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+def _rl_equity_curve(actions_pos: np.ndarray, close: np.ndarray, cost: float,
+                     init_cap: float = 10000.0) -> np.ndarray:
+    """按逐日持仓序列(每天的持仓 0/1)在给定收盘序列上滚出净值曲线，扣换仓成本。"""
+    cap = init_cap
+    curve = [cap]
+    prev_pos = 0
+    for i in range(len(close) - 1):
+        pos = actions_pos[i]
+        if pos != prev_pos:
+            cap *= (1 - cost)               # 换仓扣成本
+        ret = close[i + 1] / close[i] - 1.0
+        cap *= (1 + pos * ret)
+        curve.append(cap)
+        prev_pos = pos
+    return np.array(curve)
+
+
+def _rl_metrics(curve: np.ndarray) -> Dict[str, float]:
+    """由净值曲线算 年化夏普/最大回撤/总收益。"""
+    rets = np.diff(curve) / (curve[:-1] + 1e-9)
+    sharpe = float(np.mean(rets) / (np.std(rets) + 1e-9) * np.sqrt(252)) if len(rets) > 1 else 0.0
+    peak = np.maximum.accumulate(curve)
+    mdd = float(np.max((peak - curve) / (peak + 1e-9)) * 100.0)
+    total = float((curve[-1] / curve[0] - 1.0) * 100.0)
+    return {"sharpe": round(sharpe, 4), "max_drawdown_pct": round(mdd, 2), "total_return_pct": round(total, 2)}
+
+
+def rl_train_and_eval(code: str, start: str = "20200101", end: Optional[str] = None,
+                      episodes: int = 50, window: int = 10, cost: float = 0.001,
+                      lr: float = 1e-3, gamma: float = 0.99, eps_decay: float = 0.97,
+                      eps_min: float = 0.01, batch_size: int = 32, buffer_cap: int = 2000,
+                      target_sync: int = 100, train_ratio: float = 0.85, seed: int = 42,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """训练一个 DQN 交易智能体并在**独立测试段**上评估，与买入持有基准对比。全流程真实：真数据、
+    训练/测试按时间先后独立留出、无前视泄漏。返回训练日志 + 测试净值 + 指标 + 基准 + 诚实说明。
+    torch 缺失时返回 error。"""
+    log = progress_cb or (lambda m: None)
+    if not HAS_TORCH:
+        return {"error": "强化学习(DQN)需要 torch，请先执行: pip install torch"}
+    try:
+        import random as _random
+        from collections import deque
+        end = end or dt.date.today().strftime("%Y%m%d")
+        log(f"[RL] 取数 {code} ...")
+        raw = StockDataFetcher().fetch(code, start, end)
+        name = StockDataFetcher.fetch_stock_name(code)
+        d, feat_cols = rl_build_features(raw)
+        d = d.dropna().reset_index(drop=True)
+        if len(d) < window + 60:
+            return {"error": f"有效历史只有 {len(d)} 行，不足以训练(至少需 window+60={window+60} 行)"}
+
+        close_all = d["close"].values.astype(np.float64)
+        split = int(len(d) * train_ratio)
+        # 归一化：均值/方差只用训练段拟合，套到全段(测试段不参与统计，无泄漏)
+        train_feat = d[feat_cols].iloc[:split]
+        mu = train_feat.mean().values
+        sd = train_feat.std().replace(0, 1).values
+        feat_norm = ((d[feat_cols].values - mu) / sd).astype(np.float32)
+        feat_norm = np.clip(feat_norm, -5, 5)
+
+        torch.manual_seed(seed); np.random.seed(seed); _random.seed(seed)
+        device = torch.device("cpu")
+
+        env = RLTradingEnv(feat_norm[:split], close_all[:split], window=window, cost=cost)
+        state_dim = env.state_dim
+        online = _DQNNet(state_dim).to(device)
+        target = _DQNNet(state_dim).to(device)
+        target.load_state_dict(online.state_dict())
+        opt = torch.optim.Adam(online.parameters(), lr=lr)
+        buf: "deque" = deque(maxlen=buffer_cap)
+        eps = 1.0
+        step_count = 0
+        train_log = []
+
+        def _act(state, eps_):
+            if _random.random() < eps_:
+                return _random.randint(0, 2)
+            with torch.no_grad():
+                q = online(torch.tensor(state, device=device).unsqueeze(0))
+                return int(torch.argmax(q, dim=1).item())
+
+        def _learn():
+            if len(buf) < batch_size:
+                return
+            batch = _random.sample(buf, batch_size)
+            s = torch.tensor(np.array([b[0] for b in batch]), device=device)
+            a = torch.tensor([b[1] for b in batch], device=device).long().unsqueeze(1)
+            r = torch.tensor([b[2] for b in batch], device=device).float().unsqueeze(1)
+            s2 = torch.tensor(np.array([b[3] for b in batch]), device=device)
+            dn = torch.tensor([b[4] for b in batch], device=device).float().unsqueeze(1)
+            q = online(s).gather(1, a)
+            with torch.no_grad():
+                q_next = target(s2).max(1, keepdim=True)[0]
+                tgt = r + gamma * q_next * (1 - dn)
+            loss = nn.functional.mse_loss(q, tgt)
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        for ep in range(1, episodes + 1):
+            state = env.reset()
+            cum_r = 0.0
+            done = False
+            while not done:
+                action = _act(state, eps)
+                s2, reward, done = env.step(action)
+                buf.append((state, action, reward, s2, float(done)))
+                state = s2
+                cum_r += reward
+                step_count += 1
+                if step_count % 4 == 0:
+                    _learn()
+                if step_count % target_sync == 0:
+                    target.load_state_dict(online.state_dict())
+            eps = max(eps_min, eps * eps_decay)
+            # 用当前策略在训练段贪心滚一遍净值，记录该回合"资金"(仅供观察训练进度)
+            pos_seq = _rl_eval_positions(online, env, feat_norm[:split], close_all[:split], window, device)
+            cap = _rl_equity_curve(pos_seq, close_all[:split], cost)[-1]
+            train_log.append({"episode": ep, "cum_reward": round(float(cum_r), 2),
+                              "epsilon": round(eps, 4), "capital": round(float(cap), 2)})
+            if ep % max(1, episodes // 10) == 0 or ep == episodes:
+                log(f"[RL] 回合 {ep}/{episodes} 累计奖励 {cum_r:.1f} ε={eps:.3f} 资金 {cap:.0f}")
+
+        # ---- 独立测试段：贪心策略评估 + 买入持有基准 ----
+        log("[RL] 测试段评估 ...")
+        test_close = close_all[split:]
+        test_feat = feat_norm[split:]
+        if len(test_close) < window + 2:
+            return {"error": "测试段太短，无法评估(请拉长历史或调低训练占比)"}
+        test_env = RLTradingEnv(test_feat, test_close, window=window, cost=cost)
+        pos_seq = _rl_eval_positions(online, test_env, test_feat, test_close, window, device)
+        # 公平对齐：前 window-1 天智能体凑不齐窗口、结构性只能空仓，两条曲线都从"能开始交易"那天(active)起、
+        # 同起点 10000、覆盖完全相同的交易日，避免用不同长度/不同区间的曲线做不公平对比。
+        active = window - 1
+        rl_full = _rl_equity_curve(pos_seq, test_close, cost)          # 长度 = len(test_close)
+        rl_curve = rl_full[active:] / rl_full[active] * 10000.0        # 从 active 起重新归一到 10000
+        bh_curve = test_close[active:] / test_close[active] * 10000.0  # 买入持有：同区间同起点
+        rl_m = _rl_metrics(rl_curve)
+        bh_m = _rl_metrics(bh_curve)
+        # 动作/持仓统计
+        n_hold = int(np.sum(pos_seq == 1))
+        n_days = len(pos_seq)
+        trades = int(np.sum(np.abs(np.diff(np.concatenate([[0], pos_seq])))))   # 换仓次数
+        # 单步胜率：持仓日里次日上涨的比例
+        win_days = 0; hold_days = 0
+        for i in range(len(test_close) - 1):
+            if i < len(pos_seq) and pos_seq[i] == 1:
+                hold_days += 1
+                if test_close[i + 1] > test_close[i]:
+                    win_days += 1
+        win_rate = round(win_days / hold_days * 100, 2) if hold_days else 0.0
+
+        return {
+            "code": code, "name": name, "error": None,
+            "feat_cols": feat_cols, "state_dim": state_dim,
+            "n_total": len(d), "n_train": split, "n_test": len(test_close),
+            "train_log": train_log,
+            "rl_curve": [round(float(x), 2) for x in rl_curve],
+            "bh_curve": [round(float(x), 2) for x in bh_curve],
+            "rl": rl_m, "buy_hold": bh_m,
+            "win_rate_pct": win_rate, "n_trades": trades,
+            "hold_ratio_pct": round(n_hold / n_days * 100, 1) if n_days else 0.0,
+            "final_cap": round(float(rl_curve[-1]), 2),
+            "bh_final_cap": round(float(bh_curve[-1]), 2),
+            "seed": seed, "episodes": episodes,
+            "note": ("这是单只股票、单次训练(种子固定)的结果，换股票/换随机种子可能完全不同，"
+                     "不足以证明策略有效；对长/平仓智能体而言，『总是涨』等价于买入持有、『Naive前值』不适用，"
+                     "故只与买入持有比。实验性功能，非投资建议。"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _rl_eval_positions(net, env_like, feat_norm: np.ndarray, close: np.ndarray,
+                       window: int, device) -> np.ndarray:
+    """用贪心策略跑一遍，返回逐日持仓序列(长度 = len(close))。第 t 天的动作只用截至 t 的信息。"""
+    pos_seq = np.zeros(len(close), dtype=np.int64)
+    pos = 0
+    for t in range(window - 1, len(close) - 1):
+        win = feat_norm[t - window + 1: t + 1].flatten()
+        state = np.concatenate([win, [float(pos)]]).astype(np.float32)
+        with torch.no_grad():
+            q = net(torch.tensor(state, device=device).unsqueeze(0))
+            action = int(torch.argmax(q, dim=1).item())
+        if action == 1:
+            pos = 1
+        elif action == 2:
+            pos = 0
+        pos_seq[t] = pos
+    pos_seq[len(close) - 1] = pos
+    return pos_seq
+
+
 def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
                       w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
                       w_quality: float = 1.0, w_lowvol: float = 1.0, w_tech: float = 1.0,
@@ -6891,6 +7185,26 @@ if HAS_PYSIDE6:
                 results.append(add_stock_to_group(self.group_id, code))
             self.finished_signal.emit(results)
 
+    class RLTrainWorker(QThread):
+        """强化学习(DQN)训练后台线程：真实取数→训练智能体→独立测试段评估，全程不卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, code, start, end, episodes, window, cost):
+            super().__init__()
+            self.code = code; self.d_start = start; self.d_end = end
+            self.episodes = episodes; self.window = window; self.cost = cost
+
+        def run(self):
+            try:
+                r = rl_train_and_eval(self.code, self.d_start, self.d_end,
+                                      episodes=self.episodes, window=self.window, cost=self.cost,
+                                      progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
     class FactorWorker(QThread):
         """批量因子打分选股后台线程。"""
         progress_signal = Signal(str)
@@ -7208,6 +7522,8 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
             # 自选股票：持久保存关注的分组股票，一键批量预测+看每只的真实特征数据集
             self.tabs.addTab(self._build_watchlist_tab(), "自选股票")
+            # 强化学习交易：DQN 智能体学"买/卖/持"而非预测价格，独立测试段对比买入持有基准
+            self.tabs.addTab(self._build_rl_tab(), "强化学习交易")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
@@ -7220,7 +7536,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "组合与仓位"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "组合与仓位"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -9666,6 +9982,113 @@ if HAS_PYSIDE6:
             self._oplog(f"自选收藏：{r['code']} {r.get('name','')} → 「{target_name}」")
             QMessageBox.information(self, "已收藏", f"{r['code']} {r.get('name','')} 已复制进分组「{target_name}」。")
             self._refresh_wl_group_list()
+
+        # ---- 9.2.1g3 强化学习(DQN)交易标签页：学"买/卖/持"而非预测价格，独立测试段对比买入持有 ----
+        def _build_rl_tab(self) -> QWidget:
+            panel = QWidget()
+            outer = QHBoxLayout(panel)
+
+            left = QWidget(); left.setMaximumWidth(280); ll = QVBoxLayout(left)
+            ll.addWidget(QLabel("<b>DQN 智能体训练</b>"))
+            form = QGridLayout()
+            form.addWidget(QLabel("股票代码:"), 0, 0)
+            self.rl_code = QLineEdit("600519"); form.addWidget(self.rl_code, 0, 1)
+            form.addWidget(QLabel("训练回合:"), 1, 0)
+            self.rl_episodes = QSpinBox(); self.rl_episodes.setRange(5, 300); self.rl_episodes.setValue(50)
+            form.addWidget(self.rl_episodes, 1, 1)
+            form.addWidget(QLabel("状态窗口:"), 2, 0)
+            self.rl_window = QSpinBox(); self.rl_window.setRange(3, 40); self.rl_window.setValue(10)
+            form.addWidget(self.rl_window, 2, 1)
+            form.addWidget(QLabel("交易成本%:"), 3, 0)
+            self.rl_cost = QDoubleSpinBox(); self.rl_cost.setRange(0.0, 1.0); self.rl_cost.setSingleStep(0.05)
+            self.rl_cost.setValue(0.1); self.rl_cost.setDecimals(2); form.addWidget(self.rl_cost, 3, 1)
+            ll.addLayout(form)
+            self.rl_run_btn = QPushButton("▶ 训练智能体")
+            self.rl_run_btn.setStyleSheet("font-weight:bold;padding:8px;background:#7a4bc4;color:white;border-radius:4px;")
+            self.rl_run_btn.clicked.connect(self._on_rl_train)
+            ll.addWidget(self.rl_run_btn)
+            self.rl_status = QLabel("待训练"); self.rl_status.setStyleSheet("color:#666;"); self.rl_status.setWordWrap(True)
+            ll.addWidget(self.rl_status)
+            info = QLabel("动作：持有/买入/卖出\n状态：过去N天特征+持仓\n网络：state→128→64→3\n\n"
+                          "⚠ 实验性：结果对随机种子/回合数极敏感，单只股票不足以下结论；训练/测试按时间独立留出，无前视泄漏。")
+            info.setStyleSheet("color:#888;font-size:11px;"); info.setWordWrap(True)
+            ll.addWidget(info); ll.addStretch(1)
+            if not HAS_TORCH:
+                warn = QLabel("⚠ 未安装 torch，本页不可用。\npip install torch")
+                warn.setStyleSheet("color:#c0392b;font-weight:bold;"); warn.setWordWrap(True)
+                ll.addWidget(warn); self.rl_run_btn.setEnabled(False)
+            outer.addWidget(left)
+
+            right = QWidget(); rl = QVBoxLayout(right)
+            self.rl_metric_lbl = QLabel("训练后显示：RL vs 买入持有 收益率、夏普、回撤、胜率。")
+            self.rl_metric_lbl.setStyleSheet("font-size:13px;"); self.rl_metric_lbl.setWordWrap(True)
+            rl.addWidget(self.rl_metric_lbl)
+            self.rl_figure = Figure(figsize=(8, 5))
+            self.rl_canvas = FigureCanvas(self.rl_figure)
+            rl.addWidget(self.rl_canvas, stretch=1)
+            self.rl_verdict = QLabel("")
+            self.rl_verdict.setStyleSheet("color:#c0392b;font-size:12px;background:#fbf3f2;padding:8px;border-radius:6px;")
+            self.rl_verdict.setWordWrap(True)
+            rl.addWidget(self.rl_verdict)
+            outer.addWidget(right, stretch=1)
+            return panel
+
+        def _on_rl_train(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "强化学习需真实数据，请把数据源切换为「真实数据」。"); return
+            code = self.rl_code.text().strip()
+            if not code:
+                QMessageBox.warning(self, "提示", "请先填写股票代码。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            self.rl_run_btn.setEnabled(False); self.rl_run_btn.setText("训练中...")
+            self._oplog(f"强化学习训练 {code}（{self.rl_episodes.value()}回合，窗口{self.rl_window.value()}天）")
+            self.rl_status.setText("⏳ 训练进行中，进度见「运行日志」...")
+            self._prog_open("⏳ DQN 智能体训练中：真实取数+逐回合训练，请稍候 ……")
+            self.rl_worker = RLTrainWorker(code, start, end, self.rl_episodes.value(),
+                                           self.rl_window.value(), self.rl_cost.value() / 100.0)
+            self.rl_worker.progress_signal.connect(self._log)
+            self.rl_worker.progress_signal.connect(self.rl_status.setText)
+            self.rl_worker.finished_signal.connect(self._on_rl_finished)
+            self.rl_worker.error_signal.connect(lambda m: (self._prog_close(), QMessageBox.critical(self, "训练出错", m),
+                                                           self._rl_reset_btn()))
+            self.rl_worker.start()
+
+        def _rl_reset_btn(self):
+            self.rl_run_btn.setEnabled(True); self.rl_run_btn.setText("▶ 训练智能体")
+
+        def _on_rl_finished(self, r: dict):
+            self._prog_close(); self._rl_reset_btn()
+            if r.get("error"):
+                self.rl_status.setText(f"失败：{r['error']}")
+                QMessageBox.warning(self, "无法训练", r["error"]); return
+            self.rl_status.setText(f"完成：测试段 {r['n_test']} 天（种子{r['seed']}）")
+            rlm, bhm = r["rl"], r["buy_hold"]
+            self.rl_metric_lbl.setText(
+                f"<b>测试段（{r['n_test']} 天，独立留出）</b>　"
+                f"RL收益 <b>{rlm['total_return_pct']}%</b> · 夏普 {rlm['sharpe']} · 回撤 {rlm['max_drawdown_pct']}% · "
+                f"胜率 {r['win_rate_pct']}% · 换仓 {r['n_trades']}次 · 持仓占比 {r['hold_ratio_pct']}%　｜　"
+                f"买入持有收益 <b>{bhm['total_return_pct']}%</b> · 夏普 {bhm['sharpe']} · 回撤 {bhm['max_drawdown_pct']}%")
+            # 作图：训练资金曲线 + 测试净值 RL vs 买入持有
+            self.rl_figure.clear()
+            ax1 = self.rl_figure.add_subplot(211)
+            eps_ = [t["episode"] for t in r["train_log"]]
+            caps = [t["capital"] for t in r["train_log"]]
+            ax1.plot(eps_, caps, color="#7a4bc4", lw=1.6)
+            ax1.axhline(10000, ls="--", color="#999", lw=1)
+            ax1.set_title("训练过程 · 每回合末资金", fontsize=10)
+            ax1.set_xlabel("回合", fontsize=9); ax1.set_ylabel("资金", fontsize=9)
+            ax2 = self.rl_figure.add_subplot(212)
+            ax2.plot(r["rl_curve"], color="#7a4bc4", lw=1.6, label="RL 智能体")
+            ax2.plot(r["bh_curve"], color="#999", lw=1.4, label="买入持有")
+            ax2.set_title("测试段净值 · RL vs 买入持有（初始 10000）", fontsize=10)
+            ax2.set_xlabel("测试交易日", fontsize=9); ax2.legend(fontsize=9)
+            self.rl_figure.tight_layout()
+            self.rl_canvas.draw()
+            win = rlm["total_return_pct"] > bhm["total_return_pct"]
+            head = "✓ RL 跑赢买入持有" if win else "✗ RL 没跑赢买入持有"
+            self.rl_verdict.setText(f"<b>{head}</b>（RL {rlm['total_return_pct']}% vs 买入持有 {bhm['total_return_pct']}%）。{r['note']}")
+            self._oplog(f"强化学习完成：RL {rlm['total_return_pct']}% vs 买入持有 {bhm['total_return_pct']}%")
 
         # ---- 9.2.1h2 组合与仓位标签页（相关性分散化 + 凯利仓位；借鉴交易 skill） ----
         def _build_portfolio_tab(self) -> QWidget:

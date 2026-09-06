@@ -41,6 +41,7 @@
 - 实盘操作板块：实时监控(盘口+记录) ｜ **尾盘选股(五维筛选+历史有效性验证)** ｜ 批量扫描 ｜ 组合与仓位(1%风险计算器+金字塔建仓)
   ｜ **监管披露观察(大宗交易折溢率+大股东增减持+龙虎榜三项强制披露信号交叉验证)** ｜ **模拟交易(纸面模拟盘，按A股真实规则逐周期自动买卖)**
   ｜ **自选股票(持久多分组+批量真实预测+点行看真实特征数据集预览+跨分组收藏，SQLite落地watchlist/watchlist.db)**
+  ｜ **强化学习交易(DQN智能体学买/卖/持而非预测价格，独立测试段无泄漏，对比买入持有，实验性·需torch)**
 - 日志板块：运行日志 ｜ 操作日志
 
 模型下拉（策略回测/预测跟踪/未来预测）只列**本次训练成功**的模型，避免选到未训练模型。每个重操作都有醒目进程弹窗。
@@ -60,7 +61,9 @@
      + 模拟交易账户 `create/run_paper_account`（纸面模拟盘，A股真实规则逐周期自动买卖）
      + 自选股票 `watchlist_group_scan`（同 batch_scan 引擎，修正美股/北向开关不生效的问题）+ `get_stock_feature_preview`
        （真实特征列预览，非固定示例）+ SQLite 分组持久化 `list/create/rename/delete_watchlist_group` 等（`watchlist/watchlist.db`）
-- 九 GUI（`MainWindow`，18 页签）
+     + 强化学习 `rl_train_and_eval`（DQN 智能体：`RLTradingEnv` 环境 + `_DQNNet` Q网络 + 经验回放/目标网络/ε-greedy，
+       独立测试段无泄漏，对比买入持有；需 torch）
+- 九 GUI（`MainWindow`，19 页签）
 - 十~十一 可编程 API `run_experiment` + CLI/GUI 入口
 
 ## 快速开始
