@@ -4134,17 +4134,24 @@ def get_stock_feature_preview(code: str, start: str = "20200101", end: Optional[
         feature_cols = [c for c in df_ind.columns if c != "date"]   # 与 build_supervised_samples 默认推导一致
         close = df_ind["close"].values
         n = len(df_ind)
-        fwd_pct = [None] * n
+        # 输出目标：y1=未来 horizon 日涨跌方向(+1/-1)、y2=未来第 horizon 日真实收盘价。
+        # 都用"已经发生的"真实未来数据算(历史行才有)，最近 horizon 行未来还没到→留空，绝不瞎猜。
+        fwd_pct = [None] * n; y1_dir = [None] * n; y2_price = [None] * n
         for i in range(n - horizon):
-            fwd_pct[i] = round(float((close[i + horizon] / close[i] - 1.0) * 100.0), 3)
+            r = float(close[i + horizon] / close[i] - 1.0)
+            fwd_pct[i] = round(r * 100.0, 3)
+            y1_dir[i] = 1 if r > 0 else -1
+            y2_price[i] = round(float(close[i + horizon]), 3)
         tail_n = min(n_rows, n)
         preview_cols = ["date"] + feature_cols
         preview_df = df_ind[preview_cols].tail(tail_n).copy().reset_index(drop=True)
         preview_df["real_fwd_return_pct"] = fwd_pct[-tail_n:]
+        preview_df["y1_涨跌方向"] = y1_dir[-tail_n:]
+        preview_df["y2_真实股价"] = y2_price[-tail_n:]
         return {
             "code": code, "name": name, "feature_cols": feature_cols,
             "window_size": window_size, "n_total_rows": n, "enrich_status": enrich_status,
-            "preview_df": preview_df, "error": None,
+            "horizon": horizon, "preview_df": preview_df, "error": None,
         }
     except Exception as e:
         return {"code": code, "name": "", "error": str(e)}
@@ -9945,23 +9952,30 @@ if HAS_PYSIDE6:
             self.wl_feature_table.setColumnCount(len(cols))
             self.wl_feature_table.setHorizontalHeaderLabels(cols)
             self.wl_feature_table.setRowCount(len(df))
+            out_cols = {"real_fwd_return_pct", "y1_涨跌方向", "y2_真实股价"}
             for i in range(len(df)):
                 for c, col in enumerate(cols):
                     v = df.iloc[i][col]
-                    if col == "real_fwd_return_pct" and pd.isna(v):
-                        s = "(未来，未发生)"
+                    if col in out_cols and pd.isna(v):
+                        s = "(未来·未发生)"
+                    elif col == "y1_涨跌方向" and not pd.isna(v):
+                        s = "＋1 (涨)" if float(v) > 0 else "－1 (跌)"
                     elif isinstance(v, float):
                         s = f"{v:.3f}"
                     else:
                         s = str(v)
-                    self.wl_feature_table.setItem(i, c, QTableWidgetItem(s))
+                    it = QTableWidgetItem(s)
+                    if col == "y1_涨跌方向" and not pd.isna(v):    # 输出方向列：涨红跌绿
+                        it.setForeground(Qt.red if float(v) > 0 else QColor("#1f8f52"))
+                    self.wl_feature_table.setItem(i, c, it)
             self.wl_feature_table.resizeColumnsToContents()
             n_feat = len(preview.get("feature_cols", []))
+            hz = preview.get("horizon", 5)
             self.wl_feature_hint.setText(
-                f"「{preview.get('name','')}({preview.get('code','')})」真实特征共 {n_feat} 列"
-                f"(随财报估值/大盘/资金/美股/北向开关变化)，共 {preview.get('n_total_rows','?')} 行有效历史，"
-                f"下表是最近 {len(df)} 行。real_fwd_return_pct 是已经发生的真实前瞻收益(不是模型预测)；"
-                "最近几行显示「(未来，未发生)」是因为那段时间还没走完，不瞎猜。")
+                f"「{preview.get('name','')}({preview.get('code','')})」真实训练数据集：输入 X = {n_feat} 个真实特征"
+                f"(随财报估值/大盘/资金/美股/北向开关变化)；输出 y1=未来{hz}日涨跌方向(±1)、y2=未来第{hz}日真实股价。"
+                f"共 {preview.get('n_total_rows','?')} 行有效历史，下表最近 {len(df)} 行(与训练时喂给模型的完全一致)。"
+                "y1/y2 与 real_fwd_return_pct 都是已发生的真实结果(非模型预测)；最近几行「(未来·未发生)」是那段还没走完，不瞎猜。")
 
         def _on_wl_favorite_to_group(self):
             sel = self.wl_results_table.selectionModel()
