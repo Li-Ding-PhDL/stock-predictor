@@ -3714,6 +3714,10 @@ RISK_KEYWORDS = {
     "财务风险": ["亏损", "预亏", "商誉减值", "资不抵债", "债务逾期", "计提", "债务危机", "爆雷"],
     "股东/资金风险": ["减持", "质押", "爆仓", "冻结", "资金占用", "违规担保", "清仓"],
     "停牌": ["停牌", "停复牌"],
+    # 荐股/杀猪盘推广风险(借鉴 UZI-Skill trap-detector 的 8 类推广信号词表，MIT)：
+    # 真实新闻/资讯标题里出现这类"必涨/稳赚/老师带单/收费群"话术，是典型荐股诈骗/杀猪盘特征，命中即提醒回避。
+    "荐股/杀猪盘话术": ["必涨", "强烈推荐", "稳赚", "内部消息", "即将爆发", "主力建仓完毕", "目标翻倍",
+                        "老师带单", "跟单", "收费群", "VIP直播", "操盘手", "股神", "包赚", "内幕", "拉升出货"],
 }
 
 
@@ -4562,12 +4566,14 @@ def _school_features(code: str, start: str = "20200101", end: Optional[str] = No
     end = end or dt.date.today().strftime("%Y%m%d")
     f: Dict[str, Any] = {k: None for k in (
         "pe", "pb", "pe_x_pb", "pe_quantile_5y", "roe_latest", "roe_5y_above_15", "roe_5y_min",
-        "net_margin", "debt_ratio", "rev_growth_latest", "net_profit_growth_latest",
+        "net_margin", "debt_ratio", "rev_growth_latest", "net_profit_growth_latest", "eps_ocf",
         "volatility_1y", "ma_bull_aligned", "stage_num", "pct_from_60d_high", "rsi",
-        "ytd_return", "vol_ratio", "turnover_latest", "lhb_30d_count")}
+        "ytd_return", "vol_ratio", "turnover_latest", "lhb_30d_count", "last_close")}
     # ---- 行情派生的技术特征 ----
     df = StockDataFetcher().fetch(code, start, end)
     close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(close):
+        f["last_close"] = float(close.iloc[-1])
     if len(close) >= 60:
         ma5, ma10, ma20, ma60 = (close.rolling(w).mean() for w in (5, 10, 20, 60))
         f["ma_bull_aligned"] = bool(ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1] > ma60.iloc[-1])
@@ -4632,6 +4638,7 @@ def _school_features(code: str, start: str = "20200101", end: Optional[str] = No
                 f["debt_ratio"] = _num(_col("资产负债率"))
                 f["rev_growth_latest"] = _num(_col("主营业务收入增长率")) or _num(_col("营业收入增长率"))
                 f["net_profit_growth_latest"] = _num(_col("净利润增长率"))
+                f["eps_ocf"] = _num(_col("每股经营现金流"))     # 每股经营现金流(DCF 用作 FCF 近似)
                 # 多年 ROE：取该列最近至多 5 个非空读数
                 if roe_col is not None:
                     roe_hist = pd.to_numeric(fi[roe_col], errors="coerce").dropna().tail(5)
@@ -4734,14 +4741,50 @@ INVESTOR_SCHOOLS: List[Tuple[str, str, List[tuple]]] = [
 ]
 
 
+def _simple_dcf_per_share(fcf_ps: float, growth_5y: float = 0.08, growth_terminal: float = 0.03,
+                          wacc: float = 0.10, years: int = 10) -> Optional[float]:
+    """借鉴 UZI-Skill(MIT) 的 5+5 阶段简易 DCF，按**每股**口径算内在价值(直接用每股自由现金流，省去股本)。
+    fcf_ps ≤ 0 时 DCF 不适用返回 None。"""
+    if fcf_ps is None or fcf_ps <= 0 or wacc <= growth_terminal:
+        return None
+    fcfs = []; fcf = fcf_ps
+    for y in range(1, years + 1):
+        g = growth_5y if y <= 5 else (growth_5y + growth_terminal) / 2
+        fcf *= 1 + g; fcfs.append(fcf)
+    pv_fcfs = sum(fc / (1 + wacc) ** (i + 1) for i, fc in enumerate(fcfs))
+    tv = fcfs[-1] * (1 + growth_terminal) / (wacc - growth_terminal)
+    pv_tv = tv / (1 + wacc) ** years
+    return pv_fcfs + pv_tv
+
+
+def _dcf_block(f: Dict[str, Any]) -> Dict[str, Any]:
+    """用每股经营现金流(近似自由现金流)算 DCF 内在价值 vs 现价 + 安全边际。假设全部显式列出、只报数字不下结论。
+    数据缺省(无现金流/现金流为负/无现价)则标缺省，绝不编。"""
+    fcf_ps, price = f.get("eps_ocf"), f.get("last_close")
+    if fcf_ps is None or price is None:
+        return {"status": "skip", "msg": "数据缺省·跳过(缺每股经营现金流或现价)"}
+    # 成长假设：用营收增速做 5 年增速(限制在 3%~20% 之间，避免极端外推)，取不到用 8%
+    g = f.get("rev_growth_latest")
+    g5 = min(0.20, max(0.03, (g / 100.0))) if (g is not None) else 0.08
+    iv = _simple_dcf_per_share(fcf_ps, growth_5y=g5)
+    if iv is None:
+        return {"status": "skip", "msg": f"每股经营现金流 {fcf_ps:.2f} ≤ 0，DCF 不适用(不外推)"}
+    margin = (iv / price - 1) * 100
+    return {"status": "ok", "intrinsic": round(iv, 2), "price": round(price, 2),
+            "margin_pct": round(margin, 1), "fcf_ps": round(fcf_ps, 2), "g5": round(g5 * 100, 1),
+            "msg": (f"每股内在价值 ≈ {iv:.2f} 元 vs 现价 {price:.2f} 元，"
+                    f"{'低估' if margin>0 else '高估'} {abs(margin):.1f}%(安全边际)")}
+
+
 def evaluate_investor_schools(code: str, start: str = "20200101", end: Optional[str] = None,
                               progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
-    """对一只股票，用 6 大流派的客观法则套真实数据算通过/不通过。只陈述法则结果，非本人观点、不荐股。"""
+    """对一只股票，用 6 大流派的客观法则套真实数据算通过/不通过 + DCF 内在价值。只陈述客观结果，非本人观点、不荐股。"""
     log = progress_cb or (lambda m: None)
     try:
         log(f"[流派视角] {code} 采集真实特征 ...")
         name = StockDataFetcher.fetch_stock_name(code)
         f = _school_features(code, start, end)
+        dcf = _dcf_block(f)
         schools = []
         for sname, sdesc, rules in INVESTOR_SCHOOLS:
             items = []
@@ -4764,7 +4807,7 @@ def evaluate_investor_schools(code: str, start: str = "20200101", end: Optional[
             score = round(w_pass / w_eval * 100) if w_eval else None
             schools.append({"school": sname, "desc": sdesc, "items": items,
                             "n_pass": n_pass, "n_eval": n_eval, "n_skip": n_skip, "score": score})
-        return {"code": code, "name": name, "features": f, "schools": schools, "error": None}
+        return {"code": code, "name": name, "features": f, "schools": schools, "dcf": dcf, "error": None}
     except Exception as e:
         return {"code": code, "name": "", "error": str(e)}
 
@@ -10400,6 +10443,18 @@ if HAS_PYSIDE6:
             parts = [f"<h2 style='color:#2c6fbb'>{r['name']}（{r['code']}）· 投资流派视角</h2>",
                      "<p style='color:#c0392b;font-size:12px'>⚠ 以下是把各流派客观选股法则套真实数据算出的结果，"
                      "<b>不是该投资者本人观点、不构成买卖建议、不荐股</b>；「数据缺省·跳过」= 该规则要的数据取不到，不参与打分、也不算不通过。</p>"]
+            # DCF 内在价值(借鉴 UZI-Skill)
+            dcf = r.get("dcf") or {}
+            if dcf.get("status") == "ok":
+                mc = "#1a9d5a" if dcf["margin_pct"] > 0 else "#c0392b"
+                parts.append(
+                    f"<div style='background:#f7fbff;border:1px solid #b9d3ec;border-radius:6px;padding:8px 12px;margin:6px 0'>"
+                    f"<b>📐 DCF 内在价值(客观估值)</b>：{dcf['msg']}<br>"
+                    f"<span style='color:#888;font-size:12px'>假设：每股经营现金流 {dcf['fcf_ps']} 元(近似自由现金流·未扣资本开支·偏乐观)、"
+                    f"5 年增速 {dcf['g5']}%、永续 3%、贴现率 WACC 10%、5+5 阶段。"
+                    f"DCF 高度依赖假设，换假设结果差很多，仅供参考、不下结论、不荐股。</span></div>")
+            else:
+                parts.append(f"<div style='color:#888;font-size:12px;margin:6px 0'>📐 DCF 内在价值：{dcf.get('msg','数据缺省·跳过')}</div>")
             for s in r["schools"]:
                 sc = s["score"]
                 bar = (f"<span style='color:{'#1a9d5a' if (sc or 0)>=60 else ('#c0392b' if (sc or 0)<40 else '#b9720d')}'>"
