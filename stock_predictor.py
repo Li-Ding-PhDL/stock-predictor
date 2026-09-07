@@ -187,7 +187,7 @@ try:
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
         QFileDialog, QDialog, QProgressDialog, QSpinBox, QDoubleSpinBox, QHeaderView, QFrame,
-        QToolButton, QListWidget, QListWidgetItem, QInputDialog
+        QToolButton, QListWidget, QListWidgetItem, QInputDialog, QSizePolicy
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer, QEvent, QObject
     from PySide6.QtGui import QFont, QColor
@@ -7571,6 +7571,13 @@ if HAS_PYSIDE6:
             tabs_scroll.setWidget(self.tabs)
             right_layout.addWidget(tabs_scroll, stretch=1)
             main_layout.addWidget(right_panel, stretch=1)
+
+            # 让所有 matplotlib 画布能缩到面板大小：画布默认按 figsize×DPI 报一个较大的最小尺寸，
+            # 在上面那层可滚动标签区里会导致图(如K线)保持大尺寸被裁切、只露出一角。给每个画布一个很小的
+            # 最小尺寸 + Expanding 策略后，滚动区就把标签页缩到视口大小、图表随面板自适应铺满，不再被裁。
+            for _cv in self.findChildren(FigureCanvas):
+                _cv.setMinimumSize(120, 90)
+                _cv.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
             self._on_category_clicked(self._tab_categories[0][0])   # 默认展开第一个板块
 
