@@ -4638,7 +4638,14 @@ def _school_features(code: str, start: str = "20200101", end: Optional[str] = No
                 f["debt_ratio"] = _num(_col("资产负债率"))
                 f["rev_growth_latest"] = _num(_col("主营业务收入增长率")) or _num(_col("营业收入增长率"))
                 f["net_profit_growth_latest"] = _num(_col("净利润增长率"))
-                f["eps_ocf"] = _num(_col("每股经营现金流"))     # 每股经营现金流(DCF 用作 FCF 近似)
+                # 每股经营现金流(DCF 用作 FCF 近似)：列名兜底 + 取该列**最近一个非空值**
+                # (最后一期财报该单元格常为 NaN，死读最后一行会漏；改取整列最后一个有效读数)
+                ocf_col = (_col("每股经营现金流") or _col("每股经营性现金流")
+                           or _col("每股经营活动", "现金流") or _col("每股经营活动产生的现金流量净额"))
+                if ocf_col is not None:
+                    ocf_valid = pd.to_numeric(fi[ocf_col], errors="coerce").dropna()
+                    if len(ocf_valid):
+                        f["eps_ocf"] = float(ocf_valid.iloc[-1])
                 # 多年 ROE：取该列最近至多 5 个非空读数
                 if roe_col is not None:
                     roe_hist = pd.to_numeric(fi[roe_col], errors="coerce").dropna().tail(5)
