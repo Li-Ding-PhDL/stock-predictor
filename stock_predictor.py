@@ -4549,6 +4549,226 @@ def _rl_eval_positions(net, feat_norm: np.ndarray, close: np.ndarray,
     return pos_seq
 
 
+# ==================== 第八部分补充7：投资流派视角（借鉴 UZI-Skill 的可量化选股法则，MIT） ====================
+# 说明：借鉴 github.com/wbh604/UZI-Skill(MIT 许可) 里把各投资大佬"观点"拆成的可量化规则(格雷厄姆数、
+# 巴菲特质量筛、林奇 PEG、米内尔维尼 Stage2 等)。但严格按本项目"诚实优先"重做：
+#   · 只把规则套在**真实数据**上算，pass/fail 文案是**写死的模板**、填真实数字，绝不让 LLM 现编观点；
+#   · 算不到的特征(护城河/催化剂/分析师目标价等定性或 flaky 数据)对应规则**跳过·标"数据缺省"**，不当不通过；
+#   · 呈现为「XX 流派视角」= 客观法则算出的结果，**不是该投资者本人观点、不汇总成买卖结论、不荐股**。
+# --------------------------------------------------------------------------------
+def _school_features(code: str, start: str = "20200101", end: Optional[str] = None,
+                     use_lhb: bool = True) -> Dict[str, Any]:
+    """采集投资流派规则要用的真实特征(算不到的留 None，绝不编造)。"""
+    end = end or dt.date.today().strftime("%Y%m%d")
+    f: Dict[str, Any] = {k: None for k in (
+        "pe", "pb", "pe_x_pb", "pe_quantile_5y", "roe_latest", "roe_5y_above_15", "roe_5y_min",
+        "net_margin", "debt_ratio", "rev_growth_latest", "net_profit_growth_latest",
+        "volatility_1y", "ma_bull_aligned", "stage_num", "pct_from_60d_high", "rsi",
+        "ytd_return", "vol_ratio", "turnover_latest", "lhb_30d_count")}
+    # ---- 行情派生的技术特征 ----
+    df = StockDataFetcher().fetch(code, start, end)
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(close) >= 60:
+        ma5, ma10, ma20, ma60 = (close.rolling(w).mean() for w in (5, 10, 20, 60))
+        f["ma_bull_aligned"] = bool(ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1] > ma60.iloc[-1])
+        # Stage 2(米内尔维尼)近似：收盘 > MA20 > MA60 且 MA60 近20日上行
+        ma60_rising = ma60.iloc[-1] > ma60.iloc[-21] if len(ma60.dropna()) >= 21 else False
+        f["stage_num"] = 2 if (close.iloc[-1] > ma20.iloc[-1] > ma60.iloc[-1] and ma60_rising) else 1
+        f["pct_from_60d_high"] = float((close.iloc[-1] / close.tail(60).max() - 1) * 100)
+        rets = close.pct_change().dropna()
+        f["volatility_1y"] = float(rets.tail(252).std() * np.sqrt(252) * 100) if len(rets) >= 30 else None
+        delta = close.diff(); gain = delta.clip(lower=0).rolling(14).mean(); loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9); f["rsi"] = float((100 - 100 / (1 + rs)).iloc[-1])
+        yr = pd.to_datetime(df["date"]).dt.year
+        this_year = close[yr.values == yr.values[-1]]
+        if len(this_year) >= 2:
+            f["ytd_return"] = float((this_year.iloc[-1] / this_year.iloc[0] - 1) * 100)
+    if "turnover" in df.columns:
+        tv = pd.to_numeric(df["turnover"], errors="coerce").dropna()
+        if len(tv): f["turnover_latest"] = float(tv.iloc[-1])
+    if "volume" in df.columns:
+        vol = pd.to_numeric(df["volume"], errors="coerce").dropna()
+        if len(vol) >= 6:
+            f["vol_ratio"] = float(vol.iloc[-1] / (vol.tail(6).iloc[:-1].mean() + 1e-9))
+    # ---- 估值：PE/PB/PE×PB/PE5年分位 ----
+    if HAS_AKSHARE:
+        try:
+            v = StockDataFetcher._fetch_valuation(code)
+            if v is not None and len(v):
+                if "val_pe_ttm" in v.columns:
+                    pe_s = pd.to_numeric(v["val_pe_ttm"], errors="coerce").dropna()
+                    pe_s = pe_s[pe_s > 0]
+                    if len(pe_s):
+                        f["pe"] = float(pe_s.iloc[-1])
+                        f["pe_quantile_5y"] = int(round((pe_s.tail(1250) <= pe_s.iloc[-1]).mean() * 100))
+                if "val_pb" in v.columns:
+                    pb_s = pd.to_numeric(v["val_pb"], errors="coerce").dropna()
+                    pb_s = pb_s[pb_s > 0]
+                    if len(pb_s): f["pb"] = float(pb_s.iloc[-1])
+                if f["pe"] and f["pb"]:
+                    f["pe_x_pb"] = f["pe"] * f["pb"]
+        except Exception:
+            pass
+        # ---- 基本面：ROE(多年)/净利率/负债率/营收增速/净利增速 ----
+        try:
+            ctx = _no_proxy()
+            with ctx:
+                fi = StockDataFetcher._retry(lambda: ak.stock_financial_analysis_indicator(symbol=code), tries=2)
+            if fi is not None and len(fi):
+                fi = fi.sort_index()
+                row = fi.iloc[-1]
+                def _col(*kws):
+                    for c in fi.columns:
+                        if all(k in str(c) for k in kws):
+                            return c
+                    return None
+                def _num(col):
+                    if col is None: return None
+                    x = pd.to_numeric(row.get(col), errors="coerce")
+                    return None if (x is None or pd.isna(x)) else float(x)
+                roe_col = _col("净资产收益率", "加权") or _col("净资产收益率")
+                f["roe_latest"] = _num(roe_col)
+                f["net_margin"] = _num(_col("销售净利率")) or _num(_col("净利率"))
+                f["debt_ratio"] = _num(_col("资产负债率"))
+                f["rev_growth_latest"] = _num(_col("主营业务收入增长率")) or _num(_col("营业收入增长率"))
+                f["net_profit_growth_latest"] = _num(_col("净利润增长率"))
+                # 多年 ROE：取该列最近至多 5 个非空读数
+                if roe_col is not None:
+                    roe_hist = pd.to_numeric(fi[roe_col], errors="coerce").dropna().tail(5)
+                    if len(roe_hist):
+                        f["roe_5y_above_15"] = int((roe_hist > 15).sum())
+                        f["roe_5y_min"] = float(roe_hist.min())
+        except Exception:
+            pass
+        # ---- 龙虎榜近30天上榜次数 ----
+        if use_lhb:
+            try:
+                lhb = StockDataFetcher._fetch_dragon_tiger(code, max_dates=30)
+                if lhb is not None and len(lhb) and "lhb_count" in lhb.columns:
+                    f["lhb_30d_count"] = int(pd.to_numeric(lhb["lhb_count"], errors="coerce").fillna(0).sum())
+                else:
+                    f["lhb_30d_count"] = 0
+            except Exception:
+                f["lhb_30d_count"] = None
+    return f
+
+
+# 每条规则：(id, 名称, 权重, [依赖的特征键], 判定函数, 通过模板, 不通过模板)。依赖键有任一为 None → 跳过(数据缺省)。
+def _peg(f):
+    pe, g = f.get("pe"), f.get("rev_growth_latest")
+    return (pe / g) if (pe and g and g > 0) else None
+
+INVESTOR_SCHOOLS: List[Tuple[str, str, List[tuple]]] = [
+    ("价值派", "格雷厄姆 / 巴菲特 / 芒格 · 便宜 + 高质量", [
+        ("graham_2225", "格雷厄姆数 PE×PB < 22.5", 5, ["pe_x_pb"],
+         lambda f: f["pe_x_pb"] < 22.5, "PE×PB={pe_x_pb:.1f} < 22.5 ✓", "PE×PB={pe_x_pb:.1f} 超 22.5"),
+        ("pe15", "PE < 15", 3, ["pe"], lambda f: 0 < f["pe"] < 15, "PE {pe:.1f} < 15", "PE {pe:.1f} ≥ 15"),
+        ("pb15", "PB < 1.5", 3, ["pb"], lambda f: 0 < f["pb"] < 1.5, "PB {pb:.2f} < 1.5", "PB {pb:.2f} ≥ 1.5"),
+        ("roe15", "当前 ROE > 15%(巴菲特质量)", 4, ["roe_latest"],
+         lambda f: f["roe_latest"] > 15, "ROE {roe_latest:.1f}% > 15%", "ROE {roe_latest:.1f}% ≤ 15%"),
+        ("nm15", "净利率 > 15%", 3, ["net_margin"],
+         lambda f: f["net_margin"] > 15, "净利率 {net_margin:.1f}% > 15%", "净利率 {net_margin:.1f}% ≤ 15%"),
+        ("debt50", "资产负债率 < 50%", 3, ["debt_ratio"],
+         lambda f: 0 < f["debt_ratio"] < 50, "负债率 {debt_ratio:.0f}% < 50%", "负债率 {debt_ratio:.0f}% ≥ 50%"),
+        ("pe_q50", "PE 在 5 年中位数以下", 3, ["pe_quantile_5y"],
+         lambda f: f["pe_quantile_5y"] < 50, "PE 处 5 年 {pe_quantile_5y} 分位(便宜)", "PE 处 5 年 {pe_quantile_5y} 分位(不便宜)"),
+    ]),
+    ("中国价投", "段永平 / 张坤 · 高 ROE + 合理估值", [
+        ("good_biz", "生意对(净利率>15% 且 ROE>10%)", 5, ["net_margin", "roe_latest"],
+         lambda f: f["net_margin"] > 15 and f["roe_latest"] > 10, "净利率 {net_margin:.1f}% · ROE {roe_latest:.1f}%", "生意质量一般(净利率{net_margin:.1f}%/ROE{roe_latest:.1f}%)"),
+        ("good_price", "价格对(PE 分位 < 50)", 4, ["pe_quantile_5y"],
+         lambda f: f["pe_quantile_5y"] < 50, "PE 处 {pe_quantile_5y} 分位", "PE 处 {pe_quantile_5y} 分位偏贵"),
+        ("pe40", "PE < 40(段/张估值纪律)", 3, ["pe"],
+         lambda f: 0 < f["pe"] < 40, "PE {pe:.0f} 在舒适区", "PE {pe:.0f} ≥ 40 太贵"),
+        ("pricing_power", "定价权(净利率 > 18%)", 3, ["net_margin"],
+         lambda f: f["net_margin"] > 18, "净利率 {net_margin:.1f}% 有定价权", "净利率 {net_margin:.1f}% 定价权弱"),
+        ("roe_persist", "ROE 5 年 ≥3 次 > 15%", 4, ["roe_5y_above_15"],
+         lambda f: f["roe_5y_above_15"] >= 3, "5 年 {roe_5y_above_15}/5 次 ROE>15%", "5 年仅 {roe_5y_above_15}/5 次 ROE>15%"),
+    ]),
+    ("成长派", "林奇 / 欧奈尔 · PEG + 高增速 + 新高", [
+        ("peg1", "PEG < 1(林奇理想)", 5, ["pe", "rev_growth_latest"],
+         lambda f: (_peg(f) is not None and 0 < _peg(f) < 1), "PEG≈{_peg:.2f} < 1", "PEG≈{_peg:.2f} 未达理想"),
+        ("pe40g", "PE < 40(林奇警戒)", 3, ["pe"],
+         lambda f: 0 < f["pe"] < 40, "PE {pe:.0f} 在舒适区", "PE {pe:.0f} ≥ 40 警戒"),
+        ("fast_grower", "营收增速 20-50%(fast grower)", 3, ["rev_growth_latest"],
+         lambda f: 20 < f["rev_growth_latest"] < 50, "营收增速 {rev_growth_latest:.0f}%", "增速 {rev_growth_latest:.0f}% 不在 20-50%"),
+        ("eps25", "净利增速 > 25%(欧奈尔 C)", 3, ["net_profit_growth_latest"],
+         lambda f: f["net_profit_growth_latest"] > 25, "净利增速 {net_profit_growth_latest:.0f}%", "净利增速 {net_profit_growth_latest:.0f}% < 25%"),
+        ("near_high10", "距 60 日高点 < 10%(欧奈尔 N)", 2, ["pct_from_60d_high"],
+         lambda f: f["pct_from_60d_high"] > -10, "距 60 日高 {pct_from_60d_high:.1f}%", "距 60 日高 {pct_from_60d_high:.1f}% 偏远"),
+    ]),
+    ("技术趋势", "米内尔维尼 / 欧奈尔 · Stage2 + 均线多头", [
+        ("stage2", "严格 Stage 2(SEPA 核心)", 5, ["stage_num"],
+         lambda f: f["stage_num"] == 2, "处 Stage 2 上升", "不在 Stage 2"),
+        ("ma_stack", "均线多头堆叠", 4, ["ma_bull_aligned"],
+         lambda f: f["ma_bull_aligned"], "MA5>10>20>60 多头", "均线未多头堆叠"),
+        ("near_high25", "距 60 日高点 < 25%", 3, ["pct_from_60d_high"],
+         lambda f: f["pct_from_60d_high"] > -25, "距高点 {pct_from_60d_high:.0f}%", "距高点 {pct_from_60d_high:.0f}% 过远"),
+        ("ytd_pos", "YTD 相对强度 > 0", 2, ["ytd_return"],
+         lambda f: f["ytd_return"] > 0, "YTD {ytd_return:+.0f}%", "YTD {ytd_return:+.0f}% 弱"),
+        ("rsi80", "RSI 未严重超买(< 80)", 2, ["rsi"],
+         lambda f: f["rsi"] < 80, "RSI {rsi:.0f}", "RSI {rsi:.0f} 严重超买"),
+    ]),
+    ("游资博弈", "赵老哥等 · 龙虎榜 + 量能 + 趋势(客观信号)", [
+        ("stage2_y", "Stage 2 上升中", 3, ["stage_num"],
+         lambda f: f["stage_num"] == 2, "Stage 2 上升", "不在 Stage 2"),
+        ("lhb_hot", "近 30 天龙虎榜有热度", 3, ["lhb_30d_count"],
+         lambda f: f["lhb_30d_count"] >= 1, "30 天上榜 {lhb_30d_count} 次", "近 30 天未上榜"),
+        ("vol_amp", "量能放大(量比 > 1.5)", 2, ["vol_ratio"],
+         lambda f: f["vol_ratio"] > 1.5, "量比 {vol_ratio:.2f} 放大", "量比 {vol_ratio:.2f} 未放大"),
+        ("turnover_active", "换手活跃(> 3%)", 2, ["turnover_latest"],
+         lambda f: f["turnover_latest"] > 3, "换手 {turnover_latest:.1f}%", "换手 {turnover_latest:.1f}% 清淡"),
+    ]),
+    ("量化派", "西蒙斯 / 索普 / 大卫·肖 · 多因子", [
+        ("stat_edge", "统计信号(近 1 年正收益)", 3, ["ytd_return"],
+         lambda f: f["ytd_return"] > 0, "YTD {ytd_return:+.0f}%", "YTD {ytd_return:+.0f}% 负"),
+        ("vol_tradeable", "波动率可交易(20-80%)", 2, ["volatility_1y"],
+         lambda f: 20 < f["volatility_1y"] < 80, "年化波动 {volatility_1y:.0f}%", "波动 {volatility_1y:.0f}% 不适合"),
+        ("quality_f", "质量因子(ROE > 12%)", 3, ["roe_latest"],
+         lambda f: f["roe_latest"] > 12, "ROE {roe_latest:.1f}% 质量好", "ROE {roe_latest:.1f}% 质量弱"),
+        ("value_f", "价值因子(PE 分位 < 60)", 2, ["pe_quantile_5y"],
+         lambda f: f["pe_quantile_5y"] < 60, "PE 分位 {pe_quantile_5y}", "PE 分位 {pe_quantile_5y} 偏贵"),
+        ("momentum_f", "动量因子(Stage 2)", 2, ["stage_num"],
+         lambda f: f["stage_num"] == 2, "Stage 2 动量", "动量不足"),
+    ]),
+]
+
+
+def evaluate_investor_schools(code: str, start: str = "20200101", end: Optional[str] = None,
+                              progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """对一只股票，用 6 大流派的客观法则套真实数据算通过/不通过。只陈述法则结果，非本人观点、不荐股。"""
+    log = progress_cb or (lambda m: None)
+    try:
+        log(f"[流派视角] {code} 采集真实特征 ...")
+        name = StockDataFetcher.fetch_stock_name(code)
+        f = _school_features(code, start, end)
+        schools = []
+        for sname, sdesc, rules in INVESTOR_SCHOOLS:
+            items = []
+            n_pass = n_eval = n_skip = 0; w_pass = w_eval = 0
+            for rid, rname, w, req, ok, pmsg, fmsg in rules:
+                fmt = dict(f); fmt["_peg"] = _peg(f)
+                if any(f.get(k) is None for k in req):
+                    items.append({"name": rname, "status": "skip", "msg": "数据缺省·跳过", "weight": w}); n_skip += 1; continue
+                try:
+                    passed = bool(ok(f))
+                except Exception:
+                    items.append({"name": rname, "status": "skip", "msg": "数据缺省·跳过", "weight": w}); n_skip += 1; continue
+                try:
+                    msg = (pmsg if passed else fmsg).format(**fmt)
+                except Exception:
+                    msg = rname
+                items.append({"name": rname, "status": "pass" if passed else "fail", "msg": msg, "weight": w})
+                n_eval += 1; w_eval += w
+                if passed: n_pass += 1; w_pass += w
+            score = round(w_pass / w_eval * 100) if w_eval else None
+            schools.append({"school": sname, "desc": sdesc, "items": items,
+                            "n_pass": n_pass, "n_eval": n_eval, "n_skip": n_skip, "score": score})
+        return {"code": code, "name": name, "features": f, "schools": schools, "error": None}
+    except Exception as e:
+        return {"code": code, "name": "", "error": str(e)}
+
+
 def batch_factor_scan(codes: List[str], start: str = "20200101", end: Optional[str] = None,
                       w_value: float = 1.0, w_momentum: float = 1.0, w_money: float = 1.0,
                       w_quality: float = 1.0, w_lowvol: float = 1.0, w_tech: float = 1.0,
@@ -7212,6 +7432,24 @@ if HAS_PYSIDE6:
             except Exception as e:
                 self.error_signal.emit(str(e))
 
+    class SchoolWorker(QThread):
+        """投资流派视角后台线程：采集真实特征→按 6 大流派客观法则算通过/不通过。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, code, start, end):
+            super().__init__()
+            self.code = code; self.d_start = start; self.d_end = end
+
+        def run(self):
+            try:
+                r = evaluate_investor_schools(self.code, self.d_start, self.d_end,
+                                              progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
     class FactorWorker(QThread):
         """批量因子打分选股后台线程。"""
         progress_signal = Signal(str)
@@ -7531,6 +7769,8 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_watchlist_tab(), "自选股票")
             # 强化学习交易：DQN 智能体学"买/卖/持"而非预测价格，独立测试段对比买入持有基准
             self.tabs.addTab(self._build_rl_tab(), "强化学习交易")
+            # 投资流派视角：借鉴 UZI-Skill(MIT) 的可量化选股法则，套真实数据算各流派通过/不通过
+            self.tabs.addTab(self._build_school_tab(), "投资流派视角")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
@@ -7543,7 +7783,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "组合与仓位"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -10104,6 +10344,81 @@ if HAS_PYSIDE6:
             head = "✓ RL 跑赢买入持有" if win else "✗ RL 没跑赢买入持有"
             self.rl_verdict.setText(f"<b>{head}</b>（RL {rlm['total_return_pct']}% vs 买入持有 {bhm['total_return_pct']}%）。{r['note']}")
             self._oplog(f"强化学习完成：RL {rlm['total_return_pct']}% vs 买入持有 {bhm['total_return_pct']}%")
+
+        # ---- 9.2.1g4 投资流派视角标签页：客观法则套真实数据，非本人观点、不荐股 ----
+        def _build_school_tab(self) -> QWidget:
+            panel = QWidget(); layout = QVBoxLayout(panel)
+            intro = QLabel("💡 投资流派视角：借鉴 UZI-Skill(MIT) 把各投资大佬的选股法则拆成可量化规则，"
+                           "套在<b>真实数据</b>上算这只股票从各流派角度看过不过关。<b>⚠ 这是「法则视角」算出的客观结果，"
+                           "不是该投资者本人观点、不汇总成买卖结论、不荐股</b>；算不到的规则标「数据缺省·跳过」，绝不编造。")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#c0392b;background:#fbf3f2;padding:7px;border-radius:5px;")
+            layout.addWidget(intro)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("股票代码:"))
+            self.school_code = QLineEdit("600519"); self.school_code.setMaximumWidth(140)
+            top.addWidget(self.school_code)
+            self.school_run_btn = QPushButton("▶ 生成流派视角")
+            self.school_run_btn.setStyleSheet("font-weight:bold;padding:6px 16px;background:#2c6fbb;color:white;border-radius:4px;")
+            self.school_run_btn.clicked.connect(self._on_school_run)
+            top.addWidget(self.school_run_btn)
+            top.addStretch(1)
+            layout.addLayout(top)
+            self.school_status = QLabel(""); self.school_status.setStyleSheet("color:#666;")
+            layout.addWidget(self.school_status)
+            self.school_view = QTextBrowser(); self.school_view.setOpenExternalLinks(True)
+            layout.addWidget(self.school_view, stretch=1)
+            return panel
+
+        def _on_school_run(self):
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "流派视角需真实数据，请把数据源切换为「真实数据」。"); return
+            code = self.school_code.text().strip()
+            if not code:
+                QMessageBox.warning(self, "提示", "请先填写股票代码。"); return
+            start = self.start_date.date().toString("yyyyMMdd")
+            end = self.end_date.date().toString("yyyyMMdd")
+            self.school_run_btn.setEnabled(False); self.school_run_btn.setText("计算中...")
+            self.school_status.setText("⏳ 正在采集真实特征并按各流派法则打分 ...")
+            self._prog_open("⏳ 投资流派视角：采集真实数据+套法则计算 ……")
+            self.school_worker = SchoolWorker(code, start, end)
+            self.school_worker.progress_signal.connect(self._log)
+            self.school_worker.progress_signal.connect(self.school_status.setText)
+            self.school_worker.finished_signal.connect(self._on_school_finished)
+            self.school_worker.error_signal.connect(lambda m: (self._prog_close(),
+                QMessageBox.critical(self, "流派视角出错", m), self._school_reset_btn()))
+            self.school_worker.start()
+
+        def _school_reset_btn(self):
+            self.school_run_btn.setEnabled(True); self.school_run_btn.setText("▶ 生成流派视角")
+
+        def _on_school_finished(self, r: dict):
+            self._prog_close(); self._school_reset_btn()
+            if r.get("error"):
+                self.school_status.setText(f"失败：{r['error']}")
+                QMessageBox.warning(self, "无法生成", r["error"]); return
+            self.school_status.setText(f"完成：{r['name']}({r['code']}) · 6 大流派法则视角（真实数据）")
+            parts = [f"<h2 style='color:#2c6fbb'>{r['name']}（{r['code']}）· 投资流派视角</h2>",
+                     "<p style='color:#c0392b;font-size:12px'>⚠ 以下是把各流派客观选股法则套真实数据算出的结果，"
+                     "<b>不是该投资者本人观点、不构成买卖建议、不荐股</b>；「数据缺省·跳过」= 该规则要的数据取不到，不参与打分、也不算不通过。</p>"]
+            for s in r["schools"]:
+                sc = s["score"]
+                bar = (f"<span style='color:{'#1a9d5a' if (sc or 0)>=60 else ('#c0392b' if (sc or 0)<40 else '#b9720d')}'>"
+                       f"通过率 {sc}%（{s['n_pass']}/{s['n_eval']} 条）</span>" if sc is not None else "<span style='color:#888'>数据不足</span>")
+                parts.append(f"<h3 style='margin:10px 0 4px'>{s['school']} <span style='font-size:12px;color:#888'>· {s['desc']}</span>　{bar}"
+                             + (f"　<span style='color:#888;font-size:12px'>({s['n_skip']} 条数据缺省)</span>" if s['n_skip'] else "") + "</h3>")
+                lis = []
+                for it in s["items"]:
+                    if it["status"] == "pass":
+                        lis.append(f"<li><span style='color:#1a9d5a'>✓</span> <b>{it['name']}</b>：{it['msg']}</li>")
+                    elif it["status"] == "fail":
+                        lis.append(f"<li><span style='color:#c0392b'>✗</span> {it['name']}：{it['msg']}</li>")
+                    else:
+                        lis.append(f"<li><span style='color:#bbb'>—</span> <span style='color:#999'>{it['name']}：{it['msg']}</span></li>")
+                parts.append("<ul style='margin:2px 0 6px'>" + "".join(lis) + "</ul>")
+            parts.append("<hr><p style='color:#888;font-size:12px'>法则借鉴 UZI-Skill(github.com/wbh604/UZI-Skill, MIT)，"
+                         "阈值为各流派公开的选股原则；本页只做客观计算，不神化、不保证有效。</p>")
+            self.school_view.setHtml("".join(parts))
+            self._oplog(f"投资流派视角完成：{r['code']}")
 
         # ---- 9.2.1h2 组合与仓位标签页（相关性分散化 + 凯利仓位；借鉴交易 skill） ----
         def _build_portfolio_tab(self) -> QWidget:
