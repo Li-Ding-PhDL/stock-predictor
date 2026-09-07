@@ -7561,20 +7561,14 @@ if HAS_PYSIDE6:
             right_layout = QVBoxLayout(right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.addWidget(nav)
-            # 用 QScrollArea 包住标签页区域(跟左侧配置区 line 7141 同一招)：Qt 的 QTabWidget 默认按
-            # "全部标签页里最宽/最高的那一个"算自己的最小尺寸，哪怕当前只显示其中一个标签页——
-            # 某个标签页内容一多(尤其在系统显示缩放125%/150%下，控件整体被放大)，就会把整个主窗口
-            # 撑得比屏幕还大、还缩不小。包一层可滚动区域后，最小尺寸不再传导到主窗口，
-            # 真正需要更多空间的那一个标签页自己出滚动条，不连累窗口本身。
-            tabs_scroll = QScrollArea()
-            tabs_scroll.setWidgetResizable(True)
-            tabs_scroll.setWidget(self.tabs)
-            right_layout.addWidget(tabs_scroll, stretch=1)
+            # 标签页直接放进布局(不再套 QScrollArea)：之前套滚动区是为了修"窗口过大/缩不小"，但那会让
+            # matplotlib 画布保持大尺寸被裁切(K线只露一角)。真正的病根是 QTabWidget 按"最大页"算最小尺寸、
+            # 而画布默认按 figsize×DPI 报一个很大的最小尺寸把窗口撑大。改为直接给每个画布设很小的最小尺寸 +
+            # Expanding 策略(见下)，标签页的最小尺寸随之变小、窗口就能缩小，同时画布随面板自适应铺满、不被裁。
+            right_layout.addWidget(self.tabs, stretch=1)
             main_layout.addWidget(right_panel, stretch=1)
 
-            # 让所有 matplotlib 画布能缩到面板大小：画布默认按 figsize×DPI 报一个较大的最小尺寸，
-            # 在上面那层可滚动标签区里会导致图(如K线)保持大尺寸被裁切、只露出一角。给每个画布一个很小的
-            # 最小尺寸 + Expanding 策略后，滚动区就把标签页缩到视口大小、图表随面板自适应铺满，不再被裁。
+            # 所有 matplotlib 画布：很小的最小尺寸 + Expanding，既不把窗口撑大、又能随面板铺满自适应。
             for _cv in self.findChildren(FigureCanvas):
                 _cv.setMinimumSize(120, 90)
                 _cv.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
