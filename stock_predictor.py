@@ -7807,12 +7807,12 @@ if HAS_PYSIDE6:
         error_signal = Signal(str)
 
         def __init__(self, codes, algos, split_date, hpo_method, hpo_trials, anchor_stride, freeze,
-                     arima_features=False):
+                     arima_features=False, market_features=False):
             super().__init__()
             self.codes = codes; self.algos = algos; self.split_date = split_date
             self.hpo_method = hpo_method; self.hpo_trials = hpo_trials
             self.anchor_stride = anchor_stride; self.freeze = freeze
-            self.arima_features = arima_features
+            self.arima_features = arima_features; self.market_features = market_features
 
         def run(self):
             try:
@@ -7820,7 +7820,7 @@ if HAS_PYSIDE6:
                     codes=self.codes, algos=self.algos, split_date=self.split_date,
                     hpo_method=self.hpo_method, hpo_trials=self.hpo_trials,
                     anchor_stride=self.anchor_stride, freeze=self.freeze,
-                    arima_features=self.arima_features,
+                    arima_features=self.arima_features, market_features=self.market_features,
                     progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(summary)
             except Exception as e:
@@ -10172,9 +10172,12 @@ if HAS_PYSIDE6:
             self.gm_algos_edit = QLineEdit("SVR,GPR,Lasso,PLSR,ELM")
             self.gm_algos_edit.setToolTip("参与全局池化的模型；ARIMA 自动附带『逐股基线』，不入全局冻结")
             g.addWidget(self.gm_algos_edit, 2, 1, 1, 3)
-            self.gm_arima_chk = QCheckBox("ARIMA残差混合特征(B)")
+            self.gm_arima_chk = QCheckBox("ARIMA残差混合特征")
             self.gm_arima_chk.setToolTip("借鉴 AttCLX：ARIMA 拟合线性成分，把因果的『预测收益/标准化残差』作为额外输入特征(需 statsmodels)")
-            g.addWidget(self.gm_arima_chk, 2, 4, 1, 2)
+            g.addWidget(self.gm_arima_chk, 2, 4)
+            self.gm_market_chk = QCheckBox("大盘环境特征")
+            self.gm_market_chk.setToolTip("同日全池平均涨跌/动量作大盘 regime 代理(离线、因果)")
+            g.addWidget(self.gm_market_chk, 2, 5)
             layout.addWidget(box)
 
             # ── 按钮区 ──
@@ -10321,7 +10324,8 @@ if HAS_PYSIDE6:
             self._gm_train_worker = GlobalTrainWorker(
                 codes, algos, self.gm_split_edit.text().strip(), self.gm_hpo_combo.currentText(),
                 self.config_hpo_trials() if hasattr(self, "config_hpo_trials") else 15,
-                self.gm_stride_spin.value(), True, arima_features=self.gm_arima_chk.isChecked())
+                self.gm_stride_spin.value(), True, arima_features=self.gm_arima_chk.isChecked(),
+                market_features=self.gm_market_chk.isChecked())
             self._gm_train_worker.progress_signal.connect(self._gm_logmsg)
             self._gm_train_worker.finished_signal.connect(self._on_gm_train_done)
             self._gm_train_worker.error_signal.connect(lambda e: (self._gm_logmsg("失败: " + e), self.gm_train_btn.setEnabled(True)))
@@ -13411,7 +13415,8 @@ POOL_FEATURE_ALGOS: List[str] = ["SVR", "GPR", "Lasso", "PLSR", "ELM"]
 # 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
 MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
                               "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm",
-                              "vol20", "mom20", "rsi14", "dist_ma60", "dist_ma250", "dist_hi120"]
+                              "vol20", "mom20", "mom60", "rsi14", "dist_ma60", "dist_ma250",
+                              "dist_hi120", "dist_lo120", "macd_hist", "boll_pos", "price_tier"]
 # 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
 MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
 # B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
@@ -13448,6 +13453,15 @@ def _arima_causal_features(close: np.ndarray, split_idx: int, order=(2, 1, 0)):
     except Exception:
         pass
     return pred_ret, resid_z
+
+
+# 序列/深度模型需要窗口化的 3D 输入(window_size×features)，与本模块"扁平特征×多目标"设计不匹配，故排除。
+_NON_TABULAR_ALGOS = {"LSTM", "GRU", "Transformer", "CNN", "DNN", "ResNet", "BPNet", "TabNet", "ARIMA"}
+
+
+def _all_tabular_algos() -> List[str]:
+    """全部可用的『表格类』回归模型(用于 --global-algos all)：排除序列/深度模型与 ARIMA，且依赖已安装。"""
+    return [k for k in ALGO_REGISTRY if k not in _NON_TABULAR_ALGOS and ALGO_AVAILABILITY.get(k, True)]
 
 
 def _scan_all_local_codes(root: Optional[str] = None, adjust: str = "qfq") -> List[str]:
@@ -13494,6 +13508,15 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     df["dist_ma60"] = (cl / df["ma60"] - 1) * 100 if "ma60" in df.columns else np.nan     # 离60日线偏离%
     df["dist_ma250"] = (cl / df["ma250"] - 1) * 100 if "ma250" in df.columns else np.nan  # 离250日线偏离%
     df["dist_hi120"] = (cl / cl.rolling(120).max() - 1) * 100                             # 离120日高点距离%(≤0)
+    df["dist_lo120"] = (cl / cl.rolling(120).min() - 1) * 100                             # 离120日低点距离%(≥0)
+    df["mom60"] = (cl / cl.shift(60) - 1) * 100                                           # 60日动量%
+    # MACD 柱(用收盘 EMA12-EMA26 - signal9)，除以收盘做尺度无关
+    ema12 = cl.ewm(span=12, adjust=False).mean(); ema26 = cl.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26; signal = macd.ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = (macd - signal) / (cl + 1e-9) * 100
+    # 布林带位置：(收盘 − 20日均) / (2×20日标准差)，落在 [-1,1] 内表示带内位置
+    std20 = cl.rolling(20).std()
+    df["boll_pos"] = (cl - cl.rolling(20).mean()) / (2 * std20 + 1e-9)
     return df, is_delisted
 
 
@@ -13555,8 +13578,12 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 "ma20_dev": (float(c0) / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
                 "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
                 "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
-                "vol20": r.get("vol20"), "mom20": r.get("mom20"), "rsi14": r.get("rsi14"),
-                "dist_ma60": r.get("dist_ma60"), "dist_ma250": r.get("dist_ma250"), "dist_hi120": r.get("dist_hi120"),
+                "vol20": r.get("vol20"), "mom20": r.get("mom20"), "mom60": r.get("mom60"),
+                "rsi14": r.get("rsi14"), "dist_ma60": r.get("dist_ma60"), "dist_ma250": r.get("dist_ma250"),
+                "dist_hi120": r.get("dist_hi120"), "dist_lo120": r.get("dist_lo120"),
+                "macd_hist": r.get("macd_hist"), "boll_pos": r.get("boll_pos"),
+                # 价格档位(股价区间 regime)：1-3/3-6/6-9/9-11/11-20/20-50/50+ → 1..7；树模型可据此在不同价位学不同规律
+                "price_tier": int(np.searchsorted([3, 6, 9, 11, 20, 50], float(c0)) + 1),
             }
             for h in horizons:
                 win = close[i + 1: i + h + 1]
@@ -13904,6 +13931,125 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
             "disclaimer": "研究性回测，非投资建议、盈亏自负。"}
 
 
+def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int = 21,
+                                split_date: str = "2024-01-01", start: str = "20150101",
+                                end: Optional[str] = None, algo: str = "ExtraTrees",
+                                root: Optional[str] = None, out_png: Optional[str] = None,
+                                progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """『主力思维』选股排序：用公开历史数据给一篮子股票按**未来相对强弱**(超额=个股−同日中位)打分排序，
+    并**样本外回测**"买打分最高的一档、避最低一档"到底有没有用(多空价差 + 累计净值 + RankIC)。
+    诚实口径：基准恒 50%/市场等权；非投资建议、盈亏自负；数据非实时(取决于本地数据集截止日)。"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or GLOBAL_SUBSET_CODES
+    root = root or StockDataFetcher._resolve_local_root()
+    log(f"① 构建横截面数据集(期限 {horizon} 交易日) ...")
+    ds = build_multi_horizon_dataset(codes, [horizon], start, end, root, drop_delisted=True,
+                                     anchor_stride=1, progress_cb=progress_cb)
+    ds = ds.dropna(subset=MH_FEATURE_COLS + ["y4_mean_pct"]).reset_index(drop=True)
+    g = ds.groupby("date")["y4_mean_pct"]
+    ds["xs_med"] = g.transform("median"); ds["xs_cnt"] = g.transform("count")
+    ds = ds[ds["xs_cnt"] >= 5].reset_index(drop=True)
+    if len(ds) == 0:
+        raise RuntimeError("横截面为空(同日同池股票不足5只)，请多给些股票。")
+    ds["y_excess"] = ds["y4_mean_pct"] - ds["xs_med"]
+    xr = ["mom20", "rsi14", "dist_hi120", "ret_10d", "vol20", "mom60"]
+    for f in xr:
+        if f in ds.columns:
+            ds[f + "_xr"] = ds.groupby("date")[f].rank(pct=True)
+    feat = MH_FEATURE_COLS + [f + "_xr" for f in xr if (f + "_xr") in ds.columns]
+    ds = ds.dropna(subset=feat + ["y_excess"]).reset_index(drop=True)
+
+    split = pd.to_datetime(split_date)
+    tr, te = ds[ds["date"] < split], ds[ds["date"] >= split]
+    if len(tr) == 0 or len(te) == 0:
+        raise RuntimeError(f"切分后训练/测试为空({len(tr)}/{len(te)})。")
+    scaler = StandardScaler().fit(tr[feat].values.astype(float))
+    if algo not in ALGO_REGISTRY or not ALGO_AVAILABILITY.get(algo, True):
+        algo = "ExtraTrees" if ALGO_AVAILABILITY.get("ExtraTrees", True) else "RF"
+    log(f"② 训练排序模型 [{algo}]（目标=未来{horizon}日相对强弱超额）...")
+    model = ALGO_REGISTRY[algo]()
+    model.fit(scaler.transform(tr[feat].values.astype(float)), tr["y_excess"].values.astype(float))
+
+    # ③ 样本外回测：非重叠调仓(每 horizon 天一次)，买打分前1/3、避后1/3；对比市场等权
+    te = te.assign(_pred=model.predict(scaler.transform(te[feat].values.astype(float))))
+    udates = sorted(te["date"].unique())
+    rebal = udates[::max(1, horizon)]
+    cum_top, cum_mkt, dts, ics, spreads = [1.0], [1.0], [], [], []
+    for d in rebal:
+        grp = te[te["date"] == d]
+        if len(grp) < 6:
+            continue
+        k = max(1, len(grp) // 3)
+        top = grp.nlargest(k, "_pred"); bot = grp.nsmallest(k, "_pred")
+        topr = float(top["y4_mean_pct"].mean()) / 100.0
+        botr = float(bot["y4_mean_pct"].mean()) / 100.0
+        mktr = float(grp["y4_mean_pct"].mean()) / 100.0
+        cum_top.append(cum_top[-1] * (1 + topr))
+        cum_mkt.append(cum_mkt[-1] * (1 + mktr))
+        dts.append(pd.Timestamp(d)); spreads.append((topr - botr) * 100)
+        ic = grp["_pred"].corr(grp["y_excess"], method="spearman")
+        if pd.notna(ic):
+            ics.append(ic)
+    rank_ic = float(np.mean(ics)) if ics else float("nan")
+    ls_spread = float(np.mean(spreads)) if spreads else float("nan")
+
+    # ④ 最新一期打分排名(以数据集最后一个交易日的横截面)
+    last_d = ds["date"].max()
+    latest = ds[ds["date"] == last_d].copy()
+    latest["score"] = model.predict(scaler.transform(latest[feat].values.astype(float)))
+    latest = latest.sort_values("score", ascending=False)
+    n = len(latest); k = max(1, n // 3)
+    ranked = []
+    for i, (_, r) in enumerate(latest.iterrows()):
+        tag = "建议关注(前1/3)" if i < k else ("回避(后1/3)" if i >= n - k else "中性")
+        ranked.append({"rank": i + 1, "code": r["code"], "name": r.get("name", ""),
+                       "score": round(float(r["score"]), 4), "tag": tag})
+
+    if out_png:
+        _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
+                            horizon, algo, str(last_d.date()), out_png)
+        log(f"图已保存: {out_png}")
+    return {"algo": algo, "horizon": horizon, "as_of": str(last_d.date()),
+            "rank_ic": round(rank_ic, 4), "ls_spread_pct": round(ls_spread, 3),
+            "n_rebalance": len(dts), "ranked": ranked, "out_png": out_png,
+            "disclaimer": "用公开历史数据的相对强弱打分，样本外回测；非投资建议、盈亏自负；数据非实时。"}
+
+
+def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
+                        horizon, algo, as_of, out_png):
+    """两栏图：左=最新打分排名条形(前1/3绿/后1/3红)；右=样本外『买最强一档 vs 市场等权』累计净值。"""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    fig = Figure(figsize=(13.5, 6.2)); FigureCanvasAgg(fig)
+    ax1 = fig.add_subplot(1, 2, 1); ax2 = fig.add_subplot(1, 2, 2)
+    lt = latest.sort_values("score")
+    n = len(lt); k = max(1, n // 3)
+    colors = []
+    for i in range(n):
+        # 排序后：末尾是高分(前1/3)绿，开头是低分(后1/3)红
+        if i >= n - k: colors.append("#1a9d5a")
+        elif i < k: colors.append("#c0392b")
+        else: colors.append("#95a5a6")
+    labels = [f"{r['code']} {str(r.get('name',''))[:4]}" for _, r in lt.iterrows()]
+    ax1.barh(range(n), lt["score"].values, color=colors)
+    ax1.set_yticks(range(n)); ax1.set_yticklabels(labels, fontsize=7)
+    ax1.axvline(0, color="#333", lw=0.8)
+    ax1.set_title(f"最新相对强弱打分排名（{as_of}，{algo}，未来{horizon}日）\n绿=建议关注前1/3  红=回避后1/3", fontsize=10)
+    ax1.set_xlabel("相对强弱得分(预测超额，越大越强)")
+    if dts:
+        ax2.plot(dts, cum_mkt[1:], label="市场等权(全买)", color="#7f8c8d", lw=1.8)
+        ax2.plot(dts, cum_top[1:], label="只买打分最强一档", color="#1a9d5a", lw=2.0)
+        ax2.legend(fontsize=9); ax2.grid(alpha=0.25)
+        ax2.set_title(f"样本外回测：非重叠调仓\nRankIC={rank_ic:.3f}  多空价差均值={ls_spread:.2f}%/期", fontsize=10)
+        ax2.set_ylabel("累计净值(起点=1)")
+    else:
+        ax2.text(0.5, 0.5, "测试期调仓点不足，无法回测", ha="center", va="center")
+    fig.suptitle("『主力思维』选股排序 · 用公开历史数据做相对强弱 · 研究用途非投资建议、盈亏自负",
+                 fontsize=11, color="#c0392b")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+
+
 def list_frozen_models(out_dir: str = FROZEN_DIR) -> List[Dict[str, Any]]:
     """列出已冻结的全局模型(文件名 + 元信息)。"""
     items = []
@@ -14124,6 +14270,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="用本地数据集对『一批股票』做多期限×多目标全局池化训练，并冻结模型(不必每次重训)")
     p.add_argument("--train-xs", action="store_true",
                    help="横截面排序训练：预测『该股未来收益−同池中位数』(相对强弱)，基准恒50%，报横截面DA/RankIC/多空价差")
+    p.add_argument("--rank-stocks", action="store_true",
+                   help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
+    p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
     p.add_argument("--global-scope", default="subset", choices=["subset", "all"],
                    help="全局训练用哪些股票：subset=内置流动性子集(先跑通) / all=本地全部(自动剔除已退市)")
     p.add_argument("--global-codes", default=None,
@@ -14287,7 +14436,8 @@ def main():
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
                  (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
-        algos = [a.strip() for a in args.global_algos.split(",") if a.strip()]
+        algos = (_all_tabular_algos() if args.global_algos.strip().lower() == "all"
+                 else [a.strip() for a in args.global_algos.split(",") if a.strip()])
         print(f"[train-global] 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date} / 步长 {args.anchor_stride}")
         summary = train_global_pooled(
             codes=codes, algos=algos, split_date=args.split_date,
@@ -14325,12 +14475,35 @@ def main():
             print("已冻结: " + "  ".join(f"{k}->{os.path.basename(v)}" for k, v in summary["frozen"].items()))
         return
 
+    # --rank-stocks：『主力思维』选股排序 + 回测 + 出图
+    if args.rank_stocks:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        png = os.path.join(BASE_DIR, "选股排序_result.png")
+        print(f"[rank-stocks] {len(codes)} 只 / 期限 {args.rank_horizon}日 / 切分 {args.split_date}")
+        r = rank_stocks_cross_sectional(codes=codes, horizon=args.rank_horizon,
+                                        split_date=args.split_date, out_png=png, progress_cb=print)
+        print("\n" + "=" * 66)
+        print(f"『主力思维』选股排序  模型={r['algo']}  期限={r['horizon']}日  基准日={r['as_of']}")
+        print(f"样本外：RankIC={r['rank_ic']}  多空价差均值={r['ls_spread_pct']}%/期  调仓{r['n_rebalance']}次")
+        print("-" * 66)
+        print(f"{'排名':>4}{'代码':>9}{'名称':>8}{'得分':>10}   标签")
+        for x in r["ranked"]:
+            print(f"{x['rank']:>4}{x['code']:>9}{str(x['name'])[:6]:>8}{x['score']:>10}   {x['tag']}")
+        print("=" * 66)
+        print(f"图: {r['out_png']}")
+        print("✓ 判读：RankIC>0 且『买最强一档』净值跑赢『市场等权』，才说明排序有真实相对强弱价值。")
+        print("⚠ " + r["disclaimer"])
+        return
+
     # --train-xs：横截面排序训练(相对强弱，基准恒50%)
     if args.train_xs:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
                  (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
-        algos = [a.strip() for a in args.global_algos.split(",") if a.strip()]
+        algos = (_all_tabular_algos() if args.global_algos.strip().lower() == "all"
+                 else [a.strip() for a in args.global_algos.split(",") if a.strip()])
         print(f"[train-xs] 横截面排序 · 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date}")
         summary = train_global_cross_sectional(
             codes=codes, algos=algos, split_date=args.split_date,
