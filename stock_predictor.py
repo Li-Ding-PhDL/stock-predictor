@@ -7826,6 +7826,25 @@ if HAS_PYSIDE6:
             except Exception as e:
                 self.error_signal.emit(str(e))
 
+    class RankWorker(QThread):
+        """『一键打分』后台线程：在给定股票的历史上训练相对强弱模型→排序→样本外回测→出图。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, codes, horizon, split_date, out_png):
+            super().__init__()
+            self.codes = codes; self.horizon = horizon; self.split_date = split_date; self.out_png = out_png
+
+        def run(self):
+            try:
+                r = rank_stocks_cross_sectional(
+                    codes=self.codes, horizon=self.horizon, split_date=self.split_date,
+                    out_png=self.out_png, progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
     # ---------- 9.2 主窗口 ----------
     class MainWindow(QMainWindow):
 
@@ -10149,7 +10168,7 @@ if HAS_PYSIDE6:
             g = QGridLayout(box)
             g.addWidget(QLabel("股票范围:"), 0, 0)
             self.gm_scope_combo = QComboBox()
-            self.gm_scope_combo.addItems(["流动性子集(先跑通)", "本地全部(剔除已退市)", "自定义代码"])
+            self.gm_scope_combo.addItems(["我的自选(同花顺)", "流动性子集(先跑通)", "本地全部(剔除已退市)", "自定义代码"])
             g.addWidget(self.gm_scope_combo, 0, 1)
             g.addWidget(QLabel("自定义代码(逗号分隔):"), 0, 2)
             self.gm_codes_edit = QLineEdit()
@@ -10191,6 +10210,11 @@ if HAS_PYSIDE6:
             self.gm_train_btn = QPushButton("② 训练 + 冻结")
             self.gm_train_btn.clicked.connect(self._on_gm_train)
             btns.addWidget(self.gm_train_btn)
+            self.gm_rank_btn = QPushButton("★ 一键打分(选股排序)")
+            self.gm_rank_btn.setStyleSheet("font-weight:bold;")
+            self.gm_rank_btn.setToolTip("在所选股票的历史上训练相对强弱模型→排序→样本外回测→出图(主力思维)")
+            self.gm_rank_btn.clicked.connect(self._on_gm_rank)
+            btns.addWidget(self.gm_rank_btn)
             btns.addWidget(QLabel("③ 加载冻结预测:"))
             self.gm_predict_edit = QLineEdit(); self.gm_predict_edit.setPlaceholderText("股票代码，如 600519")
             self.gm_predict_edit.setMaximumWidth(140)
@@ -10219,6 +10243,8 @@ if HAS_PYSIDE6:
                 return [c.strip() for c in self.gm_codes_edit.text().split(",") if c.strip()]
             if scope.startswith("本地全部"):
                 return _scan_all_local_codes()
+            if scope.startswith("我的自选"):
+                return list(USER_WATCHLIST_CODES)
             return list(GLOBAL_SUBSET_CODES)
 
         def _gm_logmsg(self, m: str):
@@ -10363,6 +10389,42 @@ if HAS_PYSIDE6:
                 self._gm_logmsg(f"  期限{p_['h']:>2}日  {p_['方向']}  y4平均={p_['y4平均%']:+}%  y5最高={p_['y5最高%']:+}%  "
                                 f"(y4≈{p_['y4平均(元)']}元 / y5≈{p_['y5最高(元)']}元)")
             self._gm_logmsg("⚠ " + r["disclaimer"])
+
+        def _on_gm_rank(self):
+            codes = self._gm_codes()
+            if len(codes) < 5:
+                QMessageBox.warning(self, "股票太少", "选股排序需要至少 5 只股票(要形成横截面)。"); return
+            self.gm_rank_btn.setEnabled(False); self.gm_log.clear()
+            self._gm_logmsg(f"一键打分：在 {len(codes)} 只的**过往历史**上训练相对强弱模型 → 排序 → 样本外回测 → 出图 ...")
+            png = os.path.join(BASE_DIR, "选股排序_result.png")
+            self._gm_rank_worker = RankWorker(codes, 21, self.gm_split_edit.text().strip(), png)
+            self._gm_rank_worker.progress_signal.connect(self._gm_logmsg)
+            self._gm_rank_worker.finished_signal.connect(self._on_gm_rank_done)
+            self._gm_rank_worker.error_signal.connect(
+                lambda e: (self._gm_logmsg("失败: " + e), self.gm_rank_btn.setEnabled(True)))
+            self._gm_rank_worker.start()
+
+        def _on_gm_rank_done(self, r):
+            self.gm_rank_btn.setEnabled(True)
+            self._gm_fill_table(pd.DataFrame(r["ranked"]))
+            self._gm_logmsg(f"完成：模型={r['algo']} 期限={r['horizon']}日 基准日={r['as_of']} ｜ "
+                            f"样本外 RankIC={r['rank_ic']} 多空价差={r['ls_spread_pct']}%/期 调仓{r['n_rebalance']}次")
+            top3 = "、".join(f"{x['code']}({x['score']})" for x in r["ranked"][:3])
+            bot3 = "、".join(f"{x['code']}({x['score']})" for x in r["ranked"][-3:])
+            self._gm_logmsg(f"最强前3：{top3} ｜ 最弱后3：{bot3}")
+            self._gm_logmsg("⚠ " + r["disclaimer"])
+            png = r.get("out_png")
+            if png and os.path.exists(png):
+                try:
+                    from PySide6.QtGui import QPixmap
+                    dlg = QDialog(self); dlg.setWindowTitle("选股排序 · 可视化（主力思维）"); dlg.resize(1120, 640)
+                    lay = QVBoxLayout(dlg); lb = QLabel()
+                    lb.setPixmap(QPixmap(png).scaled(1080, 570, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lay.addWidget(lb)
+                    cb = QPushButton("关闭"); cb.clicked.connect(dlg.accept); lay.addWidget(cb)
+                    dlg.exec()
+                except Exception as e:
+                    self._gm_logmsg(f"图已保存: {png}（内嵌显示失败: {e}）")
 
         def _build_watchlist_tab(self) -> QWidget:
             panel = QWidget()
@@ -13411,6 +13473,11 @@ GLOBAL_SUBSET_CODES: List[str] = [
 # ARIMA 是单序列时序模型、没有跨股票外生特征这一说，故不进池化(见 B 步：ARIMA 残差混合特征)，
 # 本模块用 _arima_perstock_baseline 单独给它一个"逐股基线"，明确标注"未纳入全局冻结"。
 POOL_FEATURE_ALGOS: List[str] = ["SVR", "GPR", "Lasso", "PLSR", "ELM"]
+# 用户的同花顺自选股(个股，不含 ETF/指数)——供"我的自选"一键打分/排序。想改就改这里。
+USER_WATCHLIST_CODES: List[str] = [
+    "600611", "002354", "002437", "002743", "002418", "002045", "600833", "002031",
+    "601212", "000950", "002651", "002746", "600664", "601678", "002131", "000908",
+]
 
 # 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
 MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
@@ -14273,8 +14340,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
-    p.add_argument("--global-scope", default="subset", choices=["subset", "all"],
-                   help="全局训练用哪些股票：subset=内置流动性子集(先跑通) / all=本地全部(自动剔除已退市)")
+    p.add_argument("--global-scope", default="subset", choices=["subset", "all", "mine"],
+                   help="用哪些股票：subset=内置流动性子集 / all=本地全部(剔退市) / mine=我的同花顺自选(USER_WATCHLIST_CODES)")
     p.add_argument("--global-codes", default=None,
                    help="逗号分隔的股票代码，覆盖 --global-scope(自定义参与全局训练的股票)")
     p.add_argument("--global-algos", default="RF,GBRT,XGBoost,LightGBM,ExtraTrees,Lasso,ELM",
@@ -14424,7 +14491,8 @@ def main():
     if args.build_dataset:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         ds = build_multi_horizon_dataset(codes, arima_features=args.arima_features,
                                          split_date=args.split_date, progress_cb=print)
         ds.to_csv(args.build_dataset, index=False, encoding="utf-8-sig")
@@ -14435,7 +14503,8 @@ def main():
     if args.train_global:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         algos = (_all_tabular_algos() if args.global_algos.strip().lower() == "all"
                  else [a.strip() for a in args.global_algos.split(",") if a.strip()])
         print(f"[train-global] 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date} / 步长 {args.anchor_stride}")
@@ -14479,7 +14548,8 @@ def main():
     if args.rank_stocks:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         png = os.path.join(BASE_DIR, "选股排序_result.png")
         print(f"[rank-stocks] {len(codes)} 只 / 期限 {args.rank_horizon}日 / 切分 {args.split_date}")
         r = rank_stocks_cross_sectional(codes=codes, horizon=args.rank_horizon,
@@ -14501,7 +14571,8 @@ def main():
     if args.train_xs:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         algos = (_all_tabular_algos() if args.global_algos.strip().lower() == "all"
                  else [a.strip() for a in args.global_algos.split(",") if a.strip()])
         print(f"[train-xs] 横截面排序 · 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date}")
