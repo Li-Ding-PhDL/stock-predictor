@@ -10244,24 +10244,61 @@ if HAS_PYSIDE6:
             self._gm_logmsg(f"完成：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票。表格仅显示前 500 行。")
             self._gm_fill_table(ds.head(500))
 
-        def _gm_fill_table(self, ds):
-            # 表头按 标识/输入/输出 归类标注
+        def _gm_fill_table(self, ds, table=None):
+            table = table if table is not None else self.gm_table
+            # 表头按 标识/输入/输出 归类标注；输入=淡蓝、输出=淡绿、标识=淡灰，一眼分清 X 与 Y
             id_cols = ["code", "name", "date", "close"]
-            out_cols = [c for c in ds.columns if c.startswith("y")]
+            out_cols = [c for c in ds.columns if str(c).startswith("y")]
             def _tag(c):
                 if c in id_cols: return f"标识·{c}"
                 if c in out_cols: return f"输出·{c}"
                 return f"输入·{c}"
             cols = list(ds.columns)
-            self.gm_table.setColumnCount(len(cols))
-            self.gm_table.setHorizontalHeaderLabels([_tag(c) for c in cols])
-            self.gm_table.setRowCount(len(ds))
+            col_bg = {c: (QColor("#eceff1") if c in id_cols else
+                          QColor("#e6f4ea") if c in out_cols else QColor("#e8f0fe")) for c in cols}
+            table.setColumnCount(len(cols))
+            table.setHorizontalHeaderLabels([_tag(c) for c in cols])
+            table.setRowCount(len(ds))
             for i in range(len(ds)):
                 for j, c in enumerate(cols):
                     v = ds.iloc[i][c]
-                    # 表头前缀已标注 标识/输入/输出，单元格不再着色（避免依赖 QColor，跨主题更稳）
-                    self.gm_table.setItem(i, j, QTableWidgetItem("" if pd.isna(v) else str(v)))
-            self.gm_table.resizeColumnsToContents()
+                    it = QTableWidgetItem("" if pd.isna(v) else str(v))
+                    it.setBackground(col_bg[c])
+                    table.setItem(i, j, it)
+            table.resizeColumnsToContents()
+
+        def _gm_preview_and_confirm(self, action_label: str) -> bool:
+            """开跑前弹出『喂给模型的数据集』(以用户输入的股票或默认股为例)，输入蓝/输出绿/标识灰，确认后再跑。"""
+            code = (self.gm_predict_edit.text().strip() or "600519")
+            try:
+                ds = build_multi_horizon_dataset(
+                    [code], DEFAULT_HORIZONS, anchors_per_stock=8,
+                    arima_features=self.gm_arima_chk.isChecked(),
+                    split_date=self.gm_split_edit.text().strip())
+            except Exception as e:
+                QMessageBox.warning(self, "数据集预览失败", f"{code}: {e}"); return False
+            if ds is None or len(ds) == 0:
+                QMessageBox.warning(self, "无数据", f"{code} 没构建出样本(本地可能无此股票或数据不足)。"); return False
+            dlg = QDialog(self); dlg.setWindowTitle(f"开跑前确认 · 喂给模型的数据集（以 {code} 为例）")
+            dlg.resize(1040, 560)
+            lay = QVBoxLayout(dlg)
+            legend = QLabel(
+                "下面就是模型真正吃进去的数据 —— "
+                "<span style='background:#e8f0fe'>&nbsp;蓝=输入特征 X&nbsp;</span> "
+                "<span style='background:#e6f4ea'>&nbsp;绿=输出目标 Y (y1方向/y2低/y3中/y4均/y5高)&nbsp;</span> "
+                "<span style='background:#eceff1'>&nbsp;灰=标识&nbsp;</span><br>"
+                f"训练用的是全部选中股票；此处以 <b>{code}</b> 为例展示<b>列结构与真实数值</b>(同一套输入→输出)。"
+                "确认后按 取数→建数据集→时间三分(训练/验证/测试)→训练→验证→测试 执行。")
+            legend.setWordWrap(True); lay.addWidget(legend)
+            tbl = QTableWidget(); tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._gm_fill_table(ds.head(120), table=tbl)
+            lay.addWidget(tbl, 1)
+            row = QHBoxLayout(); row.addStretch(1)
+            cancel = QPushButton("取消"); ok = QPushButton(f"确认并开始{action_label}")
+            ok.setDefault(True)
+            cancel.clicked.connect(dlg.reject); ok.clicked.connect(dlg.accept)
+            row.addWidget(cancel); row.addWidget(ok); lay.addLayout(row)
+            return dlg.exec() == QDialog.Accepted
 
         def _on_gm_export(self):
             if self._gm_dataset is None or len(self._gm_dataset) == 0:
@@ -10275,6 +10312,8 @@ if HAS_PYSIDE6:
             codes = self._gm_codes()
             if not codes:
                 QMessageBox.warning(self, "无股票", "请先选择股票范围或填写自定义代码。"); return
+            if not self._gm_preview_and_confirm("训练"):     # 开跑前先弹出数据集(输入蓝/输出绿)确认
+                self._gm_logmsg("已取消(未确认数据集)。"); return
             algos = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()]
             self.gm_train_btn.setEnabled(False); self.gm_log.clear()
             self._gm_logmsg(f"训练+冻结：{len(codes)} 只 / 模型 {algos} / 切分 {self.gm_split_edit.text()} / "
@@ -10291,12 +10330,13 @@ if HAS_PYSIDE6:
         def _on_gm_train_done(self, summary):
             self.gm_train_btn.setEnabled(True)
             self._gm_logmsg("=" * 60)
-            self._gm_logmsg(f"训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只  "
-                            f"方向基准(多数类)≈{summary['base_rate_pct']}%")
+            self._gm_logmsg(f"取数→建数据集→时间三分→训练→验证→测试")
+            self._gm_logmsg(f"训练{summary['n_train']} / 验证{summary.get('n_val','-')} / 测试{summary['n_test']} / "
+                            f"股票{summary['n_codes']}只  方向基准(多数类)≈{summary['base_rate_pct']}%")
             for r in summary["results"]:
-                da = r.get("DA_dir_pct"); rm = r.get("RMSE_y4")
+                dv = r.get("DA_val_pct"); da = r.get("DA_dir_pct"); rm = r.get("RMSE_y4")
                 bn = ("优于Naive" if r.get("beat_naive_y4") else "未优于Naive") if "beat_naive_y4" in r else ""
-                self._gm_logmsg(f"  {r['algo']:<18} 方向DA={da}%  y4RMSE={rm}  {bn}")
+                self._gm_logmsg(f"  {r['algo']:<16} 验证DA={dv}% → 测试DA={da}%  y4RMSE={rm}  {bn}")
             ab = summary.get("arima_baseline", {})
             self._gm_logmsg(f"  [ARIMA·逐股基线] 方向DA≈{ab.get('DA_dir_pct')}（未纳入全局冻结）")
             if summary.get("frozen"):
@@ -10307,6 +10347,8 @@ if HAS_PYSIDE6:
             code = self.gm_predict_edit.text().strip()
             if not code:
                 QMessageBox.warning(self, "缺代码", "请填写要预测的股票代码。"); return
+            if not self._gm_preview_and_confirm("预测"):     # 预测前也先弹出该股数据集(输入蓝/输出绿)确认
+                self._gm_logmsg("已取消(未确认数据集)。"); return
             algo1 = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()][0]
             try:
                 r = predict_frozen(code, algo=algo1)
@@ -13577,23 +13619,34 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     if len(ds) == 0:
         raise RuntimeError("池化数据集为空(检查代码清单/本地数据/日期区间)。")
     ds = ds.dropna(subset=feature_cols + MH_TARGET_COLS).reset_index(drop=True)
+    log(f"① 数据集就绪：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票，"
+        f"输入特征 {len(feature_cols)} 个、输出目标 {len(MH_TARGET_COLS)} 个。")
 
-    # ② 全局日期切分(红线#1)
+    # ② 按时间三分(红线#1：前段训练→中段验证→后段测试，绝不 shuffle)。
+    #    训练 = split_date 之前；split_date 之后的样本按日期中位再对半分成 验证(前) / 测试(后)。
     split = pd.to_datetime(split_date)
-    tr_mask = ds["date"] < split
-    te_mask = ds["date"] >= split
-    tr, te = ds[tr_mask], ds[te_mask]
-    if len(tr) == 0 or len(te) == 0:
-        raise RuntimeError(f"按 split_date={split_date} 切分后训练或测试为空(训练{len(tr)}/测试{len(te)})，请调整。")
-    # 训练样本上限(SVR/GPR 在大样本上很慢)：仅对**训练集**做有种子随机下采样，测试集全量评估
+    tr = ds[ds["date"] < split]
+    hold = ds[ds["date"] >= split].sort_values("date")
+    if len(tr) == 0 or len(hold) < 2:
+        raise RuntimeError(f"按 split_date={split_date} 切分后训练/留出为空(训练{len(tr)}/留出{len(hold)})，请调整。")
+    mid = hold["date"].quantile(0.5)
+    va = hold[hold["date"] < mid]
+    te = hold[hold["date"] >= mid]
+    if len(va) == 0 or len(te) == 0:                # 留出段日期高度集中时退化，改用行数对半
+        half = len(hold) // 2
+        va, te = hold.iloc[:half], hold.iloc[half:]
+    log(f"② 时间三分：训练 {len(tr)} 行(< {split_date}) / 验证 {len(va)} 行 / 测试 {len(te)} 行(最后段，仅最终评估)。")
+    # 训练样本上限(SVR/GPR 在大样本上很慢)：仅对**训练集**做有种子随机下采样，验证/测试全量评估
     if max_train_samples and len(tr) > max_train_samples:
         tr = tr.sample(n=max_train_samples, random_state=RANDOM_SEED).sort_values("date")
-        log(f"训练样本下采样到 {max_train_samples} 行(控时；测试集仍全量 {len(te)} 行)。")
+        log(f"   训练样本下采样到 {max_train_samples} 行(控时；验证/测试全量)。")
 
     X_tr = tr[feature_cols].values.astype(float)
+    X_va = va[feature_cols].values.astype(float)
     X_te = te[feature_cols].values.astype(float)
     scaler = StandardScaler().fit(X_tr)           # 红线#2：只在训练集 fit
-    X_tr_s, X_te_s = scaler.transform(X_tr), scaler.transform(X_te)
+    X_tr_s, X_va_s, X_te_s = scaler.transform(X_tr), scaler.transform(X_va), scaler.transform(X_te)
+    y4_va_true = va["y4_mean_pct"].values.astype(float)
 
     y4_te_true = te["y4_mean_pct"].values.astype(float)
     p_up = float(np.mean(y4_te_true > 0))
@@ -13627,12 +13680,15 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                     best_params = run_hpo(hpo_method, model_cls, X_tr_s[:-n_val], y_tr[:-n_val],
                                           X_tr_s[-n_val:], y_tr[-n_val:], n_trials=hpo_trials)
                 m = model_cls(**best_params)
-                m.fit(X_tr_s, y_tr)
+                m.fit(X_tr_s, y_tr)                          # ③ 训练(只用训练集)
                 per_target_models[t] = m
                 per_target_params[t] = best_params
                 y_te_pred = m.predict(X_te_s)
                 rmse_by_t[t] = float(np.sqrt(np.mean((te[t].values.astype(float) - y_te_pred) ** 2)))
-            # 方向 DA：用 y4(均值涨跌)预测的符号
+            # ④ 验证集方向 DA(独立留出，只报不参与训练/调参)
+            y4_va_pred = per_target_models["y4_mean_pct"].predict(X_va_s)
+            da_val = _mh_direction_da(y4_va_pred, y4_va_true)
+            # ⑤ 测试集方向 DA：用 y4(均值涨跌)预测的符号
             y4_pred = per_target_models["y4_mean_pct"].predict(X_te_s)
             da = _mh_direction_da(y4_pred, y4_te_true)
             # ① DA 按期限拆开(长/短期限差异)——注意同时看该期限的"总是涨"基准，别把高基准当本事
@@ -13650,14 +13706,14 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
             da_sel = round(_mh_direction_da(y4_pred[sel], y4_te_true[sel]), 1) if sel.sum() else None
             pu_sel = float(np.mean(y4_te_true[sel] > 0)) if sel.sum() else 0.0
             base_sel = round(max(pu_sel, 1 - pu_sel) * 100, 1)
-            row = {"algo": algo, "DA_dir_pct": round(da, 2),
+            row = {"algo": algo, "DA_dir_pct": round(da, 2), "DA_val_pct": round(da_val, 2),
                    "RMSE_y4": round(rmse_by_t["y4_mean_pct"], 4),
                    "beat_naive_y4": bool(rmse_by_t["y4_mean_pct"] < naive_rmse["y4_mean_pct"]),
                    "da_by_h": da_by_h, "base_by_h": base_by_h,
                    "da_top20": da_sel, "cover_pct": round(float(sel.mean()) * 100, 1), "base_top20": base_sel,
-                   "note": f"n训练={len(tr)} n测试={len(te)}"}
+                   "note": f"n训练={len(tr)} n验证={len(va)} n测试={len(te)}"}
             results.append(row)
-            log(f"[{algo}] 方向DA={da:.1f}%(基准≈{base_rate:.1f}%) / 高置信20%时DA={da_sel}%(该子集基准{base_sel}%) "
+            log(f"[{algo}] ④验证DA={da_val:.1f}% → ⑤测试DA={da:.1f}%(基准≈{base_rate:.1f}%) / 高置信20%DA={da_sel}%(子集基准{base_sel}%) "
                 f"/ y4RMSE={rmse_by_t['y4_mean_pct']:.3f}（{'优于' if row['beat_naive_y4'] else '未优于'}Naive）")
             log(f"[{algo}] DA@各期限: " + " ".join(f"h{k}={v}%(基{base_by_h[k]})" for k, v in da_by_h.items()))
 
@@ -13689,7 +13745,7 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
 
     summary = {
         "results": results, "base_rate_pct": round(base_rate, 2), "p_up": round(p_up, 4),
-        "n_train": int(len(tr)), "n_test": int(len(te)), "n_codes": ds["code"].nunique(),
+        "n_train": int(len(tr)), "n_val": int(len(va)), "n_test": int(len(te)), "n_codes": ds["code"].nunique(),
         "split_date": split_date, "horizons": horizons, "frozen": frozen_paths,
         "arima_baseline": _arima_perstock_baseline(codes, horizons, split_date, start, end, root, log)
                           if HAS_STATSMODELS else {"note": "statsmodels 未安装，跳过 ARIMA 逐股基线"},
@@ -13729,6 +13785,108 @@ def _arima_perstock_baseline(codes: List[str], horizons: List[int], split_date: 
     log(f"[ARIMA·逐股基线] {tot} 只可评估，方向DA≈{da}%（未纳入全局冻结）")
     return {"n_eval": tot, "DA_dir_pct": da, "order": "(2,1,0)",
             "note": "逐股独立、未纳入全局冻结；仅作对照(见后续 B 步：ARIMA 残差混合特征)"}
+
+
+def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optional[List[str]] = None,
+                                 horizons: Optional[List[int]] = None, split_date: str = "2024-01-01",
+                                 start: str = "20150101", end: Optional[str] = None,
+                                 hpo_method: str = "关闭", hpo_trials: int = 12,
+                                 max_train_samples: int = 15000, root: Optional[str] = None,
+                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """横截面排序模型：目标 = 该股未来收益 − 当日同池中位数(超额)。预测"谁跑赢谁"，而非绝对涨跌。
+    诚实优势：按中位数分"跑赢/跑输"，基准天生 50%，样本外 DA>50% 即真实相对强弱 edge(不吃普涨红利)。
+    评估(全部样本外)：横截面 DA(基准50%) + RankIC(每日截面 Spearman) + 多空分层价差(top档 − bottom档 未来真实收益)。
+    **研究性回测，非投资建议、盈亏自负。**"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or GLOBAL_SUBSET_CODES
+    algos = algos or ["RF", "GBRT", "XGBoost", "LightGBM", "ExtraTrees", "Lasso", "ELM"]
+    horizons = horizons or DEFAULT_HORIZONS
+    root = root or StockDataFetcher._resolve_local_root()
+
+    log("① 构建池化数据集(全锚定日，便于按日对齐做横截面) ...")
+    ds = build_multi_horizon_dataset(codes, horizons, start, end, root, drop_delisted=True,
+                                     anchor_stride=1, progress_cb=progress_cb)
+    ds = ds.dropna(subset=MH_FEATURE_COLS + ["y4_mean_pct"]).reset_index(drop=True)
+    if len(ds) == 0:
+        raise RuntimeError("数据集为空。")
+
+    # ② 横截面超额目标：每个(date,h)组内 减去中位数；要求每组至少 5 只股票才成截面
+    g = ds.groupby(["date", "h"])["y4_mean_pct"]
+    ds["xs_med"] = g.transform("median")
+    ds["xs_cnt"] = g.transform("count")
+    ds = ds[ds["xs_cnt"] >= 5].reset_index(drop=True)
+    if len(ds) == 0:
+        raise RuntimeError("可用横截面为空(每个交易日同池股票不足5只)。请多给些股票。")
+    ds["y_excess"] = ds["y4_mean_pct"] - ds["xs_med"]
+    # 横截面 rank 特征(每个 date,h 组内把关键特征转成 0~1 分位)——对"相对强弱"往往更有效
+    xs_rank_feats = ["mom20", "rsi14", "dist_hi120", "ret_10d", "vol20"]
+    for f in xs_rank_feats:
+        if f in ds.columns:
+            ds[f + "_xr"] = ds.groupby(["date", "h"])[f].rank(pct=True)
+    feat_cols = MH_FEATURE_COLS + [f + "_xr" for f in xs_rank_feats if (f + "_xr") in ds.columns]
+    ds = ds.dropna(subset=feat_cols + ["y_excess"]).reset_index(drop=True)
+
+    # ③ 全局日期切分(红线#1)
+    split = pd.to_datetime(split_date)
+    tr, te = ds[ds["date"] < split], ds[ds["date"] >= split]
+    if len(tr) == 0 or len(te) == 0:
+        raise RuntimeError(f"按 split_date={split_date} 切分后训练/测试为空({len(tr)}/{len(te)})。")
+    if max_train_samples and len(tr) > max_train_samples:
+        tr = tr.sample(n=max_train_samples, random_state=RANDOM_SEED).sort_values("date")
+        log(f"训练下采样到 {max_train_samples} 行(测试全量 {len(te)} 行)。")
+
+    X_tr = tr[feat_cols].values.astype(float)
+    X_te = te[feat_cols].values.astype(float)
+    scaler = StandardScaler().fit(X_tr)                       # 红线#2：只在训练集 fit
+    X_tr_s, X_te_s = scaler.transform(X_tr), scaler.transform(X_te)
+    y_tr = tr["y_excess"].values.astype(float)
+    y_te = te["y_excess"].values.astype(float)
+
+    def _rank_ic_and_spread(pred):
+        te2 = te.assign(_pred=pred, _act=y_te)
+        ics, spreads = [], []
+        for (_, _), grp in te2.groupby(["date", "h"]):
+            if len(grp) < 5:
+                continue
+            ics.append(grp["_pred"].corr(grp["_act"], method="spearman"))
+            k = max(1, int(len(grp) * 0.33))
+            top = grp.nlargest(k, "_pred")["y4_mean_pct"].mean()
+            bot = grp.nsmallest(k, "_pred")["y4_mean_pct"].mean()
+            spreads.append(top - bot)
+        return (float(np.nanmean(ics)) if ics else float("nan"),
+                float(np.nanmean(spreads)) if spreads else float("nan"))
+
+    results = []
+    hcol = te["h"].values.astype(int)
+    for algo in algos:
+        if algo not in ALGO_REGISTRY or not ALGO_AVAILABILITY.get(algo, True):
+            log(f"[{algo}] 不可用，跳过"); continue
+        model_cls = ALGO_REGISTRY[algo]
+        try:
+            best = {}
+            if hpo_method and hpo_method != "关闭":
+                nv = max(1, int(len(X_tr_s) * 0.2))
+                best = run_hpo(hpo_method, model_cls, X_tr_s[:-nv], y_tr[:-nv], X_tr_s[-nv:], y_tr[-nv:], n_trials=hpo_trials)
+            m = model_cls(**best); m.fit(X_tr_s, y_tr)
+            pred = m.predict(X_te_s)
+            xs_da = float(np.mean(np.sign(pred) == np.sign(y_te)) * 100)   # 基准恒 50%
+            da_by_h = {}
+            for hh in sorted(set(hcol)):
+                mk = hcol == hh
+                da_by_h[int(hh)] = round(float(np.mean(np.sign(pred[mk]) == np.sign(y_te[mk])) * 100), 1)
+            ic, spread = _rank_ic_and_spread(pred)
+            results.append({"algo": algo, "xs_da_pct": round(xs_da, 2), "rank_ic": round(ic, 4),
+                            "ls_spread_pct": round(spread, 3), "da_by_h": da_by_h})
+            log(f"[{algo}] 横截面DA={xs_da:.1f}%(基准50%) / RankIC={ic:.3f} / 多空价差={spread:.2f}% ")
+            log(f"[{algo}] DA@各期限: " + " ".join(f"h{k}={v}%" for k, v in da_by_h.items()))
+        except Exception as ex:
+            log(f"[{algo}] 失败：{ex}")
+            results.append({"algo": algo, "xs_da_pct": None, "note": f"失败:{ex}"})
+
+    return {"mode": "cross_sectional", "results": results, "n_train": int(len(tr)), "n_test": int(len(te)),
+            "n_codes": ds["code"].nunique(), "split_date": split_date, "horizons": horizons,
+            "note": "横截面DA基准=50%(按中位数分跑赢/跑输)；DA>50%、RankIC>0、多空价差>0 才算真相对强弱edge。",
+            "disclaimer": "研究性回测，非投资建议、盈亏自负。"}
 
 
 def list_frozen_models(out_dir: str = FROZEN_DIR) -> List[Dict[str, Any]]:
@@ -13946,6 +14104,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # ---- 全局池化训练 + 冻结/加载（第八部分补充8）----
     p.add_argument("--train-global", action="store_true",
                    help="用本地数据集对『一批股票』做多期限×多目标全局池化训练，并冻结模型(不必每次重训)")
+    p.add_argument("--train-xs", action="store_true",
+                   help="横截面排序训练：预测『该股未来收益−同池中位数』(相对强弱)，基准恒50%，报横截面DA/RankIC/多空价差")
     p.add_argument("--global-scope", default="subset", choices=["subset", "all"],
                    help="全局训练用哪些股票：subset=内置流动性子集(先跑通) / all=本地全部(自动剔除已退市)")
     p.add_argument("--global-codes", default=None,
@@ -14116,17 +14276,19 @@ def main():
             arima_features=args.arima_features,
             freeze=not args.no_freeze, progress_cb=print)
         print("\n" + "=" * 74)
-        print(f"全局池化训练结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
+        print(f"流程：取数→建数据集→时间三分→训练→验证→测试")
+        print(f"划分：训练{summary['n_train']} / 验证{summary.get('n_val','-')} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
               f"  方向基准(多数类)≈{summary['base_rate_pct']}%")
         print("-" * 74)
-        print(f"{'模型':<18}{'方向DA%':>9}{'高置信20%DA':>12}{'该子集基准':>10}{'y4RMSE':>9}{'优于Naive':>9}")
+        print(f"{'模型':<16}{'验证DA%':>9}{'测试DA%':>9}{'高置信20%DA':>12}{'子集基准':>9}{'y4RMSE':>9}{'优Naive':>8}")
         for r in summary["results"]:
+            dv = "-" if r.get("DA_val_pct") is None else r["DA_val_pct"]
             da = "-" if r.get("DA_dir_pct") is None else r["DA_dir_pct"]
             dt = "-" if r.get("da_top20") is None else r["da_top20"]
             bt = "-" if r.get("base_top20") is None else r.get("base_top20", "-")
             rm = "-" if r.get("RMSE_y4") is None else r["RMSE_y4"]
             bn = ("是" if r.get("beat_naive_y4") else "否") if "beat_naive_y4" in r else ""
-            print(f"{r['algo']:<18}{str(da):>9}{str(dt):>12}{str(bt):>10}{str(rm):>9}{bn:>9}")
+            print(f"{r['algo']:<16}{str(dv):>9}{str(da):>9}{str(dt):>12}{str(bt):>9}{str(rm):>9}{bn:>8}")
         # 按期限 DA(看长期限是否更高；括号内为该期限"总是涨"基准，别把高基准当本事)
         print("-" * 74)
         print("方向DA 按期限拆开（h=交易日；括号=该期限『总是涨』基准）:")
@@ -14140,6 +14302,36 @@ def main():
         print("⚠ 方向DA 需显著>50% 且高于多数类基准、y4 RMSE 优于 Naive 才算真有用；研究性回测，非投资建议、盈亏自负。")
         if summary.get("frozen"):
             print("已冻结: " + "  ".join(f"{k}->{os.path.basename(v)}" for k, v in summary["frozen"].items()))
+        return
+
+    # --train-xs：横截面排序训练(相对强弱，基准恒50%)
+    if args.train_xs:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        algos = [a.strip() for a in args.global_algos.split(",") if a.strip()]
+        print(f"[train-xs] 横截面排序 · 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date}")
+        summary = train_global_cross_sectional(
+            codes=codes, algos=algos, split_date=args.split_date,
+            hpo_method=args.hpo, hpo_trials=args.hpo_trials,
+            max_train_samples=args.max_train_samples, progress_cb=print)
+        print("\n" + "=" * 74)
+        print(f"横截面排序结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只  "
+              f"横截面DA基准=50%(按中位数)")
+        print("-" * 74)
+        print(f"{'模型':<16}{'横截面DA%':>10}{'RankIC':>9}{'多空价差%':>10}")
+        for r in summary["results"]:
+            if r.get("xs_da_pct") is None:
+                print(f"{r['algo']:<16}  {r.get('note','')}"); continue
+            print(f"{r['algo']:<16}{r['xs_da_pct']:>10}{r['rank_ic']:>9}{r['ls_spread_pct']:>10}")
+        print("-" * 74)
+        print("横截面DA 按期限:")
+        for r in summary["results"]:
+            if r.get("da_by_h"):
+                print(f"  {r['algo']:<14} " + " ".join(f"h{k}={v}%" for k, v in r["da_by_h"].items()))
+        print("=" * 74)
+        print("✓ 判读：横截面DA>50%、RankIC>0、多空价差>0 三者一致为正，才是真实『相对强弱』edge(不吃普涨红利)。")
+        print("⚠ 研究性回测，非投资建议、盈亏自负；务必再做样本外/多期验证，别过度解读单次结果。")
         return
 
     # --predict-frozen：加载冻结模型预测某股票(不训练)
