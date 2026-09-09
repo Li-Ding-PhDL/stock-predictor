@@ -13417,6 +13417,9 @@ MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_
 # B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
 # 因果无泄露：ARIMA 参数只在训练段估计，再用固定参数对全序列一步向前拟合(测试点只用自己的过去)。
 MH_ARIMA_COLS: List[str] = ["arima_pred_ret", "arima_resid_z"]
+# 市场/大盘环境特征(可选)：同一交易日整个股票池的横截面平均涨跌/动量，作为"大盘 regime"代理(离线、因果)。
+# 说明：预测单只股票时无池可平均，predict_frozen 对这些列填 0(中性)。
+MH_MARKET_COLS: List[str] = ["mkt_ret1", "mkt_mom20"]
 
 
 def _arima_causal_features(close: np.ndarray, split_idx: int, order=(2, 1, 0)):
@@ -13595,7 +13598,7 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                         start: str = "20150101", end: Optional[str] = None,
                         hpo_method: str = "BO", hpo_trials: int = 15,
                         anchor_stride: int = 5, max_train_samples: int = 12000,
-                        arima_features: bool = False,
+                        arima_features: bool = False, market_features: bool = False,
                         freeze: bool = True, root: Optional[str] = None,
                         progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """在"多期限×多目标"池化数据集上训练**全局模型**(跨股票共用一个模型)，可选冻结到磁盘。
@@ -13610,14 +13613,22 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     root = root or StockDataFetcher._resolve_local_root()
 
     use_arima = bool(arima_features and HAS_STATSMODELS)
-    feature_cols = MH_FEATURE_COLS + (MH_ARIMA_COLS if use_arima else [])
-    log("① 构建池化数据集 ..." + ("（含 ARIMA 残差混合特征）" if use_arima else ""))
+    use_market = bool(market_features)
+    feature_cols = (MH_FEATURE_COLS + (MH_ARIMA_COLS if use_arima else [])
+                    + (MH_MARKET_COLS if use_market else []))
+    log("① 构建池化数据集 ..." + ("（含 ARIMA 残差混合特征）" if use_arima else "")
+        + ("（含大盘环境特征）" if use_market else ""))
     ds = build_multi_horizon_dataset(codes, horizons, start, end, root,
                                      drop_delisted=True, anchor_stride=anchor_stride,
                                      arima_features=use_arima, split_date=split_date,
                                      progress_cb=progress_cb)
     if len(ds) == 0:
         raise RuntimeError("池化数据集为空(检查代码清单/本地数据/日期区间)。")
+    if use_market:      # 同日全池横截面均值作大盘 regime 代理(因果：当天已知)
+        if "ret_1d" in ds.columns:
+            ds["mkt_ret1"] = ds.groupby("date")["ret_1d"].transform("mean")
+        if "mom20" in ds.columns:
+            ds["mkt_mom20"] = ds.groupby("date")["mom20"].transform("mean")
     ds = ds.dropna(subset=feature_cols + MH_TARGET_COLS).reset_index(drop=True)
     log(f"① 数据集就绪：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票，"
         f"输入特征 {len(feature_cols)} 个、输出目标 {len(MH_TARGET_COLS)} 个。")
@@ -13685,6 +13696,9 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                 per_target_params[t] = best_params
                 y_te_pred = m.predict(X_te_s)
                 rmse_by_t[t] = float(np.sqrt(np.mean((te[t].values.astype(float) - y_te_pred) ** 2)))
+            # ③′ 训练集方向 DA(样本内，仅诊断)：若训练远高于测试=模型只是背下历史，不是特征不够
+            y4_tr_pred = per_target_models["y4_mean_pct"].predict(X_tr_s)
+            da_train = _mh_direction_da(y4_tr_pred, tr["y4_mean_pct"].values.astype(float))
             # ④ 验证集方向 DA(独立留出，只报不参与训练/调参)
             y4_va_pred = per_target_models["y4_mean_pct"].predict(X_va_s)
             da_val = _mh_direction_da(y4_va_pred, y4_va_true)
@@ -13707,14 +13721,15 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
             pu_sel = float(np.mean(y4_te_true[sel] > 0)) if sel.sum() else 0.0
             base_sel = round(max(pu_sel, 1 - pu_sel) * 100, 1)
             row = {"algo": algo, "DA_dir_pct": round(da, 2), "DA_val_pct": round(da_val, 2),
+                   "DA_train_pct": round(da_train, 2),
                    "RMSE_y4": round(rmse_by_t["y4_mean_pct"], 4),
                    "beat_naive_y4": bool(rmse_by_t["y4_mean_pct"] < naive_rmse["y4_mean_pct"]),
                    "da_by_h": da_by_h, "base_by_h": base_by_h,
                    "da_top20": da_sel, "cover_pct": round(float(sel.mean()) * 100, 1), "base_top20": base_sel,
                    "note": f"n训练={len(tr)} n验证={len(va)} n测试={len(te)}"}
             results.append(row)
-            log(f"[{algo}] ④验证DA={da_val:.1f}% → ⑤测试DA={da:.1f}%(基准≈{base_rate:.1f}%) / 高置信20%DA={da_sel}%(子集基准{base_sel}%) "
-                f"/ y4RMSE={rmse_by_t['y4_mean_pct']:.3f}（{'优于' if row['beat_naive_y4'] else '未优于'}Naive）")
+            log(f"[{algo}] ③训练DA={da_train:.1f}% → ④验证DA={da_val:.1f}% → ⑤测试DA={da:.1f}%(基准≈{base_rate:.1f}%) / "
+                f"高置信20%DA={da_sel}%(子集基准{base_sel}%)（训练远高于测试=过拟合，非特征不足）")
             log(f"[{algo}] DA@各期限: " + " ".join(f"h{k}={v}%(基{base_by_h[k]})" for k, v in da_by_h.items()))
 
             if freeze:
@@ -13931,6 +13946,9 @@ def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]]
         li = len(cl) - 1
         feat_base["arima_pred_ret"] = 0.0 if np.isnan(apr[li]) else float(apr[li])
         feat_base["arima_resid_z"] = 0.0 if np.isnan(arz[li]) else float(arz[li])
+    for c in fcols:                       # 大盘环境特征单股预测时无池可平均，填 0(中性)
+        if str(c).startswith("mkt_"):
+            feat_base[c] = 0.0
     preds = []
     for h in horizons:
         row = dict(feat_base); row["h"] = h
@@ -14118,6 +14136,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-freeze", action="store_true", help="只训练评估、不冻结到磁盘")
     p.add_argument("--arima-features", action="store_true",
                    help="B步：加入 ARIMA 残差混合特征(因果无泄露；需 statsmodels)")
+    p.add_argument("--market-features", action="store_true",
+                   help="加入大盘环境特征(同日全池平均涨跌/动量作 regime 代理；离线、因果)")
     p.add_argument("--build-dataset", default=None,
                    help="只构建并导出『多期限×多目标』池化数据集到该 CSV 路径(utf-8-sig)，不训练")
     p.add_argument("--predict-frozen", default=None,
@@ -14273,22 +14293,23 @@ def main():
             codes=codes, algos=algos, split_date=args.split_date,
             hpo_method=args.hpo, hpo_trials=args.hpo_trials,
             anchor_stride=args.anchor_stride, max_train_samples=args.max_train_samples,
-            arima_features=args.arima_features,
+            arima_features=args.arima_features, market_features=args.market_features,
             freeze=not args.no_freeze, progress_cb=print)
         print("\n" + "=" * 74)
         print(f"流程：取数→建数据集→时间三分→训练→验证→测试")
         print(f"划分：训练{summary['n_train']} / 验证{summary.get('n_val','-')} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
               f"  方向基准(多数类)≈{summary['base_rate_pct']}%")
         print("-" * 74)
-        print(f"{'模型':<16}{'验证DA%':>9}{'测试DA%':>9}{'高置信20%DA':>12}{'子集基准':>9}{'y4RMSE':>9}{'优Naive':>8}")
+        print(f"{'模型':<16}{'训练DA%':>9}{'验证DA%':>9}{'测试DA%':>9}{'高置信20%DA':>12}{'子集基准':>9}{'优Naive':>8}")
         for r in summary["results"]:
+            dtr = "-" if r.get("DA_train_pct") is None else r["DA_train_pct"]
             dv = "-" if r.get("DA_val_pct") is None else r["DA_val_pct"]
             da = "-" if r.get("DA_dir_pct") is None else r["DA_dir_pct"]
             dt = "-" if r.get("da_top20") is None else r["da_top20"]
             bt = "-" if r.get("base_top20") is None else r.get("base_top20", "-")
-            rm = "-" if r.get("RMSE_y4") is None else r["RMSE_y4"]
             bn = ("是" if r.get("beat_naive_y4") else "否") if "beat_naive_y4" in r else ""
-            print(f"{r['algo']:<16}{str(dv):>9}{str(da):>9}{str(dt):>12}{str(bt):>9}{str(rm):>9}{bn:>8}")
+            print(f"{r['algo']:<16}{str(dtr):>9}{str(dv):>9}{str(da):>9}{str(dt):>12}{str(bt):>9}{bn:>8}")
+        print("  ↑ 训练DA 远高于 测试DA = 模型在『背历史』(过拟合)，说明瓶颈是信号不是特征——再加特征只会抬高训练DA。")
         # 按期限 DA(看长期限是否更高；括号内为该期限"总是涨"基准，别把高基准当本事)
         print("-" * 74)
         print("方向DA 按期限拆开（h=交易日；括号=该期限『总是涨』基准）:")
