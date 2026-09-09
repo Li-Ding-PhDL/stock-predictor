@@ -13368,7 +13368,8 @@ POOL_FEATURE_ALGOS: List[str] = ["SVR", "GPR", "Lasso", "PLSR", "ELM"]
 
 # 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
 MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
-                              "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm"]
+                              "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm",
+                              "vol20", "mom20", "rsi14", "dist_ma60", "dist_ma250", "dist_hi120"]
 # 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
 MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
 # B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
@@ -13424,17 +13425,30 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     raw = pd.read_csv(path, dtype=str)
     ren = {"日期": "date", "名称": "name", "收盘价": "close",
            "涨幅%": "ret_1d", "3日涨幅%": "ret_3d", "6日涨幅%": "ret_6d", "10日涨幅%": "ret_10d",
-           "量比": "vol_ratio", "换手率": "turnover", "20日线": "ma20",
+           "量比": "vol_ratio", "换手率": "turnover", "20日线": "ma20", "60日线": "ma60", "250日线": "ma250",
            "滚动市盈率": "pe_ttm", "市净率": "pb", "滚动市销率": "ps_ttm", "退市时间": "delist"}
     cols = {k: v for k, v in ren.items() if k in raw.columns}
     df = raw[list(cols)].rename(columns=cols)
     delist_vals = df["delist"].dropna().astype(str) if "delist" in df.columns else pd.Series([], dtype=str)
     is_delisted = bool((~delist_vals.isin(["-", "", "nan", "None"])).any())
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    for c in ["close", "ret_1d", "ret_3d", "ret_6d", "ret_10d", "vol_ratio", "turnover", "ma20", "pe_ttm", "pb", "ps_ttm"]:
+    for c in ["close", "ret_1d", "ret_3d", "ret_6d", "ret_10d", "vol_ratio", "turnover",
+              "ma20", "ma60", "ma250", "pe_ttm", "pb", "ps_ttm"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    # ---- 追加因果技术特征(只用当天及以前；rolling/shift 不含未来) ----
+    cl = df["close"]
+    df["vol20"] = df["ret_1d"].rolling(20).std() if "ret_1d" in df.columns else np.nan   # 近20日涨跌幅波动率
+    df["mom20"] = (cl / cl.shift(20) - 1) * 100                                           # 20日动量%
+    # RSI(14)
+    delta = cl.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi14"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+    df["dist_ma60"] = (cl / df["ma60"] - 1) * 100 if "ma60" in df.columns else np.nan     # 离60日线偏离%
+    df["dist_ma250"] = (cl / df["ma250"] - 1) * 100 if "ma250" in df.columns else np.nan  # 离250日线偏离%
+    df["dist_hi120"] = (cl / cl.rolling(120).max() - 1) * 100                             # 离120日高点距离%(≤0)
     return df, is_delisted
 
 
@@ -13496,6 +13510,8 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 "ma20_dev": (float(c0) / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
                 "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
                 "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
+                "vol20": r.get("vol20"), "mom20": r.get("mom20"), "rsi14": r.get("rsi14"),
+                "dist_ma60": r.get("dist_ma60"), "dist_ma250": r.get("dist_ma250"), "dist_hi120": r.get("dist_hi120"),
             }
             for h in horizons:
                 win = close[i + 1: i + h + 1]
@@ -13594,6 +13610,9 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     for algo in algos:
         if algo not in ALGO_REGISTRY:
             log(f"[{algo}] 不在 ALGO_REGISTRY，跳过"); continue
+        if not ALGO_AVAILABILITY.get(algo, True):
+            log(f"[{algo}] 依赖库未安装(置灰)，跳过"); results.append(
+                {"algo": algo, "DA_dir_pct": None, "RMSE_y4": None, "note": "依赖未安装"}); continue
         model_cls = ALGO_REGISTRY[algo]
         log(f"② 训练全局模型 [{algo}]（{len(MH_TARGET_COLS)} 个目标各一个单输出模型）...")
         per_target_models: Dict[str, Any] = {}
@@ -13616,13 +13635,31 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
             # 方向 DA：用 y4(均值涨跌)预测的符号
             y4_pred = per_target_models["y4_mean_pct"].predict(X_te_s)
             da = _mh_direction_da(y4_pred, y4_te_true)
+            # ① DA 按期限拆开(长/短期限差异)——注意同时看该期限的"总是涨"基准，别把高基准当本事
+            hcol = te["h"].values.astype(int)
+            da_by_h, base_by_h = {}, {}
+            for hh in sorted(set(hcol)):
+                mk_h = hcol == hh
+                da_by_h[int(hh)] = round(_mh_direction_da(y4_pred[mk_h], y4_te_true[mk_h]), 1)
+                pu = float(np.mean(y4_te_true[mk_h] > 0))
+                base_by_h[int(hh)] = round(max(pu, 1 - pu) * 100, 1)
+            # ② 高置信弃权 DA：只在|预测涨跌|最大的前 20% 日子出手，报该子集 DA + 覆盖率 + 该子集基准
+            cov = 0.20
+            thr = np.quantile(np.abs(y4_pred), 1 - cov) if len(y4_pred) else 0.0
+            sel = np.abs(y4_pred) >= thr
+            da_sel = round(_mh_direction_da(y4_pred[sel], y4_te_true[sel]), 1) if sel.sum() else None
+            pu_sel = float(np.mean(y4_te_true[sel] > 0)) if sel.sum() else 0.0
+            base_sel = round(max(pu_sel, 1 - pu_sel) * 100, 1)
             row = {"algo": algo, "DA_dir_pct": round(da, 2),
                    "RMSE_y4": round(rmse_by_t["y4_mean_pct"], 4),
                    "beat_naive_y4": bool(rmse_by_t["y4_mean_pct"] < naive_rmse["y4_mean_pct"]),
+                   "da_by_h": da_by_h, "base_by_h": base_by_h,
+                   "da_top20": da_sel, "cover_pct": round(float(sel.mean()) * 100, 1), "base_top20": base_sel,
                    "note": f"n训练={len(tr)} n测试={len(te)}"}
             results.append(row)
-            log(f"[{algo}] 完成：方向DA={da:.1f}%(基准≈{base_rate:.1f}%) / y4测试RMSE={rmse_by_t['y4_mean_pct']:.3f}"
-                f"（{'优于' if row['beat_naive_y4'] else '未优于'}Naive）")
+            log(f"[{algo}] 方向DA={da:.1f}%(基准≈{base_rate:.1f}%) / 高置信20%时DA={da_sel}%(该子集基准{base_sel}%) "
+                f"/ y4RMSE={rmse_by_t['y4_mean_pct']:.3f}（{'优于' if row['beat_naive_y4'] else '未优于'}Naive）")
+            log(f"[{algo}] DA@各期限: " + " ".join(f"h{k}={v}%(基{base_by_h[k]})" for k, v in da_by_h.items()))
 
             if freeze:
                 fp = pd.to_datetime(split_date).strftime("%Y%m%d")
@@ -13913,8 +13950,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="全局训练用哪些股票：subset=内置流动性子集(先跑通) / all=本地全部(自动剔除已退市)")
     p.add_argument("--global-codes", default=None,
                    help="逗号分隔的股票代码，覆盖 --global-scope(自定义参与全局训练的股票)")
-    p.add_argument("--global-algos", default="SVR,GPR,Lasso,PLSR,ELM",
-                   help="参与全局池化的模型(ARIMA 逐股基线自动附带，不入全局冻结)")
+    p.add_argument("--global-algos", default="RF,GBRT,XGBoost,LightGBM,ExtraTrees,Lasso,ELM",
+                   help="参与全局池化的模型(树模型通常最强；缺库自动跳过；ARIMA 逐股基线自动附带，不入全局冻结)")
     p.add_argument("--split-date", default="2024-01-01", help="全局训练的日期切分点(此前=训练,此后=测试)")
     p.add_argument("--anchor-stride", type=int, default=5, help="锚定日抽样步长(控样本量，默认5≈每周一个)")
     p.add_argument("--max-train-samples", type=int, default=12000, help="训练集样本上限(控时；测试集全量)")
@@ -14082,12 +14119,21 @@ def main():
         print(f"全局池化训练结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
               f"  方向基准(多数类)≈{summary['base_rate_pct']}%")
         print("-" * 74)
-        print(f"{'模型':<20}{'方向DA%':>10}{'y4测试RMSE':>12}{'优于Naive':>10}")
+        print(f"{'模型':<18}{'方向DA%':>9}{'高置信20%DA':>12}{'该子集基准':>10}{'y4RMSE':>9}{'优于Naive':>9}")
         for r in summary["results"]:
             da = "-" if r.get("DA_dir_pct") is None else r["DA_dir_pct"]
+            dt = "-" if r.get("da_top20") is None else r["da_top20"]
+            bt = "-" if r.get("base_top20") is None else r.get("base_top20", "-")
             rm = "-" if r.get("RMSE_y4") is None else r["RMSE_y4"]
             bn = ("是" if r.get("beat_naive_y4") else "否") if "beat_naive_y4" in r else ""
-            print(f"{r['algo']:<20}{str(da):>10}{str(rm):>12}{bn:>10}")
+            print(f"{r['algo']:<18}{str(da):>9}{str(dt):>12}{str(bt):>10}{str(rm):>9}{bn:>9}")
+        # 按期限 DA(看长期限是否更高；括号内为该期限"总是涨"基准，别把高基准当本事)
+        print("-" * 74)
+        print("方向DA 按期限拆开（h=交易日；括号=该期限『总是涨』基准）:")
+        for r in summary["results"]:
+            if r.get("da_by_h"):
+                seg = " ".join(f"h{k}={v}%({r['base_by_h'][k]})" for k, v in r["da_by_h"].items())
+                print(f"  {r['algo']:<16} {seg}")
         ab = summary.get("arima_baseline", {})
         print(f"[ARIMA·逐股基线] {ab.get('note','')} 方向DA≈{ab.get('DA_dir_pct')}")
         print("=" * 74)
