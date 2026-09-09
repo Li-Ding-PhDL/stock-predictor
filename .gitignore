@@ -38,6 +38,9 @@ watchlist/
 frozen_models/
 *.joblib
 
+# ---- CatBoost 训练时自动生成的日志目录(产物，不入库) ----
+catboost_info/
+
 # ---- 生成的报告(本地产物，不入库) ----
 报告_*.html
 *.html
