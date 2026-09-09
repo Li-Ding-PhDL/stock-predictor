@@ -219,8 +219,23 @@ WATCHLIST_DIR = os.path.join(BASE_DIR, "watchlist")   # 自选股票：分组+�
 os.makedirs(WATCHLIST_DIR, exist_ok=True)
 WATCHLIST_DB = os.path.join(WATCHLIST_DIR, "watchlist.db")
 
+# ------------------------------------------------------------------------------
+# 2.1b 本地离线数据集（可选，非破坏式）
+# ------------------------------------------------------------------------------
+# 设置后 fetch()/enrich() 会**优先读本地 CSV**（每只股票一个文件），该代码文件缺失时才回落联网。
+# 目录结构约定：<根>/每只股票一个文件/{前复权|后复权|不复权}/<代码>.csv（UTF-8，中文表头）。
+# 优先级：环境变量 STOCK_LOCAL_DATA_ROOT > 下面的默认常量。
+# 安全性：若解析出的目录不存在（例如换到别的机器、或别人克隆本仓库），会被 _resolve_local_root()
+#          自动忽略并回落到原来的 akshare/baostock 联网流程 —— 现有行为完全不变，不破坏红线。
+LOCAL_DATA_ROOT = os.environ.get("STOCK_LOCAL_DATA_ROOT", r"C:\Users\Q\Desktop\股票4.14")
+
 RANDOM_SEED = 42            # 全局随机种子，保证实验可复现
 np.random.seed(RANDOM_SEED)
+
+# 盈亏比(Risk-Reward Ratio)= 平均盈利 / 平均亏损。用于把"方向准确率/胜率"折算成"数学期望"。
+# 暂定 1.5:1（止盈 1.5R、止损 1R，量化实务常见的稳健设定）。想改整体口径改这里即可。
+# 注意：这是把胜率折算成期望的**研究性口径**，不是买卖信号，任何结论仍受"不荐股、盈亏自负"红线约束。
+DEFAULT_RISK_REWARD_RATIO = 1.5
 
 
 # ------------------------------------------------------------------------------
@@ -309,6 +324,78 @@ class StockDataFetcher:
         return any(k in s for k in ("remotedisconnected", "connection aborted",
                                     "connection reset", "remote end closed", "max retries"))
 
+    # ---------- 3.0 本地离线数据集（可选，配置 LOCAL_DATA_ROOT 后启用）----------
+    # 复权方式 -> 子目录名
+    _LOCAL_ADJ_DIR = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}
+    # 本地 CSV 中文列 -> 流水线契约列（与 _fetch_akshare 输出保持一致，做到 drop-in）
+    _LOCAL_COL_MAP = {
+        "日期": "date", "开盘价": "open", "最高价": "high", "最低价": "low", "收盘价": "close",
+        "成交量（股）": "volume", "成交额（元）": "amount", "换手率": "turnover",
+        "涨幅%": "pct_change", "振幅%": "amplitude",
+    }
+    # 本地 CSV 自带的估值列 -> 与联网 _fetch_valuation 相同的 val_* 列名（drop-in 顶替）
+    _LOCAL_VAL_MAP = {
+        "日期": "date", "滚动市盈率": "val_pe_ttm", "市净率": "val_pb",
+        "滚动市销率": "val_ps_ttm", "总市值（元）": "val_total_mv",
+    }
+
+    @staticmethod
+    def _resolve_local_root(explicit: Optional[str] = None) -> Optional[str]:
+        """解析本地数据集根目录。优先级：显式传参 > 环境变量 STOCK_LOCAL_DATA_ROOT > 常量 LOCAL_DATA_ROOT。
+        仅当目录真实存在、且其下有 '每只股票一个文件' 子目录时才认作有效；否则返回 None（回落联网）。"""
+        root = explicit or os.environ.get("STOCK_LOCAL_DATA_ROOT") or LOCAL_DATA_ROOT
+        if root and os.path.isdir(os.path.join(root, "每只股票一个文件")):
+            return root
+        return None
+
+    @staticmethod
+    def _local_csv_path(code: str, adjust: str, root: str) -> str:
+        """给定代码/复权/根目录，拼出本地 CSV 路径：<根>/每只股票一个文件/<复权>/<代码>.csv"""
+        adj = StockDataFetcher._LOCAL_ADJ_DIR.get(adjust, "前复权")
+        return os.path.join(root, "每只股票一个文件", adj, f"{str(code).strip()}.csv")
+
+    @staticmethod
+    def _fetch_local(code, start_date, end_date, adjust, root) -> pd.DataFrame:
+        """从本地 CSV 读单只股票日线，产出与 _fetch_akshare 一致的契约列并按 [start,end] 截取。
+        注意：本地 成交量 单位为『股』（akshare 为『手』）。同一次离线运行内所有股票单位一致，
+        且下游对 volume 做标准化/比率处理，不影响相对特征；仅在与联网数据混用时需知晓此差异。"""
+        path = StockDataFetcher._local_csv_path(code, adjust, root)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"本地数据集无此代码文件: {path}")
+        raw = pd.read_csv(path, dtype=str)
+        cols = {k: v for k, v in StockDataFetcher._LOCAL_COL_MAP.items() if k in raw.columns}
+        if "日期" not in cols or "收盘价" not in raw.columns:
+            raise RuntimeError(f"本地 CSV 列结构异常（缺 日期/收盘价）: {path}")
+        df = raw[list(cols)].rename(columns=cols)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for c in ("open", "high", "low", "close", "volume", "amount", "turnover", "pct_change", "amplitude"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date")
+        s = pd.to_datetime(str(start_date), format="%Y%m%d", errors="coerce")
+        e = pd.to_datetime(str(end_date), format="%Y%m%d", errors="coerce")
+        if pd.notna(s):
+            df = df[df["date"] >= s]
+        if pd.notna(e):
+            df = df[df["date"] <= e]
+        return df.reset_index(drop=True)
+
+    @staticmethod
+    def _fetch_valuation_local(code, root) -> pd.DataFrame:
+        """从同一份本地 CSV 抽出日频估值列（PE_TTM/PB/PS_TTM/总市值），列名与联网 _fetch_valuation 对齐，
+        供 enrich() 离线顶替联网估值。估值与复权无关，固定读『前复权』文件即可。"""
+        path = StockDataFetcher._local_csv_path(code, "qfq", root)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"本地数据集无此代码文件: {path}")
+        raw = pd.read_csv(path, dtype=str)
+        cols = {k: v for k, v in StockDataFetcher._LOCAL_VAL_MAP.items() if k in raw.columns}
+        v = raw[list(cols)].rename(columns=cols)
+        v["date"] = pd.to_datetime(v["date"], errors="coerce")
+        for c in v.columns:
+            if c != "date":
+                v[c] = pd.to_numeric(v[c], errors="coerce")
+        return v.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
     # ---------- 3.1 拉取真实历史行情（多源自动容错）----------
     def fetch(self, code: str, start_date: str, end_date: str,
               adjust: str = "qfq", use_cache: bool = True,
@@ -324,13 +411,30 @@ class StockDataFetcher:
             adjust     : 复权方式，"qfq"=前复权（推荐，训练用），"hfq"=后复权，""=不复权
             use_cache  : 是否优先读取本地缓存（避免重复请求，加快调试速度）
             bypass_proxy: 拉取时是否临时绕过系统代理（默认开，解决 VPN 导致的 ProxyError）
-            source     : "auto"(先东方财富后 baostock) / "akshare" / "baostock"
+            source     : "auto"(本地数据集→东方财富→baostock) / "local"(仅本地) / "akshare" / "baostock"
             retries    : 单个数据源的重试次数（应对 RemoteDisconnected 等瞬时网络抖动）
 
         返回：
             统一格式的 DataFrame，至少包含列 [date, open, close, high, low, volume]。
         """
         cache_path = self._cache_path(code, start_date, end_date, adjust)
+
+        # ---- 3.1.0 本地离线数据集优先（配置了 LOCAL_DATA_ROOT 且该代码文件存在时）----
+        local_root = self._resolve_local_root()
+        if source in ("auto", "local") and local_root and \
+                os.path.exists(self._local_csv_path(code, adjust, local_root)):
+            try:
+                df = self._fetch_local(code, start_date, end_date, adjust, local_root)
+                if df is None or len(df) == 0:
+                    raise RuntimeError("本地数据在该日期区间为空")
+                return df
+            except Exception as e:
+                if source == "local":
+                    raise RuntimeError(f"本地数据集读取失败({code}): {e}")
+                # auto 模式：本地失败则继续回落联网
+        if source == "local":
+            _p = self._local_csv_path(code, adjust, local_root) if local_root else "(未配置/无效 LOCAL_DATA_ROOT)"
+            raise RuntimeError(f"指定 source='local' 但未找到本地数据: {_p}")
 
         # ---- 3.1.1 优先读取本地缓存 ----
         # 但：若结束日期是"今天或未来"，当天日线还在变(报告价格会滞后)，则强制重新拉取最新数据，不吃旧缓存。
@@ -465,16 +569,28 @@ class StockDataFetcher:
 
         df = _nsdate(df)
         status: Dict[str, str] = {}
-        if want_valuation and HAS_AKSHARE:
-            try:
-                v = _nsdate(StockDataFetcher._fetch_valuation(code, bypass_proxy))
-                df = pd.merge_asof(df, v, on="date", direction="backward")
-                vcols = [c for c in v.columns if c != "date"]
-                status["valuation"] = f"已接入({len(v)}行: {'/'.join(vcols)})"
-            except Exception as e:
-                status["valuation"] = f"跳过(取数失败: {e})"
-        elif want_valuation:
-            status["valuation"] = "跳过(未安装 akshare)"
+        if want_valuation:
+            _root = StockDataFetcher._resolve_local_root()
+            _use_local = bool(_root) and os.path.exists(StockDataFetcher._local_csv_path(code, "qfq", _root))
+            if _use_local:
+                # 本地 CSV 自带日频 PE_TTM/PB/PS_TTM/总市值，离线顶替联网估值，补上「数据缺省」
+                try:
+                    v = _nsdate(StockDataFetcher._fetch_valuation_local(code, _root))
+                    df = pd.merge_asof(df, v, on="date", direction="backward")
+                    vcols = [c for c in v.columns if c != "date"]
+                    status["valuation"] = f"已接入(本地CSV, {len(v)}行: {'/'.join(vcols)})"
+                except Exception as e:
+                    status["valuation"] = f"跳过(本地估值失败: {e})"
+            elif HAS_AKSHARE:
+                try:
+                    v = _nsdate(StockDataFetcher._fetch_valuation(code, bypass_proxy))
+                    df = pd.merge_asof(df, v, on="date", direction="backward")
+                    vcols = [c for c in v.columns if c != "date"]
+                    status["valuation"] = f"已接入({len(v)}行: {'/'.join(vcols)})"
+                except Exception as e:
+                    status["valuation"] = f"跳过(取数失败: {e})"
+            else:
+                status["valuation"] = "跳过(未安装 akshare 且无本地数据)"
         if want_index and HAS_AKSHARE:
             try:
                 ix = _nsdate(StockDataFetcher._fetch_index(bypass_proxy))
@@ -5086,10 +5202,41 @@ def optimize_factor_weights(codes: List[str], lookback_days: int = 252, fwd_days
 
 
 # ==================== 第八部分补充4b：组合与仓位（借鉴 kelly/correlation/portfolio 等交易 skill） ====================
-def kelly_fraction(p: float, b: float) -> Dict[str, Any]:
-    """凯利公式仓位：p=胜率(0~1)，b=赔率(平均盈利/平均亏损)。f* = (p*b - (1-p)) / b = p - (1-p)/b。
+def expectancy(p: float, rr: float = DEFAULT_RISK_REWARD_RATIO,
+               stake: Optional[float] = None) -> Dict[str, Any]:
+    """数学期望(Expectancy)：把方向准确率/胜率 p 折算成每笔交易的期望收益。
+    口径同风险回报框架：以"止损额 1R"为单位，盈利 = rr·R、亏损 = 1·R，
+        E_per_R = p·rr − (1−p)·1
+    rr 即**盈亏比**(平均盈利/平均亏损)，默认取全局 DEFAULT_RISK_REWARD_RATIO(1.5:1)。
+    E_per_R>0 表示这套"胜率×盈亏比"长期有正期望；≤0 表示长期必亏(即便胜率>50%)。
+    可选 stake=单笔止损金额(元)，则额外给出每笔期望的绝对金额 E_amount = E_per_R × stake。
+    **这是研究性期望值估算，非买卖建议、非收益承诺，盈亏自负。**"""
+    if p is None or rr is None or rr <= 0 or not (0 <= p <= 1):
+        return {"e_per_r": None, "rr": rr, "text": "参数无效(需 0≤胜率≤1、盈亏比>0)"}
+    e_per_r = p * rr - (1 - p)
+    win_needed = 1.0 / (1.0 + rr)                      # 该盈亏比下"期望盈亏平衡"所需的最低胜率
+    out: Dict[str, Any] = {
+        "e_per_r": round(e_per_r, 4), "rr": rr, "p": round(p, 4),
+        "breakeven_winrate": round(win_needed, 4),
+    }
+    if stake is not None and stake > 0:
+        out["e_amount"] = round(e_per_r * stake, 2)
+        out["stake"] = stake
+    verdict = "正期望(长期有利)" if e_per_r > 0 else ("零期望(盈亏平衡)" if e_per_r == 0 else "负期望(长期必亏)")
+    out["text"] = (f"盈亏比 {rr:.2f}:1、胜率 {p*100:.1f}% → 每承担 1 份止损的数学期望 "
+                   f"{e_per_r:+.3f}R（{verdict}）；该盈亏比下保本需胜率≥{win_needed*100:.1f}%。"
+                   + (f" 若单笔止损 {stake:.0f} 元，每笔期望约 {out['e_amount']:+.1f} 元。" if stake else "")
+                   + " 研究性估算，非投资建议、盈亏自负。")
+    return out
+
+
+def kelly_fraction(p: float, b: Optional[float] = None) -> Dict[str, Any]:
+    """凯利公式仓位：p=胜率(0~1)，b=赔率(平均盈利/平均亏损，即**盈亏比**)。f* = (p*b - (1-p)) / b = p - (1-p)/b。
+    b 缺省时取全局 DEFAULT_RISK_REWARD_RATIO(盈亏比，暂定 1.5:1)。
     借鉴 kelly-criterion skill。返回全凯利/半凯利(实务更稳)+文字解释。**这是数学最优增长比例，不是买卖建议**。
     A 股不能做空、且估计误差大，务必用『半凯利甚至更低』，且 f*≤0 表示这笔『期望为负、根本不该下注』。"""
+    if b is None:
+        b = DEFAULT_RISK_REWARD_RATIO
     if b is None or b <= 0 or p is None or not (0 <= p <= 1):
         return {"kelly": None, "half": None, "text": "参数无效(需 0≤胜率≤1、赔率>0)"}
     f = p - (1 - p) / b
@@ -7632,6 +7779,48 @@ if HAS_PYSIDE6:
                 return True
             return False
 
+    class GlobalDatasetWorker(QThread):
+        """全局『多期限×多目标』数据集构建后台线程：批量读本地 CSV → 池化，不卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(object)          # pd.DataFrame
+        error_signal = Signal(str)
+
+        def __init__(self, codes, horizons, anchor_stride):
+            super().__init__()
+            self.codes = codes; self.horizons = horizons; self.anchor_stride = anchor_stride
+
+        def run(self):
+            try:
+                ds = build_multi_horizon_dataset(
+                    self.codes, self.horizons, anchor_stride=self.anchor_stride,
+                    progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(ds)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class GlobalTrainWorker(QThread):
+        """全局池化训练+冻结后台线程：建数据集→全局日期切→训练→冻结→ARIMA基线，不卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, codes, algos, split_date, hpo_method, hpo_trials, anchor_stride, freeze):
+            super().__init__()
+            self.codes = codes; self.algos = algos; self.split_date = split_date
+            self.hpo_method = hpo_method; self.hpo_trials = hpo_trials
+            self.anchor_stride = anchor_stride; self.freeze = freeze
+
+        def run(self):
+            try:
+                summary = train_global_pooled(
+                    codes=self.codes, algos=self.algos, split_date=self.split_date,
+                    hpo_method=self.hpo_method, hpo_trials=self.hpo_trials,
+                    anchor_stride=self.anchor_stride, freeze=self.freeze,
+                    progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(summary)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
     # ---------- 9.2 主窗口 ----------
     class MainWindow(QMainWindow):
 
@@ -7817,6 +8006,8 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_batch_tab(), "批量扫描")
             # 自选股票：持久保存关注的分组股票，一键批量预测+看每只的真实特征数据集
             self.tabs.addTab(self._build_watchlist_tab(), "自选股票")
+            # 全局模型(多期限)：把一批股票池化成"多期限×多目标"数据集(可在软件里看)，训练+冻结，加载即预测
+            self.tabs.addTab(self._build_global_model_tab(), "全局模型(多期限)")
             # 强化学习交易：DQN 智能体学"买/卖/持"而非预测价格，独立测试段对比买入持有基准
             self.tabs.addTab(self._build_rl_tab(), "强化学习交易")
             # 投资流派视角：借鉴 UZI-Skill(MIT) 的可量化选股法则，套真实数据算各流派通过/不通过
@@ -7831,7 +8022,7 @@ if HAS_PYSIDE6:
             self._tab_categories = [
                 ("行情板块", ["行情K线图", "板块行情"]),
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
-                ("机器学习板块", ["机器学习内部"]),
+                ("机器学习板块", ["机器学习内部", "全局模型(多期限)"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
                 ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位"]),
                 ("日志板块", ["运行日志", "操作日志"]),
@@ -9934,6 +10125,189 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "导出失败", str(e))
 
         # ---- 9.2.1g2 自选股票标签页：持久分组 + 批量真实预测 + 点行看真实特征数据集 ----
+        # ---------- 9.2.1h9 全局模型(多期限×多目标)：数据集可视 + 训练冻结 + 加载预测 ----------
+        def _build_global_model_tab(self) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            layout.setSpacing(6)
+
+            intro = QLabel(
+                "🌐 全局模型(多期限×多目标)：把一批股票池化成一个数据集——输入含『期限h(交易日)』特征，"
+                "输出 y1方向 / y2最低 / y3中位 / y4平均 / y5最高(涨跌%)。先用流动性子集训练+冻结(超参+模型存盘)，"
+                "以后加载即预测、不必重训。全局按日期切分防泄露、标准化只在训练集fit、强制Naive基准+DA。研究用途，非投资建议、盈亏自负。")
+            intro.setWordWrap(True)
+            intro.setStyleSheet("color:#555;background:#f6f8fb;padding:6px;")
+            layout.addWidget(intro)
+
+            # ── 参数区 ──
+            box = QGroupBox("参数")
+            g = QGridLayout(box)
+            g.addWidget(QLabel("股票范围:"), 0, 0)
+            self.gm_scope_combo = QComboBox()
+            self.gm_scope_combo.addItems(["流动性子集(先跑通)", "本地全部(剔除已退市)", "自定义代码"])
+            g.addWidget(self.gm_scope_combo, 0, 1)
+            g.addWidget(QLabel("自定义代码(逗号分隔):"), 0, 2)
+            self.gm_codes_edit = QLineEdit()
+            self.gm_codes_edit.setPlaceholderText("仅『自定义代码』时生效，如 600519,000858,600036")
+            g.addWidget(self.gm_codes_edit, 0, 3, 1, 3)
+
+            g.addWidget(QLabel("日期切分(此前训练/此后测试):"), 1, 0)
+            self.gm_split_edit = QLineEdit("2024-01-01")
+            g.addWidget(self.gm_split_edit, 1, 1)
+            g.addWidget(QLabel("锚定日步长:"), 1, 2)
+            self.gm_stride_spin = QSpinBox(); self.gm_stride_spin.setRange(1, 60); self.gm_stride_spin.setValue(5)
+            self.gm_stride_spin.setToolTip("锚定日抽样步长(默认5≈每周一个)，越小样本越多越慢")
+            g.addWidget(self.gm_stride_spin, 1, 3)
+            g.addWidget(QLabel("超参寻优:"), 1, 4)
+            self.gm_hpo_combo = QComboBox(); self.gm_hpo_combo.addItems(["关闭", "BO", "PSO", "GA", "FA", "SOA"])
+            self.gm_hpo_combo.setToolTip("BO=贝叶斯优化(吃性能但更优)；先『关闭』快速跑通，正式训练选 BO")
+            g.addWidget(self.gm_hpo_combo, 1, 5)
+
+            g.addWidget(QLabel("参与模型:"), 2, 0)
+            self.gm_algos_edit = QLineEdit("SVR,GPR,Lasso,PLSR,ELM")
+            self.gm_algos_edit.setToolTip("参与全局池化的模型；ARIMA 自动附带『逐股基线』，不入全局冻结")
+            g.addWidget(self.gm_algos_edit, 2, 1, 1, 3)
+            layout.addWidget(box)
+
+            # ── 按钮区 ──
+            btns = QHBoxLayout()
+            self.gm_build_btn = QPushButton("① 生成数据集(预览)")
+            self.gm_build_btn.clicked.connect(self._on_gm_build)
+            btns.addWidget(self.gm_build_btn)
+            self.gm_export_btn = QPushButton("导出数据集CSV")
+            self.gm_export_btn.clicked.connect(self._on_gm_export); self.gm_export_btn.setEnabled(False)
+            btns.addWidget(self.gm_export_btn)
+            self.gm_train_btn = QPushButton("② 训练 + 冻结")
+            self.gm_train_btn.clicked.connect(self._on_gm_train)
+            btns.addWidget(self.gm_train_btn)
+            btns.addWidget(QLabel("③ 加载冻结预测:"))
+            self.gm_predict_edit = QLineEdit(); self.gm_predict_edit.setPlaceholderText("股票代码，如 600519")
+            self.gm_predict_edit.setMaximumWidth(140)
+            btns.addWidget(self.gm_predict_edit)
+            self.gm_predict_btn = QPushButton("预测")
+            self.gm_predict_btn.clicked.connect(self._on_gm_predict)
+            btns.addWidget(self.gm_predict_btn)
+            btns.addStretch(1)
+            layout.addLayout(btns)
+
+            # ── 数据集表格(输入/输出标注) + 日志 ──
+            self.gm_table = QTableWidget()
+            self.gm_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.gm_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            layout.addWidget(self.gm_table, stretch=3)
+            self.gm_log = QTextEdit(); self.gm_log.setReadOnly(True); self.gm_log.setMaximumHeight(150)
+            self.gm_log.setStyleSheet("font-family:Consolas,monospace;font-size:12px;")
+            layout.addWidget(self.gm_log, stretch=1)
+
+            self._gm_dataset = None
+            return panel
+
+        def _gm_codes(self) -> List[str]:
+            scope = self.gm_scope_combo.currentText()
+            if scope.startswith("自定义"):
+                return [c.strip() for c in self.gm_codes_edit.text().split(",") if c.strip()]
+            if scope.startswith("本地全部"):
+                return _scan_all_local_codes()
+            return list(GLOBAL_SUBSET_CODES)
+
+        def _gm_logmsg(self, m: str):
+            self.gm_log.append(m); self.gm_log.ensureCursorVisible()
+
+        def _on_gm_build(self):
+            codes = self._gm_codes()
+            if not codes:
+                QMessageBox.warning(self, "无股票", "请先选择股票范围或填写自定义代码。"); return
+            self.gm_build_btn.setEnabled(False); self.gm_log.clear()
+            self._gm_logmsg(f"生成数据集：{len(codes)} 只股票，步长 {self.gm_stride_spin.value()} ...")
+            self._gm_ds_worker = GlobalDatasetWorker(codes, DEFAULT_HORIZONS, self.gm_stride_spin.value())
+            self._gm_ds_worker.progress_signal.connect(self._gm_logmsg)
+            self._gm_ds_worker.finished_signal.connect(self._on_gm_build_done)
+            self._gm_ds_worker.error_signal.connect(lambda e: (self._gm_logmsg("失败: " + e), self.gm_build_btn.setEnabled(True)))
+            self._gm_ds_worker.start()
+
+        def _on_gm_build_done(self, ds):
+            self.gm_build_btn.setEnabled(True)
+            self._gm_dataset = ds
+            self.gm_export_btn.setEnabled(ds is not None and len(ds) > 0)
+            if ds is None or len(ds) == 0:
+                self._gm_logmsg("数据集为空。"); return
+            self._gm_logmsg(f"完成：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票。表格仅显示前 500 行。")
+            self._gm_fill_table(ds.head(500))
+
+        def _gm_fill_table(self, ds):
+            # 表头按 标识/输入/输出 归类标注
+            id_cols = ["code", "name", "date", "close"]
+            out_cols = [c for c in ds.columns if c.startswith("y")]
+            def _tag(c):
+                if c in id_cols: return f"标识·{c}"
+                if c in out_cols: return f"输出·{c}"
+                return f"输入·{c}"
+            cols = list(ds.columns)
+            self.gm_table.setColumnCount(len(cols))
+            self.gm_table.setHorizontalHeaderLabels([_tag(c) for c in cols])
+            self.gm_table.setRowCount(len(ds))
+            for i in range(len(ds)):
+                for j, c in enumerate(cols):
+                    v = ds.iloc[i][c]
+                    # 表头前缀已标注 标识/输入/输出，单元格不再着色（避免依赖 QColor，跨主题更稳）
+                    self.gm_table.setItem(i, j, QTableWidgetItem("" if pd.isna(v) else str(v)))
+            self.gm_table.resizeColumnsToContents()
+
+        def _on_gm_export(self):
+            if self._gm_dataset is None or len(self._gm_dataset) == 0:
+                QMessageBox.information(self, "无数据", "请先生成数据集。"); return
+            path, _ = QFileDialog.getSaveFileName(self, "导出数据集", "训练数据集_全局.csv", "CSV (*.csv)")
+            if path:
+                self._gm_dataset.to_csv(path, index=False, encoding="utf-8-sig")
+                self._gm_logmsg(f"已导出: {path}")
+
+        def _on_gm_train(self):
+            codes = self._gm_codes()
+            if not codes:
+                QMessageBox.warning(self, "无股票", "请先选择股票范围或填写自定义代码。"); return
+            algos = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()]
+            self.gm_train_btn.setEnabled(False); self.gm_log.clear()
+            self._gm_logmsg(f"训练+冻结：{len(codes)} 只 / 模型 {algos} / 切分 {self.gm_split_edit.text()} / "
+                            f"寻优 {self.gm_hpo_combo.currentText()} ...(BO 会较慢，请耐心)")
+            self._gm_train_worker = GlobalTrainWorker(
+                codes, algos, self.gm_split_edit.text().strip(), self.gm_hpo_combo.currentText(),
+                self.config_hpo_trials() if hasattr(self, "config_hpo_trials") else 15,
+                self.gm_stride_spin.value(), True)
+            self._gm_train_worker.progress_signal.connect(self._gm_logmsg)
+            self._gm_train_worker.finished_signal.connect(self._on_gm_train_done)
+            self._gm_train_worker.error_signal.connect(lambda e: (self._gm_logmsg("失败: " + e), self.gm_train_btn.setEnabled(True)))
+            self._gm_train_worker.start()
+
+        def _on_gm_train_done(self, summary):
+            self.gm_train_btn.setEnabled(True)
+            self._gm_logmsg("=" * 60)
+            self._gm_logmsg(f"训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只  "
+                            f"方向基准(多数类)≈{summary['base_rate_pct']}%")
+            for r in summary["results"]:
+                da = r.get("DA_dir_pct"); rm = r.get("RMSE_y4")
+                bn = ("优于Naive" if r.get("beat_naive_y4") else "未优于Naive") if "beat_naive_y4" in r else ""
+                self._gm_logmsg(f"  {r['algo']:<18} 方向DA={da}%  y4RMSE={rm}  {bn}")
+            ab = summary.get("arima_baseline", {})
+            self._gm_logmsg(f"  [ARIMA·逐股基线] 方向DA≈{ab.get('DA_dir_pct')}（未纳入全局冻结）")
+            if summary.get("frozen"):
+                self._gm_logmsg("已冻结: " + " ".join(os.path.basename(v) for v in summary["frozen"].values()))
+            self._gm_logmsg("⚠ DA需显著>50%且高于基准、y4RMSE优于Naive才算真有用。研究性回测，非投资建议、盈亏自负。")
+
+        def _on_gm_predict(self):
+            code = self.gm_predict_edit.text().strip()
+            if not code:
+                QMessageBox.warning(self, "缺代码", "请填写要预测的股票代码。"); return
+            algo1 = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()][0]
+            try:
+                r = predict_frozen(code, algo=algo1)
+            except Exception as e:
+                QMessageBox.critical(self, "预测失败", str(e)); return
+            self._gm_logmsg(f"[加载冻结预测] {r['code']} 用 {r['algo']}({r['frozen_file']}) 基于 {r['as_of']} 收盘 {r['from_close']}元")
+            for p_ in r["predictions"]:
+                self._gm_logmsg(f"  期限{p_['h']:>2}日  {p_['方向']}  y4平均={p_['y4平均%']:+}%  y5最高={p_['y5最高%']:+}%  "
+                                f"(y4≈{p_['y4平均(元)']}元 / y5≈{p_['y5最高(元)']}元)")
+            self._gm_logmsg("⚠ " + r["disclaimer"])
+
         def _build_watchlist_tab(self) -> QWidget:
             panel = QWidget()
             outer = QHBoxLayout(panel)
@@ -10794,15 +11168,19 @@ if HAS_PYSIDE6:
             except ValueError:
                 self.kelly_view.setText("请输入有效数字(胜率%、赔率)。"); return
             r = kelly_fraction(p, b)
+            ev = expectancy(p, b)                       # 盈亏比 b 折算的数学期望(同截图 E 口径)
             if r["kelly"] is None:
                 self.kelly_view.setText(r["text"]); return
+            ev_color = "#1a7f37" if (ev["e_per_r"] or 0) > 0 else "#c0392b"
             self.kelly_view.setText(
                 f"<b>凯利仓位：全凯利 {r['kelly']*100:.0f}% ／ 半凯利 {r['half']*100:.0f}%(推荐)</b>　"
                 f"（原始 f*={r['raw']*100:.0f}%，A股不做空/不加杠杆已截断到0~100%）<br>"
                 f"<span style='color:#555'>{r['text']}</span><br>"
+                f"<b>数学期望：</b><span style='color:{ev_color}'>{ev['e_per_r']:+.3f}R / 笔</span>"
+                f"（盈亏比 {b:.2f}:1、胜率 {p*100:.1f}%；该盈亏比下<b>保本需胜率≥{ev['breakeven_winrate']*100:.1f}%</b>）<br>"
                 "<span style='color:#c0392b;font-size:12px'>⚠ 胜率/赔率是<b>估计值、误差大</b>，全凯利会大起大落；"
-                "这是数学最优增长比例，<b>非投资建议</b>，请务必留足风险边际。</span>")
-            self._oplog(f"凯利仓位计算：p={p:.2f}, b={b:.2f} → 半凯利 {r['half']*100:.0f}%。")
+                "期望值是<b>长期统计口径</b>、非单笔承诺；这是数学最优增长比例，<b>非投资建议</b>，请务必留足风险边际。</span>")
+            self._oplog(f"凯利仓位计算：p={p:.2f}, b={b:.2f} → 半凯利 {r['half']*100:.0f}%，数学期望 {ev['e_per_r']:+.3f}R/笔。")
 
         # ---- 9.2.1h2 尾盘选股标签页（五维尾盘法） ----
         def _build_tail_scan_tab(self) -> QWidget:
@@ -12941,6 +13319,383 @@ if HAS_PYSIDE6:
                 pass
 
 
+# ==================== 第八部分补充8：多期限×多目标数据集 + 全局池化训练 + 冻结/加载 ====================
+# 与「训练数据集预览_10股.csv」同口径。核心思路：把"预测期限 h(交易日)"当成一个输入特征，
+# 让**一个模型覆盖多个期限**(direct multi-horizon)；输出是未来窗口 [t+1, t+h] 的
+#   y2/y3/y4/y5 = 最低/中位/平均/最高价 相对当日收盘的"涨跌%"(诚实口径，非绝对价，跨股票才可比)。
+#   方向 y1 = sign(未来均值涨跌)，由 y4 导出，用于 DA。
+# 【红线自查】
+#  #1 时序：池化多股后按**全局日期**切(截止日 D 前=训练、D 后=测试)，同一锚定日的多期限行不跨界；
+#  #2 标准化：StandardScaler 只在训练集 fit，测试集只 transform；
+#  #3 基准：强制 Naive(前值持有→涨跌预测=0) 对比 + 方向准确率 DA；
+#  #4 目标不进特征：X 只用当天及以前可得的技术/估值特征 + h，未来价只做标签；
+#  #5 依赖可降级：joblib 缺失自动退回 pickle；
+#  #7 不荐股：所有对外结论带"非建议、盈亏自负"。
+import glob as _glob
+import pickle as _pickle
+try:
+    import joblib as _joblib
+    HAS_JOBLIB = True
+except ImportError:
+    _joblib = None
+    HAS_JOBLIB = False
+
+FROZEN_DIR = os.path.join(BASE_DIR, "frozen_models")   # 冻结模型(超参+已拟合模型+scaler)的持久化目录
+os.makedirs(FROZEN_DIR, exist_ok=True)
+
+DEFAULT_HORIZONS: List[int] = [1, 2, 3, 5, 10, 21, 32, 42]   # 1/2/3日、一周、两周、一个月、一个半月、两个月
+# 全局模型池化用的"流动性子集"默认清单(大市值/活跃、非退市；先子集跑通用)。想换/扩量改这里或用 --global-codes。
+GLOBAL_SUBSET_CODES: List[str] = [
+    "600519", "000858", "601318", "600036", "000001", "000002", "000651", "002415",
+    "300750", "600276", "601899", "000333", "600030", "600887", "000725", "002594",
+    "601166", "600000", "600585", "000063", "002304", "600690", "601288", "000568",
+    "600031", "601668", "000776", "600048", "601088", "002230",
+]
+# 参与"全局池化"的模型：这些是"吃扁平特征"的回归器，可跨股票共用一个模型。
+# ARIMA 是单序列时序模型、没有跨股票外生特征这一说，故不进池化(见 B 步：ARIMA 残差混合特征)，
+# 本模块用 _arima_perstock_baseline 单独给它一个"逐股基线"，明确标注"未纳入全局冻结"。
+POOL_FEATURE_ALGOS: List[str] = ["SVR", "GPR", "Lasso", "PLSR", "ELM"]
+
+# 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
+MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
+                              "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm"]
+# 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
+MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
+
+
+def _scan_all_local_codes(root: Optional[str] = None, adjust: str = "qfq") -> List[str]:
+    """扫描本地数据集 每只股票一个文件/<复权>/ 下所有 <代码>.csv，返回代码列表(不含退市过滤，
+    退市在 build_multi_horizon_dataset 里按 退市时间 列剔除)。"""
+    root = root or StockDataFetcher._resolve_local_root()
+    if not root:
+        return []
+    adj = StockDataFetcher._LOCAL_ADJ_DIR.get(adjust, "前复权")
+    files = _glob.glob(os.path.join(root, "每只股票一个文件", adj, "*.csv"))
+    return sorted(os.path.splitext(os.path.basename(f))[0] for f in files)
+
+
+def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
+    """读单只股票本地 CSV，返回含 date/close/name + 各特征源列的 DataFrame；
+    已退市(退市时间非'-')返回 (df, True)。文件缺失返回 (None, False)。"""
+    path = StockDataFetcher._local_csv_path(code, adjust, root)
+    if not os.path.exists(path):
+        return None, False
+    raw = pd.read_csv(path, dtype=str)
+    ren = {"日期": "date", "名称": "name", "收盘价": "close",
+           "涨幅%": "ret_1d", "3日涨幅%": "ret_3d", "6日涨幅%": "ret_6d", "10日涨幅%": "ret_10d",
+           "量比": "vol_ratio", "换手率": "turnover", "20日线": "ma20",
+           "滚动市盈率": "pe_ttm", "市净率": "pb", "滚动市销率": "ps_ttm", "退市时间": "delist"}
+    cols = {k: v for k, v in ren.items() if k in raw.columns}
+    df = raw[list(cols)].rename(columns=cols)
+    delist_vals = df["delist"].dropna().astype(str) if "delist" in df.columns else pd.Series([], dtype=str)
+    is_delisted = bool((~delist_vals.isin(["-", "", "nan", "None"])).any())
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ["close", "ret_1d", "ret_3d", "ret_6d", "ret_10d", "vol_ratio", "turnover", "ma20", "pe_ttm", "pb", "ps_ttm"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    return df, is_delisted
+
+
+def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] = None,
+                                start: str = "20150101", end: Optional[str] = None,
+                                root: Optional[str] = None, drop_delisted: bool = True,
+                                anchor_stride: int = 5, anchors_per_stock: Optional[int] = None,
+                                progress_cb: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
+    """把多支股票池化成"多期限×多目标"数据集(与预览 CSV 同口径)。
+    因果构造：第 i 行特征取自锚定日 t(及以前)，目标取自未来窗口 [t+1, t+h]，绝不泄露。
+    anchor_stride：锚定日抽样步长(默认 5≈每周一个锚点，控样本量，SVR/GPR 才跑得动)；
+    anchors_per_stock：若给定则只取每只股票最近 N 个锚定日(用于快速预览)。"""
+    log = progress_cb or (lambda m: None)
+    horizons = horizons or DEFAULT_HORIZONS
+    root = root or StockDataFetcher._resolve_local_root()
+    if not root:
+        raise RuntimeError("未配置有效的本地数据集(LOCAL_DATA_ROOT / STOCK_LOCAL_DATA_ROOT)。")
+    s = pd.to_datetime(str(start), format="%Y%m%d", errors="coerce")
+    e = pd.to_datetime(str(end), format="%Y%m%d", errors="coerce") if end else None
+    hmax = max(horizons)
+    rows = []
+    skipped_delisted = 0
+    for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        df, is_delisted = _mh_load_local_rich(code, root)
+        if df is None:
+            log(f"[{ci}/{len(codes)}] {code} 本地无文件，跳过")
+            continue
+        if drop_delisted and is_delisted:
+            skipped_delisted += 1
+            log(f"[{ci}/{len(codes)}] {code} 已退市，跳过")
+            continue
+        if s is not None:
+            df = df[df["date"] >= s]
+        if e is not None:
+            df = df[df["date"] <= e]
+        df = df.reset_index(drop=True)
+        close = df["close"].values
+        n = len(df)
+        name = str(df["name"].iloc[-1]) if "name" in df.columns and n else code
+        valid = [i for i in range(n - hmax) if pd.notna(df["ret_10d"].iloc[i])]
+        if anchors_per_stock:
+            valid = valid[-anchors_per_stock:]
+        elif anchor_stride > 1:
+            valid = valid[::anchor_stride]
+        log(f"[{ci}/{len(codes)}] {code} {name}：{len(valid)} 个锚定日 × {len(horizons)} 期限")
+        for i in valid:
+            r = df.iloc[i]
+            c0 = close[i]
+            base = {
+                "code": code, "name": name, "date": r["date"],
+                "close": round(float(c0), 3),
+                "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
+                "ma20_dev": (float(c0) / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
+                "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
+                "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
+            }
+            for h in horizons:
+                win = close[i + 1: i + h + 1]
+                if len(win) < h:
+                    continue
+                mn, md, mean, mx = float(win.min()), float(np.median(win)), float(win.mean()), float(win.max())
+                endp = float(close[i + h])
+                row = dict(base)
+                row["h"] = h
+                row["y1_dir"] = 1 if endp > c0 else -1
+                row["y2_min_pct"] = round((mn / c0 - 1) * 100, 4)
+                row["y3_med_pct"] = round((md / c0 - 1) * 100, 4)
+                row["y4_mean_pct"] = round((mean / c0 - 1) * 100, 4)
+                row["y5_max_pct"] = round((mx / c0 - 1) * 100, 4)
+                # 展示用(元)
+                row["y2_min_yuan"] = round(mn, 3); row["y3_med_yuan"] = round(md, 3)
+                row["y4_mean_yuan"] = round(mean, 3); row["y5_max_yuan"] = round(mx, 3)
+                row["end_close_yuan"] = round(endp, 3)
+                rows.append(row)
+    out = pd.DataFrame(rows)
+    if skipped_delisted:
+        log(f"共跳过 {skipped_delisted} 只已退市股票。")
+    log(f"数据集完成：{len(out)} 行，{out['code'].nunique() if len(out) else 0} 只股票。")
+    return out
+
+
+def _mh_direction_da(y4_pred: np.ndarray, y4_true: np.ndarray) -> float:
+    """方向准确率：以"未来均值涨跌"的符号为方向，比对预测与真实。"""
+    if len(y4_true) == 0:
+        return float("nan")
+    return float(np.mean(np.sign(y4_pred) == np.sign(y4_true)) * 100)
+
+
+def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[str]] = None,
+                        horizons: Optional[List[int]] = None, split_date: str = "2024-01-01",
+                        start: str = "20150101", end: Optional[str] = None,
+                        hpo_method: str = "BO", hpo_trials: int = 15,
+                        anchor_stride: int = 5, max_train_samples: int = 12000,
+                        freeze: bool = True, root: Optional[str] = None,
+                        progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """在"多期限×多目标"池化数据集上训练**全局模型**(跨股票共用一个模型)，可选冻结到磁盘。
+    - 全局日期切分(split_date 前=训练、后=测试)，防泄露；标准化只在训练集 fit。
+    - 每个算法对 4 个涨跌%目标各训一个单输出模型(复用现有 BaseModel + run_hpo 的 BO 调参)。
+    - 强制 Naive(涨跌预测=0) 基准 + 方向 DA。冻结包含{每目标超参+已拟合模型+X的scaler+特征列+元信息}。
+    - **研究性回测，非投资建议、盈亏自负；数据截止取决于本地数据集(当前约 2026-04)。**"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or GLOBAL_SUBSET_CODES
+    algos = algos or POOL_FEATURE_ALGOS
+    horizons = horizons or DEFAULT_HORIZONS
+    root = root or StockDataFetcher._resolve_local_root()
+
+    log("① 构建池化数据集 ...")
+    ds = build_multi_horizon_dataset(codes, horizons, start, end, root,
+                                     drop_delisted=True, anchor_stride=anchor_stride,
+                                     progress_cb=progress_cb)
+    if len(ds) == 0:
+        raise RuntimeError("池化数据集为空(检查代码清单/本地数据/日期区间)。")
+    ds = ds.dropna(subset=MH_FEATURE_COLS + MH_TARGET_COLS).reset_index(drop=True)
+
+    # ② 全局日期切分(红线#1)
+    split = pd.to_datetime(split_date)
+    tr_mask = ds["date"] < split
+    te_mask = ds["date"] >= split
+    tr, te = ds[tr_mask], ds[te_mask]
+    if len(tr) == 0 or len(te) == 0:
+        raise RuntimeError(f"按 split_date={split_date} 切分后训练或测试为空(训练{len(tr)}/测试{len(te)})，请调整。")
+    # 训练样本上限(SVR/GPR 在大样本上很慢)：仅对**训练集**做有种子随机下采样，测试集全量评估
+    if max_train_samples and len(tr) > max_train_samples:
+        tr = tr.sample(n=max_train_samples, random_state=RANDOM_SEED).sort_values("date")
+        log(f"训练样本下采样到 {max_train_samples} 行(控时；测试集仍全量 {len(te)} 行)。")
+
+    X_tr = tr[MH_FEATURE_COLS].values.astype(float)
+    X_te = te[MH_FEATURE_COLS].values.astype(float)
+    scaler = StandardScaler().fit(X_tr)           # 红线#2：只在训练集 fit
+    X_tr_s, X_te_s = scaler.transform(X_tr), scaler.transform(X_te)
+
+    y4_te_true = te["y4_mean_pct"].values.astype(float)
+    p_up = float(np.mean(y4_te_true > 0))
+    base_rate = max(p_up, 1 - p_up) * 100           # 多数类基准(方向 DA 要显著高于它才有意义)
+
+    results: List[Dict[str, Any]] = []
+    # Naive 基准：涨跌预测恒为 0
+    naive_rmse = {t: float(np.sqrt(np.mean((te[t].values.astype(float)) ** 2))) for t in MH_TARGET_COLS}
+    results.append({"algo": "Naive(前值,涨跌=0)", "DA_dir_pct": round(50.0, 2),
+                    "RMSE_y4": round(naive_rmse["y4_mean_pct"], 4),
+                    "note": "朴素基准：预测未来涨跌为0"})
+
+    frozen_paths = {}
+    for algo in algos:
+        if algo not in ALGO_REGISTRY:
+            log(f"[{algo}] 不在 ALGO_REGISTRY，跳过"); continue
+        model_cls = ALGO_REGISTRY[algo]
+        log(f"② 训练全局模型 [{algo}]（{len(MH_TARGET_COLS)} 个目标各一个单输出模型）...")
+        per_target_models: Dict[str, Any] = {}
+        per_target_params: Dict[str, Dict] = {}
+        rmse_by_t: Dict[str, float] = {}
+        try:
+            for t in MH_TARGET_COLS:
+                y_tr = tr[t].values.astype(float)
+                best_params = {}
+                if hpo_method and hpo_method != "关闭":
+                    n_val = max(1, int(len(X_tr_s) * 0.2))
+                    best_params = run_hpo(hpo_method, model_cls, X_tr_s[:-n_val], y_tr[:-n_val],
+                                          X_tr_s[-n_val:], y_tr[-n_val:], n_trials=hpo_trials)
+                m = model_cls(**best_params)
+                m.fit(X_tr_s, y_tr)
+                per_target_models[t] = m
+                per_target_params[t] = best_params
+                y_te_pred = m.predict(X_te_s)
+                rmse_by_t[t] = float(np.sqrt(np.mean((te[t].values.astype(float) - y_te_pred) ** 2)))
+            # 方向 DA：用 y4(均值涨跌)预测的符号
+            y4_pred = per_target_models["y4_mean_pct"].predict(X_te_s)
+            da = _mh_direction_da(y4_pred, y4_te_true)
+            row = {"algo": algo, "DA_dir_pct": round(da, 2),
+                   "RMSE_y4": round(rmse_by_t["y4_mean_pct"], 4),
+                   "beat_naive_y4": bool(rmse_by_t["y4_mean_pct"] < naive_rmse["y4_mean_pct"]),
+                   "note": f"n训练={len(tr)} n测试={len(te)}"}
+            results.append(row)
+            log(f"[{algo}] 完成：方向DA={da:.1f}%(基准≈{base_rate:.1f}%) / y4测试RMSE={rmse_by_t['y4_mean_pct']:.3f}"
+                f"（{'优于' if row['beat_naive_y4'] else '未优于'}Naive）")
+
+            if freeze:
+                fp = pd.to_datetime(split_date).strftime("%Y%m%d")
+                bundle = {
+                    "kind": "global_pooled_multihorizon", "algo": algo,
+                    "feature_cols": MH_FEATURE_COLS, "target_cols": MH_TARGET_COLS,
+                    "horizons": horizons, "scaler": scaler,
+                    "models": per_target_models, "params": per_target_params,
+                    "meta": {"n_codes": len(codes), "n_train": int(len(tr)), "n_test": int(len(te)),
+                             "split_date": split_date, "start": start, "end": end,
+                             "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             "da_dir_pct": round(da, 2), "base_rate_pct": round(base_rate, 2),
+                             "disclaimer": "研究性回测，非投资建议、盈亏自负；结果不保证样本外/未来重演。"},
+                }
+                path = os.path.join(FROZEN_DIR, f"global_{algo}_h{len(horizons)}_{fp}.joblib")
+                if HAS_JOBLIB:
+                    _joblib.dump(bundle, path)
+                else:
+                    with open(path, "wb") as f:
+                        _pickle.dump(bundle, f)
+                frozen_paths[algo] = path
+                log(f"[{algo}] 已冻结 → {os.path.basename(path)}")
+        except Exception as ex:
+            log(f"[{algo}] 训练失败：{ex}")
+            results.append({"algo": algo, "DA_dir_pct": None, "RMSE_y4": None, "note": f"失败:{ex}"})
+
+    summary = {
+        "results": results, "base_rate_pct": round(base_rate, 2), "p_up": round(p_up, 4),
+        "n_train": int(len(tr)), "n_test": int(len(te)), "n_codes": ds["code"].nunique(),
+        "split_date": split_date, "horizons": horizons, "frozen": frozen_paths,
+        "arima_baseline": _arima_perstock_baseline(codes, horizons, split_date, start, end, root, log)
+                          if HAS_STATSMODELS else {"note": "statsmodels 未安装，跳过 ARIMA 逐股基线"},
+        "disclaimer": "研究性回测，非投资建议、盈亏自负。",
+    }
+    return summary
+
+
+def _arima_perstock_baseline(codes: List[str], horizons: List[int], split_date: str,
+                             start: str, end: Optional[str], root: str, log) -> Dict[str, Any]:
+    """ARIMA 逐股基线(未纳入全局冻结)：对每只股票在 split_date 处 fit ARIMA(2,1,0)，
+    从边界向后预测 max(h) 步，取预测路径的方向(末值 vs 起点)聚合 DA。仅作对照，明确标注。"""
+    try:
+        from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+    except Exception as ex:
+        return {"note": f"ARIMA 不可用: {ex}"}
+    split = pd.to_datetime(split_date); hmax = max(horizons)
+    hits = tot = 0
+    for code in codes[:min(len(codes), 30)]:
+        df, is_del = _mh_load_local_rich(code, root)
+        if df is None or is_del:
+            continue
+        s = df[df["date"] < split]["close"].values
+        fut = df[df["date"] >= split]["close"].values
+        if len(s) < 60 or len(fut) < 1:
+            continue
+        try:
+            fit = _ARIMA(s, order=(2, 1, 0)).fit()
+            steps = min(hmax, len(fut))
+            fc = np.asarray(fit.forecast(steps=steps))
+            pred_dir = 1 if fc[-1] > s[-1] else -1
+            true_dir = 1 if fut[min(steps, len(fut)) - 1] > s[-1] else -1
+            hits += int(pred_dir == true_dir); tot += 1
+        except Exception:
+            continue
+    da = round(hits / tot * 100, 2) if tot else None
+    log(f"[ARIMA·逐股基线] {tot} 只可评估，方向DA≈{da}%（未纳入全局冻结）")
+    return {"n_eval": tot, "DA_dir_pct": da, "order": "(2,1,0)",
+            "note": "逐股独立、未纳入全局冻结；仅作对照(见后续 B 步：ARIMA 残差混合特征)"}
+
+
+def list_frozen_models(out_dir: str = FROZEN_DIR) -> List[Dict[str, Any]]:
+    """列出已冻结的全局模型(文件名 + 元信息)。"""
+    items = []
+    for p in sorted(_glob.glob(os.path.join(out_dir, "global_*.joblib"))):
+        try:
+            b = _joblib.load(p) if HAS_JOBLIB else _pickle.load(open(p, "rb"))
+            items.append({"file": os.path.basename(p), "algo": b.get("algo"),
+                          "meta": b.get("meta", {})})
+        except Exception as ex:
+            items.append({"file": os.path.basename(p), "error": str(ex)})
+    return items
+
+
+def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]] = None,
+                   root: Optional[str] = None, out_dir: str = FROZEN_DIR) -> Dict[str, Any]:
+    """加载冻结的全局模型，对某股票**最新一行**在各期限上预测(只 transform+predict，不 fit、不调参)。
+    返回每个期限的 y2~y5 涨跌%及还原成元的价格。**研究性估算，非投资建议、盈亏自负。**"""
+    root = root or StockDataFetcher._resolve_local_root()
+    matches = sorted(_glob.glob(os.path.join(out_dir, f"global_{algo}_*.joblib")))
+    if not matches:
+        raise RuntimeError(f"未找到 {algo} 的冻结模型(请先训练+冻结)。目录：{out_dir}")
+    path = matches[-1]
+    bundle = _joblib.load(path) if HAS_JOBLIB else _pickle.load(open(path, "rb"))
+    horizons = horizons or bundle["horizons"]
+    df, is_del = _mh_load_local_rich(code, root)
+    if df is None:
+        raise RuntimeError(f"本地无该股票数据：{code}")
+    r = df.iloc[-1]; c0 = float(r["close"])
+    feat_base = {
+        "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
+        "ma20_dev": (c0 / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else 0.0,
+        "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
+        "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
+    }
+    scaler = bundle["scaler"]; models = bundle["models"]; fcols = bundle["feature_cols"]
+    preds = []
+    for h in horizons:
+        row = dict(feat_base); row["h"] = h
+        x = np.array([[float(row.get(c, 0.0) if pd.notna(row.get(c, 0.0)) else 0.0) for c in fcols]])
+        xs = scaler.transform(x)
+        out = {t: float(models[t].predict(xs)[0]) for t in bundle["target_cols"]}
+        y4 = out.get("y4_mean_pct", 0.0)
+        preds.append({
+            "h": h, "方向": "涨" if y4 > 0 else "跌",
+            "y2最低%": round(out.get("y2_min_pct", float("nan")), 3),
+            "y3中位%": round(out.get("y3_med_pct", float("nan")), 3),
+            "y4平均%": round(out.get("y4_mean_pct", float("nan")), 3),
+            "y5最高%": round(out.get("y5_max_pct", float("nan")), 3),
+            "y4平均(元)": round(c0 * (1 + out.get("y4_mean_pct", 0.0) / 100), 3),
+            "y5最高(元)": round(c0 * (1 + out.get("y5_max_pct", 0.0) / 100), 3),
+        })
+    return {"code": code, "algo": algo, "from_close": round(c0, 3),
+            "as_of": str(r["date"].date()), "frozen_file": os.path.basename(path),
+            "predictions": preds,
+            "disclaimer": "加载冻结模型的研究性估算，非投资建议、盈亏自负；数据非实时。"}
+
+
 # ==================== 第十部分：可编程 API（供脚本 / 其它 AI 调用） ====================
 def run_experiment(code: str = "600519",
                    start: str = "20200101",
@@ -13089,6 +13844,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="无界面抓取一次实时盘口并记录到 monitor_log/(供 Windows 任务计划定时调用)，如 --snapshot 002418")
     p.add_argument("--verify", action="store_true",
                    help="无界面自动验证到期预测(拉真实股价对比)，供定时任务每日调用")
+    # ---- 全局池化训练 + 冻结/加载（第八部分补充8）----
+    p.add_argument("--train-global", action="store_true",
+                   help="用本地数据集对『一批股票』做多期限×多目标全局池化训练，并冻结模型(不必每次重训)")
+    p.add_argument("--global-scope", default="subset", choices=["subset", "all"],
+                   help="全局训练用哪些股票：subset=内置流动性子集(先跑通) / all=本地全部(自动剔除已退市)")
+    p.add_argument("--global-codes", default=None,
+                   help="逗号分隔的股票代码，覆盖 --global-scope(自定义参与全局训练的股票)")
+    p.add_argument("--global-algos", default="SVR,GPR,Lasso,PLSR,ELM",
+                   help="参与全局池化的模型(ARIMA 逐股基线自动附带，不入全局冻结)")
+    p.add_argument("--split-date", default="2024-01-01", help="全局训练的日期切分点(此前=训练,此后=测试)")
+    p.add_argument("--anchor-stride", type=int, default=5, help="锚定日抽样步长(控样本量，默认5≈每周一个)")
+    p.add_argument("--max-train-samples", type=int, default=12000, help="训练集样本上限(控时；测试集全量)")
+    p.add_argument("--no-freeze", action="store_true", help="只训练评估、不冻结到磁盘")
+    p.add_argument("--build-dataset", default=None,
+                   help="只构建并导出『多期限×多目标』池化数据集到该 CSV 路径(utf-8-sig)，不训练")
+    p.add_argument("--predict-frozen", default=None,
+                   help="用已冻结的全局模型预测某股票(传股票代码)，只加载不训练；配合 --global-algos 里第一个模型")
     return p
 
 
@@ -13216,6 +13988,58 @@ def main():
             print(f"[verify] 本次验证 {n} 条到期预测。" + ("(因连续抓取失败提前中止)" if aborted else ""))
         except Exception as e:
             print(f"[verify] 失败: {e}")
+        return
+
+    # --build-dataset：只构建并导出『多期限×多目标』池化数据集，不训练
+    if args.build_dataset:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        ds = build_multi_horizon_dataset(codes, progress_cb=print)
+        ds.to_csv(args.build_dataset, index=False, encoding="utf-8-sig")
+        print(f"[build-dataset] {len(ds)} 行 × {ds.shape[1]} 列 已写入: {args.build_dataset}")
+        return
+
+    # --train-global：全局池化训练 + 冻结
+    if args.train_global:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        algos = [a.strip() for a in args.global_algos.split(",") if a.strip()]
+        print(f"[train-global] 股票 {len(codes)} 只 / 模型 {algos} / 切分 {args.split_date} / 步长 {args.anchor_stride}")
+        summary = train_global_pooled(
+            codes=codes, algos=algos, split_date=args.split_date,
+            hpo_method=args.hpo, hpo_trials=args.hpo_trials,
+            anchor_stride=args.anchor_stride, max_train_samples=args.max_train_samples,
+            freeze=not args.no_freeze, progress_cb=print)
+        print("\n" + "=" * 74)
+        print(f"全局池化训练结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
+              f"  方向基准(多数类)≈{summary['base_rate_pct']}%")
+        print("-" * 74)
+        print(f"{'模型':<20}{'方向DA%':>10}{'y4测试RMSE':>12}{'优于Naive':>10}")
+        for r in summary["results"]:
+            da = "-" if r.get("DA_dir_pct") is None else r["DA_dir_pct"]
+            rm = "-" if r.get("RMSE_y4") is None else r["RMSE_y4"]
+            bn = ("是" if r.get("beat_naive_y4") else "否") if "beat_naive_y4" in r else ""
+            print(f"{r['algo']:<20}{str(da):>10}{str(rm):>12}{bn:>10}")
+        ab = summary.get("arima_baseline", {})
+        print(f"[ARIMA·逐股基线] {ab.get('note','')} 方向DA≈{ab.get('DA_dir_pct')}")
+        print("=" * 74)
+        print("⚠ 方向DA 需显著>50% 且高于多数类基准、y4 RMSE 优于 Naive 才算真有用；研究性回测，非投资建议、盈亏自负。")
+        if summary.get("frozen"):
+            print("已冻结: " + "  ".join(f"{k}->{os.path.basename(v)}" for k, v in summary["frozen"].items()))
+        return
+
+    # --predict-frozen：加载冻结模型预测某股票(不训练)
+    if args.predict_frozen:
+        algo1 = [a.strip() for a in args.global_algos.split(",") if a.strip()][0]
+        r = predict_frozen(args.predict_frozen.strip(), algo=algo1)
+        print(f"[predict-frozen] {r['code']} 用 {r['algo']}(冻结:{r['frozen_file']}) 基于 {r['as_of']} 收盘 {r['from_close']} 元")
+        print(f"{'期限h':>6}{'方向':>6}{'y2最低%':>10}{'y4平均%':>10}{'y5最高%':>10}{'y4(元)':>10}{'y5(元)':>10}")
+        for p_ in r["predictions"]:
+            print(f"{p_['h']:>6}{p_['方向']:>6}{p_['y2最低%']:>10}{p_['y4平均%']:>10}{p_['y5最高%']:>10}"
+                  f"{p_['y4平均(元)']:>10}{p_['y5最高(元)']:>10}")
+        print("⚠ " + r["disclaimer"])
         return
 
     # 判断是否走命令行模式：显式 --cli，或用户传了任何非默认业务参数而没要求 --gui

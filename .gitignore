@@ -34,6 +34,10 @@ paper_trading/
 # ---- 自选股票分组(用户个人关注列表，本地记录，不入库) ----
 watchlist/
 
+# ---- 冻结的全局模型(joblib/pickle 二进制产物，可重新训练生成，不入库) ----
+frozen_models/
+*.joblib
+
 # ---- 生成的报告(本地产物，不入库) ----
 报告_*.html
 *.html
