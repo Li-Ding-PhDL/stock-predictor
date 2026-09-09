@@ -7785,14 +7785,16 @@ if HAS_PYSIDE6:
         finished_signal = Signal(object)          # pd.DataFrame
         error_signal = Signal(str)
 
-        def __init__(self, codes, horizons, anchor_stride):
+        def __init__(self, codes, horizons, anchor_stride, arima_features=False, split_date=None):
             super().__init__()
             self.codes = codes; self.horizons = horizons; self.anchor_stride = anchor_stride
+            self.arima_features = arima_features; self.split_date = split_date
 
         def run(self):
             try:
                 ds = build_multi_horizon_dataset(
                     self.codes, self.horizons, anchor_stride=self.anchor_stride,
+                    arima_features=self.arima_features, split_date=self.split_date,
                     progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(ds)
             except Exception as e:
@@ -7804,11 +7806,13 @@ if HAS_PYSIDE6:
         finished_signal = Signal(dict)
         error_signal = Signal(str)
 
-        def __init__(self, codes, algos, split_date, hpo_method, hpo_trials, anchor_stride, freeze):
+        def __init__(self, codes, algos, split_date, hpo_method, hpo_trials, anchor_stride, freeze,
+                     arima_features=False):
             super().__init__()
             self.codes = codes; self.algos = algos; self.split_date = split_date
             self.hpo_method = hpo_method; self.hpo_trials = hpo_trials
             self.anchor_stride = anchor_stride; self.freeze = freeze
+            self.arima_features = arima_features
 
         def run(self):
             try:
@@ -7816,6 +7820,7 @@ if HAS_PYSIDE6:
                     codes=self.codes, algos=self.algos, split_date=self.split_date,
                     hpo_method=self.hpo_method, hpo_trials=self.hpo_trials,
                     anchor_stride=self.anchor_stride, freeze=self.freeze,
+                    arima_features=self.arima_features,
                     progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(summary)
             except Exception as e:
@@ -10167,6 +10172,9 @@ if HAS_PYSIDE6:
             self.gm_algos_edit = QLineEdit("SVR,GPR,Lasso,PLSR,ELM")
             self.gm_algos_edit.setToolTip("参与全局池化的模型；ARIMA 自动附带『逐股基线』，不入全局冻结")
             g.addWidget(self.gm_algos_edit, 2, 1, 1, 3)
+            self.gm_arima_chk = QCheckBox("ARIMA残差混合特征(B)")
+            self.gm_arima_chk.setToolTip("借鉴 AttCLX：ARIMA 拟合线性成分，把因果的『预测收益/标准化残差』作为额外输入特征(需 statsmodels)")
+            g.addWidget(self.gm_arima_chk, 2, 4, 1, 2)
             layout.addWidget(box)
 
             # ── 按钮区 ──
@@ -10219,7 +10227,9 @@ if HAS_PYSIDE6:
                 QMessageBox.warning(self, "无股票", "请先选择股票范围或填写自定义代码。"); return
             self.gm_build_btn.setEnabled(False); self.gm_log.clear()
             self._gm_logmsg(f"生成数据集：{len(codes)} 只股票，步长 {self.gm_stride_spin.value()} ...")
-            self._gm_ds_worker = GlobalDatasetWorker(codes, DEFAULT_HORIZONS, self.gm_stride_spin.value())
+            self._gm_ds_worker = GlobalDatasetWorker(
+                codes, DEFAULT_HORIZONS, self.gm_stride_spin.value(),
+                arima_features=self.gm_arima_chk.isChecked(), split_date=self.gm_split_edit.text().strip())
             self._gm_ds_worker.progress_signal.connect(self._gm_logmsg)
             self._gm_ds_worker.finished_signal.connect(self._on_gm_build_done)
             self._gm_ds_worker.error_signal.connect(lambda e: (self._gm_logmsg("失败: " + e), self.gm_build_btn.setEnabled(True)))
@@ -10272,7 +10282,7 @@ if HAS_PYSIDE6:
             self._gm_train_worker = GlobalTrainWorker(
                 codes, algos, self.gm_split_edit.text().strip(), self.gm_hpo_combo.currentText(),
                 self.config_hpo_trials() if hasattr(self, "config_hpo_trials") else 15,
-                self.gm_stride_spin.value(), True)
+                self.gm_stride_spin.value(), True, arima_features=self.gm_arima_chk.isChecked())
             self._gm_train_worker.progress_signal.connect(self._gm_logmsg)
             self._gm_train_worker.finished_signal.connect(self._on_gm_train_done)
             self._gm_train_worker.error_signal.connect(lambda e: (self._gm_logmsg("失败: " + e), self.gm_train_btn.setEnabled(True)))
@@ -13361,6 +13371,37 @@ MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
                               "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm"]
 # 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
 MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
+# B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
+# 因果无泄露：ARIMA 参数只在训练段估计，再用固定参数对全序列一步向前拟合(测试点只用自己的过去)。
+MH_ARIMA_COLS: List[str] = ["arima_pred_ret", "arima_resid_z"]
+
+
+def _arima_causal_features(close: np.ndarray, split_idx: int, order=(2, 1, 0)):
+    """对单只股票的收盘序列，产出**因果**的 ARIMA 特征(与 close 等长，索引 0 为 NaN)：
+      arima_pred_ret[i] = ARIMA 对第 i 日的一步向前预测收益(fit[i]/close[i-1]-1)
+      arima_resid_z[i]  = (close[i]-fit[i]) 的标准化残差(均值/方差只取训练段)
+    参数只用 close[:split_idx](训练段)估计，再 res.apply(close) 套全序列、不重估计 → 测试段不泄露。
+    statsmodels 缺失/拟合失败时全返回 NaN(降级，红线#5)。"""
+    n = len(close)
+    pred_ret = np.full(n, np.nan)
+    resid_z = np.full(n, np.nan)
+    if not HAS_STATSMODELS or split_idx < 40 or n < split_idx + 1:
+        return pred_ret, resid_z
+    try:
+        from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = _ARIMA(close[:split_idx], order=order).fit()
+            fit = np.asarray(res.apply(close).predict(start=1, end=n - 1))   # 一步向前 in-sample，索引 1..n-1
+        prev = close[:-1]
+        pred_ret[1:] = fit / prev - 1.0
+        resid = close[1:] - fit
+        tr_resid = resid[:max(1, split_idx - 1)]                             # 只用训练段残差做标准化
+        mu, sd = float(np.nanmean(tr_resid)), float(np.nanstd(tr_resid)) + 1e-9
+        resid_z[1:] = (resid - mu) / sd
+    except Exception:
+        pass
+    return pred_ret, resid_z
 
 
 def _scan_all_local_codes(root: Optional[str] = None, adjust: str = "qfq") -> List[str]:
@@ -13401,6 +13442,7 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                                 start: str = "20150101", end: Optional[str] = None,
                                 root: Optional[str] = None, drop_delisted: bool = True,
                                 anchor_stride: int = 5, anchors_per_stock: Optional[int] = None,
+                                arima_features: bool = False, split_date: Optional[str] = None,
                                 progress_cb: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     """把多支股票池化成"多期限×多目标"数据集(与预览 CSV 同口径)。
     因果构造：第 i 行特征取自锚定日 t(及以前)，目标取自未来窗口 [t+1, t+h]，绝不泄露。
@@ -13433,6 +13475,11 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
         close = df["close"].values
         n = len(df)
         name = str(df["name"].iloc[-1]) if "name" in df.columns and n else code
+        # B 步(可选)：因果 ARIMA 特征。split_idx 用 split_date 之前的行数(无则用前 70% 作近似训练段)
+        arima_pr = arima_rz = None
+        if arima_features and HAS_STATSMODELS and n > 60:
+            si = int((df["date"] < pd.to_datetime(split_date)).sum()) if split_date else int(n * 0.7)
+            arima_pr, arima_rz = _arima_causal_features(close.astype(float), max(si, 40))
         valid = [i for i in range(n - hmax) if pd.notna(df["ret_10d"].iloc[i])]
         if anchors_per_stock:
             valid = valid[-anchors_per_stock:]
@@ -13467,6 +13514,9 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 row["y2_min_yuan"] = round(mn, 3); row["y3_med_yuan"] = round(md, 3)
                 row["y4_mean_yuan"] = round(mean, 3); row["y5_max_yuan"] = round(mx, 3)
                 row["end_close_yuan"] = round(endp, 3)
+                if arima_pr is not None:
+                    row["arima_pred_ret"] = None if np.isnan(arima_pr[i]) else round(float(arima_pr[i]), 6)
+                    row["arima_resid_z"] = None if np.isnan(arima_rz[i]) else round(float(arima_rz[i]), 4)
                 rows.append(row)
     out = pd.DataFrame(rows)
     if skipped_delisted:
@@ -13487,6 +13537,7 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                         start: str = "20150101", end: Optional[str] = None,
                         hpo_method: str = "BO", hpo_trials: int = 15,
                         anchor_stride: int = 5, max_train_samples: int = 12000,
+                        arima_features: bool = False,
                         freeze: bool = True, root: Optional[str] = None,
                         progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """在"多期限×多目标"池化数据集上训练**全局模型**(跨股票共用一个模型)，可选冻结到磁盘。
@@ -13500,13 +13551,16 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     horizons = horizons or DEFAULT_HORIZONS
     root = root or StockDataFetcher._resolve_local_root()
 
-    log("① 构建池化数据集 ...")
+    use_arima = bool(arima_features and HAS_STATSMODELS)
+    feature_cols = MH_FEATURE_COLS + (MH_ARIMA_COLS if use_arima else [])
+    log("① 构建池化数据集 ..." + ("（含 ARIMA 残差混合特征）" if use_arima else ""))
     ds = build_multi_horizon_dataset(codes, horizons, start, end, root,
                                      drop_delisted=True, anchor_stride=anchor_stride,
+                                     arima_features=use_arima, split_date=split_date,
                                      progress_cb=progress_cb)
     if len(ds) == 0:
         raise RuntimeError("池化数据集为空(检查代码清单/本地数据/日期区间)。")
-    ds = ds.dropna(subset=MH_FEATURE_COLS + MH_TARGET_COLS).reset_index(drop=True)
+    ds = ds.dropna(subset=feature_cols + MH_TARGET_COLS).reset_index(drop=True)
 
     # ② 全局日期切分(红线#1)
     split = pd.to_datetime(split_date)
@@ -13520,8 +13574,8 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
         tr = tr.sample(n=max_train_samples, random_state=RANDOM_SEED).sort_values("date")
         log(f"训练样本下采样到 {max_train_samples} 行(控时；测试集仍全量 {len(te)} 行)。")
 
-    X_tr = tr[MH_FEATURE_COLS].values.astype(float)
-    X_te = te[MH_FEATURE_COLS].values.astype(float)
+    X_tr = tr[feature_cols].values.astype(float)
+    X_te = te[feature_cols].values.astype(float)
     scaler = StandardScaler().fit(X_tr)           # 红线#2：只在训练集 fit
     X_tr_s, X_te_s = scaler.transform(X_tr), scaler.transform(X_te)
 
@@ -13574,7 +13628,8 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                 fp = pd.to_datetime(split_date).strftime("%Y%m%d")
                 bundle = {
                     "kind": "global_pooled_multihorizon", "algo": algo,
-                    "feature_cols": MH_FEATURE_COLS, "target_cols": MH_TARGET_COLS,
+                    "feature_cols": feature_cols, "target_cols": MH_TARGET_COLS,
+                    "arima_features": use_arima,
                     "horizons": horizons, "scaler": scaler,
                     "models": per_target_models, "params": per_target_params,
                     "meta": {"n_codes": len(codes), "n_train": int(len(tr)), "n_test": int(len(te)),
@@ -13583,7 +13638,7 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                              "da_dir_pct": round(da, 2), "base_rate_pct": round(base_rate, 2),
                              "disclaimer": "研究性回测，非投资建议、盈亏自负；结果不保证样本外/未来重演。"},
                 }
-                path = os.path.join(FROZEN_DIR, f"global_{algo}_h{len(horizons)}_{fp}.joblib")
+                path = os.path.join(FROZEN_DIR, f"global_{algo}_h{len(horizons)}_{fp}{'_arima' if use_arima else ''}.joblib")
                 if HAS_JOBLIB:
                     _joblib.dump(bundle, path)
                 else:
@@ -13674,6 +13729,13 @@ def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]]
         "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
     }
     scaler = bundle["scaler"]; models = bundle["models"]; fcols = bundle["feature_cols"]
+    # 若冻结模型用了 ARIMA 混合特征，为该股票最新一行现算(因果：参数用其全部历史估计，末行只用自身过去)
+    if any(str(c).startswith("arima") for c in fcols):
+        cl = df["close"].values.astype(float)
+        apr, arz = _arima_causal_features(cl, len(cl))
+        li = len(cl) - 1
+        feat_base["arima_pred_ret"] = 0.0 if np.isnan(apr[li]) else float(apr[li])
+        feat_base["arima_resid_z"] = 0.0 if np.isnan(arz[li]) else float(arz[li])
     preds = []
     for h in horizons:
         row = dict(feat_base); row["h"] = h
@@ -13857,6 +13919,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchor-stride", type=int, default=5, help="锚定日抽样步长(控样本量，默认5≈每周一个)")
     p.add_argument("--max-train-samples", type=int, default=12000, help="训练集样本上限(控时；测试集全量)")
     p.add_argument("--no-freeze", action="store_true", help="只训练评估、不冻结到磁盘")
+    p.add_argument("--arima-features", action="store_true",
+                   help="B步：加入 ARIMA 残差混合特征(因果无泄露；需 statsmodels)")
     p.add_argument("--build-dataset", default=None,
                    help="只构建并导出『多期限×多目标』池化数据集到该 CSV 路径(utf-8-sig)，不训练")
     p.add_argument("--predict-frozen", default=None,
@@ -13995,7 +14059,8 @@ def main():
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
                  (GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
-        ds = build_multi_horizon_dataset(codes, progress_cb=print)
+        ds = build_multi_horizon_dataset(codes, arima_features=args.arima_features,
+                                         split_date=args.split_date, progress_cb=print)
         ds.to_csv(args.build_dataset, index=False, encoding="utf-8-sig")
         print(f"[build-dataset] {len(ds)} 行 × {ds.shape[1]} 列 已写入: {args.build_dataset}")
         return
@@ -14011,6 +14076,7 @@ def main():
             codes=codes, algos=algos, split_date=args.split_date,
             hpo_method=args.hpo, hpo_trials=args.hpo_trials,
             anchor_stride=args.anchor_stride, max_train_samples=args.max_train_samples,
+            arima_features=args.arima_features,
             freeze=not args.no_freeze, progress_cb=print)
         print("\n" + "=" * 74)
         print(f"全局池化训练结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只"
