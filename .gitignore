@@ -41,6 +41,9 @@ frozen_models/
 # ---- CatBoost 训练时自动生成的日志目录(产物，不入库) ----
 catboost_info/
 
+# ---- 抓取整理的最新每日数据(可重新抓取的产物，不入库) ----
+data_updated/
+
 # ---- 生成的报告(本地产物，不入库) ----
 报告_*.html
 *.html

@@ -13542,6 +13542,92 @@ def _scan_all_local_codes(root: Optional[str] = None, adjust: str = "qfq") -> Li
     return sorted(os.path.splitext(os.path.basename(f))[0] for f in files)
 
 
+UPDATED_DATA_ROOT = os.path.join(BASE_DIR, "data_updated")   # 抓取整理后的"最新"数据集根(与 股票4.14 同格式)
+
+
+def update_daily_dataset(codes: List[str], out_root: str = UPDATED_DATA_ROOT,
+                         bypass_proxy: bool = True,
+                         progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """抓取整理『最新每日数据』：把 akshare 最新日线+估值**接续**到本地历史(股票4.14)之后，
+    按数据集所需字段(股票4.14 同格式)写到 out_root/每只股票一个文件/前复权/<代码>.csv。
+    这样选股/预测能用到当前数据(本地历史只到 2026-04-10)。缺 akshare 时跳过(降级，红线#5)。
+    用法：跑完把 LOCAL_DATA_ROOT/STOCK_LOCAL_DATA_ROOT 指向 out_root 即用最新数据。"""
+    log = progress_cb or (lambda m: None)
+    hist_root = StockDataFetcher._resolve_local_root()
+    os.makedirs(os.path.join(out_root, "每只股票一个文件", "前复权"), exist_ok=True)
+    today = dt.date.today().strftime("%Y%m%d")
+    ok, skip = 0, 0
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        try:
+            # 1) 本地历史(全部原始列)
+            raw = None
+            if hist_root:
+                hp = StockDataFetcher._local_csv_path(code, "qfq", hist_root)
+                if os.path.exists(hp):
+                    raw = pd.read_csv(hp, dtype=str)
+                    raw["日期"] = pd.to_datetime(raw["日期"], errors="coerce").astype("datetime64[ns]")
+            # 2) akshare 最新日线(强制联网，英文列；多重试缓解东方财富限流)
+            df_new = StockDataFetcher().fetch(code, "20260101", today, source="akshare",
+                                              use_cache=False, bypass_proxy=bypass_proxy, retries=4)
+            if df_new is None or len(df_new) == 0:
+                skip += 1; log(f"[{i}/{len(codes)}] {code} 无最新数据，跳过"); continue
+            df_new["date"] = pd.to_datetime(df_new["date"]).astype("datetime64[ns]")
+            # 只保留比本地历史更新的行
+            last_hist = raw["日期"].max() if raw is not None and len(raw) else pd.Timestamp("2000-01-01")
+            add = df_new[df_new["date"] > last_hist].copy()
+            if len(add) == 0:
+                skip += 1; log(f"[{i}/{len(codes)}] {code} 本地已最新，跳过"); continue
+            # 3) 估值(日频 PE/PB/PS)
+            try:
+                val = StockDataFetcher._fetch_valuation(code, bypass_proxy)
+                val["date"] = pd.to_datetime(val["date"]).astype("datetime64[ns]")
+            except Exception:
+                val = pd.DataFrame(columns=["date"])
+            name = raw["名称"].iloc[-1] if raw is not None and "名称" in raw.columns and len(raw) else code
+            ind = raw["所属行业"].iloc[-1] if raw is not None and "所属行业" in raw.columns and len(raw) else ""
+            # 4) 新行 → 股票4.14 中文列(成交量 手→股 ×100 与本地口径一致)
+            new_rows = pd.DataFrame({
+                "日期": add["date"], "代码": code, "名称": name, "所属行业": ind,
+                "开盘价": add.get("open"), "最高价": add.get("high"), "最低价": add.get("low"),
+                "收盘价": add.get("close"), "前收盘价": add["close"].shift(1),
+                "成交量（股）": pd.to_numeric(add.get("volume"), errors="coerce") * 100,
+                "成交额（元）": add.get("amount"), "换手率": add.get("turnover"),
+                "涨幅%": add.get("pct_change"), "振幅%": add.get("amplitude"),
+                "是否ST": "否", "退市时间": "-",
+            })
+            if len(val):
+                m = pd.merge_asof(new_rows.sort_values("日期"), val.sort_values("date"),
+                                  left_on="日期", right_on="date", direction="backward")
+                new_rows["滚动市盈率"] = m.get("val_pe_ttm").values if "val_pe_ttm" in m else np.nan
+                new_rows["市净率"] = m.get("val_pb").values if "val_pb" in m else np.nan
+                new_rows["滚动市销率"] = m.get("val_ps_ttm").values if "val_ps_ttm" in m else np.nan
+            # 5) 拼接历史+新行，对"数据集要用的派生列"在全序列上重算，保证接缝正确
+            combined = pd.concat([raw, new_rows], ignore_index=True) if raw is not None else new_rows
+            combined = combined.sort_values("日期").reset_index(drop=True)
+            cl = pd.to_numeric(combined["收盘价"], errors="coerce")
+            vol = pd.to_numeric(combined["成交量（股）"], errors="coerce")
+            # 只对新增行(尾部)回填这些派生列，历史行保留原值
+            mask_new = combined["日期"] > last_hist
+            for w, col in [(3, "3日涨幅%"), (6, "6日涨幅%"), (10, "10日涨幅%")]:
+                s = (cl / cl.shift(w) - 1) * 100
+                combined.loc[mask_new, col] = s[mask_new].values
+            for w, col in [(5, "5日线"), (10, "10日线"), (20, "20日线"), (30, "30日线"),
+                           (60, "60日线"), (120, "120日线"), (250, "250日线")]:
+                s = cl.rolling(w).mean()
+                combined.loc[mask_new, col] = s[mask_new].round(3).values
+            lb = vol / (vol.rolling(5).mean() + 1e-9)         # 量比代理 = 量 / 5日均量
+            combined.loc[mask_new, "量比"] = lb[mask_new].round(3).values
+            outp = os.path.join(out_root, "每只股票一个文件", "前复权", f"{code}.csv")
+            combined.to_csv(outp, index=False, encoding="utf-8-sig")
+            ok += 1
+            log(f"[{i}/{len(codes)}] {code} {name}：+{len(add)} 行 → 最新 {add['date'].max().date()}（写入 {os.path.basename(outp)}）")
+        except Exception as e:
+            skip += 1; log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:80]}")
+        time.sleep(1.2)          # 股间隔，缓解东方财富限流
+    log(f"完成：更新 {ok} 只，跳过 {skip} 只。数据在 {out_root}")
+    return {"updated": ok, "skipped": skip, "out_root": out_root}
+
+
 def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     """读单只股票本地 CSV，返回含 date/close/name + 各特征源列的 DataFrame；
     已退市(退市时间非'-')返回 (df, True)。文件缺失返回 (None, False)。"""
@@ -14093,19 +14179,19 @@ def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
     n = len(lt); k = max(1, n // 3)
     colors = []
     for i in range(n):
-        # 排序后：末尾是高分(前1/3)绿，开头是低分(后1/3)红
-        if i >= n - k: colors.append("#1a9d5a")
-        elif i < k: colors.append("#c0392b")
+        # A股口径：强(高分,前1/3)=红涨，弱(低分,后1/3)=绿跌。lt 按分升序：末尾高分红、开头低分绿
+        if i >= n - k: colors.append("#c0392b")
+        elif i < k: colors.append("#1a9d5a")
         else: colors.append("#95a5a6")
     labels = [f"{r['code']} {str(r.get('name',''))[:4]}" for _, r in lt.iterrows()]
     ax1.barh(range(n), lt["score"].values, color=colors)
     ax1.set_yticks(range(n)); ax1.set_yticklabels(labels, fontsize=7)
     ax1.axvline(0, color="#333", lw=0.8)
-    ax1.set_title(f"最新相对强弱打分排名（{as_of}，{algo}，未来{horizon}日）\n绿=建议关注前1/3  红=回避后1/3", fontsize=10)
+    ax1.set_title(f"最新相对强弱打分排名（{as_of}，{algo}，未来{horizon}日）\n红=建议关注前1/3(强)  绿=回避后1/3(弱)", fontsize=10)
     ax1.set_xlabel("相对强弱得分(预测超额，越大越强)")
     if dts:
         ax2.plot(dts, cum_mkt[1:], label="市场等权(全买)", color="#7f8c8d", lw=1.8)
-        ax2.plot(dts, cum_top[1:], label="只买打分最强一档", color="#1a9d5a", lw=2.0)
+        ax2.plot(dts, cum_top[1:], label="只买打分最强一档", color="#c0392b", lw=2.0)
         ax2.legend(fontsize=9); ax2.grid(alpha=0.25)
         ax2.set_title(f"样本外回测：非重叠调仓\nRankIC={rank_ic:.3f}  多空价差均值={ls_spread:.2f}%/期", fontsize=10)
         ax2.set_ylabel("累计净值(起点=1)")
@@ -14340,6 +14426,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
+    p.add_argument("--update-data", action="store_true",
+                   help="抓取整理『最新每日数据』：akshare 最新日线+估值接续到本地历史，写到 data_updated/(补上4月后的缺口)")
     p.add_argument("--global-scope", default="subset", choices=["subset", "all", "mine"],
                    help="用哪些股票：subset=内置流动性子集 / all=本地全部(剔退市) / mine=我的同花顺自选(USER_WATCHLIST_CODES)")
     p.add_argument("--global-codes", default=None,
@@ -14542,6 +14630,18 @@ def main():
         print("⚠ 方向DA 需显著>50% 且高于多数类基准、y4 RMSE 优于 Naive 才算真有用；研究性回测，非投资建议、盈亏自负。")
         if summary.get("frozen"):
             print("已冻结: " + "  ".join(f"{k}->{os.path.basename(v)}" for k, v in summary["frozen"].items()))
+        return
+
+    # --update-data：抓取整理最新每日数据，接续到本地历史
+    if args.update_data:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        print(f"[update-data] 抓取最新日线+估值，接续 {len(codes)} 只 ...")
+        r = update_daily_dataset(codes, progress_cb=print)
+        print(f"完成：更新 {r['updated']} / 跳过 {r['skipped']}。数据在: {r['out_root']}")
+        print("提示：把 STOCK_LOCAL_DATA_ROOT 指向该目录，或设 LOCAL_DATA_ROOT，即用最新数据跑选股/预测。")
         return
 
     # --rank-stocks：『主力思维』选股排序 + 回测 + 出图
