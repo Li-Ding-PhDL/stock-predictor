@@ -12151,7 +12151,7 @@ if HAS_PYSIDE6:
             filt.addStretch()
             layout.addLayout(filt)
             # 摘要放进可收起的 splitter，表格默认占大头
-            self.trk_summary = QTextBrowser(); self.trk_summary.setMaximumHeight(240)
+            self.trk_summary = QTextBrowser(); self.trk_summary.setMinimumHeight(150); self.trk_summary.setMaximumHeight(320)
             layout.addWidget(self.trk_summary)
             # Y3(概率输出)方案B原型的校准检验表(见 calibration_check())：只用已验证且带 pred_prob_up 的
             # 1日周期记录("记录当前预测"时自动附带，见 estimate_direction_probability)，
@@ -13444,13 +13444,14 @@ if HAS_PYSIDE6:
             ax.legend(loc="best", fontsize=8)
             # 关键诚实提示：价格预测的线总是紧贴真实值，是因为"明天价≈今天价"，连Naive基准都贴合，
             # 并不代表模型厉害。真本事看 DA 方向准确率，不是看这条线贴不贴。
-            ax.text(0.5, -0.22,
-                    "⚠️ 别被这张图骗了：明天价≈今天价，连『Naive前值』基准都紧贴真实值——线贴合≠预测准。\n"
+            ax.text(0.5, -0.24,
+                    "【别被这张图骗了】明天价≈今天价，连『Naive前值』基准都紧贴真实值——线贴合≠预测准。\n"
                     "『精度』≠『准确率』：价格拟合精度(R²)能到99%，但方向准确率(DA)只有~50%(抛硬币)。\n"
                     "真本事请看『指标结果表格』的 DA(≈50%就是没用)，和『策略回测』能不能赚钱。",
-                    transform=ax.transAxes, ha="center", va="top", fontsize=9, color="#c0392b")
-            self.figure.subplots_adjust(bottom=0.34)
+                    transform=ax.transAxes, ha="center", va="top", fontsize=8, color="#c0392b")
+            # 注意顺序：先 autofmt_xdate(它会把 bottom 改成~0.2)，再设我们的底部留白，否则会被覆盖导致红字被裁。
             self.figure.autofmt_xdate()
+            self.figure.subplots_adjust(bottom=0.42)
             self.canvas.draw()
 
         # ---- 9.7 日志输出 ----
