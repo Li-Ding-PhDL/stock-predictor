@@ -8163,6 +8163,7 @@ if HAS_PYSIDE6:
             # 投资流派视角：借鉴 UZI-Skill(MIT) 的可量化选股法则，套真实数据算各流派通过/不通过
             self.tabs.addTab(self._build_school_tab(), "投资流派视角")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
+            self.tabs.addTab(self._build_avoid_tab(), "异动避雷")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
             self.tabs.addTab(self._build_paper_trade_tab(), "模拟交易")
@@ -8174,7 +8175,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部", "全局模型(多期限)"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位", "异动避雷"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -11641,6 +11642,56 @@ if HAS_PYSIDE6:
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.macro_btn.setEnabled(True)
 
+        # ---- 9.2.1h3 异动避雷标签页（主力视角重定位：识别被拉抬/出货/操纵的特征，用于回避）----
+        def _build_avoid_tab(self) -> QWidget:
+            panel = QWidget(); layout = QVBoxLayout(panel)
+            intro = QLabel(
+                "💡 <b>主力视角·避雷扫描</b>：跟庄不可行(拿不到 Level2/真实席位)，本页换个思路——"
+                "识别一只股票是否正被<b>异常拉抬/出货/操纵</b>(换手暴增、放量、急拉乖离、频繁涨跌停、"
+                "高波动、闪崩、ST/亏损)，给<b>异动分(越高越该回避)</b>。全部用当日及以前的真实数据算，因果无泄露。"
+                "<br><span style='color:#c0392b'>⚠ 高分≠预测下跌，只提示『这只当前很不正常、离远点』；不是买卖信号、非投资建议、盈亏自负。</span>")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#fef6f6;padding:6px;border-radius:4px")
+            layout.addWidget(intro)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("股票篮子(逗号分隔，留空=我的自选):"))
+            self.avoid_codes = QLineEdit(",".join(list(USER_WATCHLIST_CODES)))
+            row.addWidget(self.avoid_codes, stretch=1)
+            self.avoid_btn = QPushButton("▶ 扫描异动/避雷")
+            self.avoid_btn.setStyleSheet("font-weight:bold;padding:5px;background:#c0392b;color:white;")
+            self.avoid_btn.clicked.connect(self._on_avoid_scan)
+            row.addWidget(self.avoid_btn)
+            layout.addLayout(row)
+            self.avoid_table = QTableWidget(); self.avoid_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            layout.addWidget(self.avoid_table, stretch=1)
+            return panel
+
+        def _on_avoid_scan(self):
+            codes = [c.strip() for c in self.avoid_codes.text().split(",") if c.strip()] or list(USER_WATCHLIST_CODES)
+            self.avoid_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open("⏳ 扫描异动/操纵风险(本地/联网真实数据)…"); QApplication.processEvents()
+            try:
+                r = anomaly_risk_scan(codes=codes, progress_cb=self._log)
+            except Exception as e:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.avoid_btn.setEnabled(True)
+                QMessageBox.critical(self, "扫描失败", str(e)); return
+            QApplication.restoreOverrideCursor(); self._prog_close(); self.avoid_btn.setEnabled(True)
+            rows = r["ranked"]
+            t = self.avoid_table
+            t.setColumnCount(5); t.setHorizontalHeaderLabels(["代码", "名称", "异动分", "风险等级", "命中特征(前3)"])
+            t.setRowCount(len(rows))
+            for i, x in enumerate(rows):
+                sc = x.get("score")
+                bg = (QColor("#fdecea") if isinstance(sc, (int, float)) and sc >= 60 else
+                      QColor("#fcf3e2") if isinstance(sc, (int, float)) and sc >= 35 else QColor("#eef7f0"))
+                vals = [x["code"], str(x.get("name", "")), ("-" if sc is None else str(sc)),
+                        x.get("level", ""), "；".join(x.get("reasons", [])[:3])]
+                for j, v in enumerate(vals):
+                    it = QTableWidgetItem(v); it.setBackground(bg)
+                    t.setItem(i, j, it)
+            t.resizeColumnsToContents()
+            t.horizontalHeader().setStretchLastSection(True)
+            self._oplog(f"异动避雷扫描完成：{len(rows)}只，最高分 {rows[0].get('score') if rows else '-'}。")
+
         def _on_montecarlo(self):
             try:
                 p = float(self.mc_p.text()); rr = float(self.mc_rr.text())
@@ -14881,6 +14932,110 @@ def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
 
 
+def _anomaly_risk_one(df: pd.DataFrame, name: str = "") -> Dict[str, Any]:
+    """对单只股票的最新状态算『异动/操纵风险分』(0-100，越高越该回避)。
+    重定位『主力视角』：看不到主力的手，但能识别被异常拉抬/出货/操纵的特征——用于**规避**，不是跟庄、不预测涨跌。
+    全部因果(只用当日及以前)。各项为独立扣分，累加封顶100；附命中原因。"""
+    reasons = []; score = 0.0
+    cl = pd.to_numeric(df["close"], errors="coerce")
+    r = df["ret_1d"] if "ret_1d" in df.columns else cl.pct_change() * 100
+    r = pd.to_numeric(r, errors="coerce")
+    n = len(df)
+    if n < 30:
+        return {"score": None, "reasons": ["历史不足(<30日)，跳过"], "level": "数据不足"}
+    last = df.iloc[-1]
+    # ① 换手异常(z 分数)：当日换手 vs 过去60日均值/标准差
+    if "turnover" in df.columns:
+        tv = pd.to_numeric(df["turnover"], errors="coerce")
+        base = tv.iloc[-61:-1] if n > 61 else tv.iloc[:-1]
+        mu, sd = base.mean(), base.std()
+        if pd.notna(tv.iloc[-1]) and pd.notna(sd) and sd > 1e-9:
+            z = (tv.iloc[-1] - mu) / sd
+            if z >= 2:
+                add = min(20, 8 + (z - 2) * 5); score += add
+                reasons.append(f"换手异常放大(z={z:.1f}，近期资金异常活跃)")
+    # ② 放量：量比
+    if "vol_ratio" in df.columns and pd.notna(last.get("vol_ratio")):
+        vr = float(last["vol_ratio"])
+        if vr >= 2:
+            add = min(15, 6 + (vr - 2) * 4); score += add
+            reasons.append(f"明显放量(量比{vr:.1f})")
+    # ③ 急拉/乖离：20日动量过高 或 远高于60日线(拉抬后回落/接盘风险)
+    mom20 = float(last.get("mom20")) if pd.notna(last.get("mom20")) else None
+    dma60 = float(last.get("dist_ma60")) if pd.notna(last.get("dist_ma60")) else None
+    if mom20 is not None and mom20 >= 30:
+        add = min(20, 8 + (mom20 - 30) * 0.4); score += add
+        reasons.append(f"短期急拉(20日+{mom20:.0f}%，高位接盘风险)")
+    elif dma60 is not None and dma60 >= 25:
+        add = min(15, 5 + (dma60 - 25) * 0.3); score += add
+        reasons.append(f"远离60日线(+{dma60:.0f}%，乖离过大)")
+    # ④ 涨跌停频繁：近20日 |日涨跌|>=9.5% 次数(游资/操纵典型特征)
+    rr = r.iloc[-20:]
+    n_limit = int((rr.abs() >= 9.5).sum())
+    if n_limit >= 2:
+        add = min(20, n_limit * 6); score += add
+        reasons.append(f"近20日{n_limit}次涨/跌停(游资博弈/操纵特征)")
+    # ⑤ 高波动：近20日涨跌幅标准差 vs 自身历史分位
+    if "vol20" in df.columns:
+        v20 = pd.to_numeric(df["vol20"], errors="coerce")
+        if pd.notna(v20.iloc[-1]) and v20.notna().sum() > 60:
+            pct = float((v20.iloc[:-1] <= v20.iloc[-1]).mean() * 100)
+            if pct >= 90:
+                add = min(15, (pct - 90) * 1.2 + 5); score += add
+                reasons.append(f"波动率处自身{pct:.0f}%高位(股性异常剧烈)")
+    # ⑥ 闪崩：近10日出现单日 <= -8%
+    if (r.iloc[-10:] <= -8).any():
+        score += 10; reasons.append("近10日现单日闪崩(≤-8%)")
+    # ⑦ ST / 亏损或极端估值
+    nm = str(name or df.get("name", pd.Series([""])).iloc[-1] if "name" in df.columns else name)
+    if "ST" in nm.upper():
+        score += 15; reasons.append("ST/风险警示股")
+    pe = float(last.get("pe_ttm")) if pd.notna(last.get("pe_ttm")) else None
+    if pe is not None and (pe <= 0):
+        score += 8; reasons.append("滚动市盈率为负(亏损)")
+    elif pe is not None and pe >= 150:
+        score += 6; reasons.append(f"估值极高(PE={pe:.0f})")
+    score = float(min(100, round(score, 1)))
+    level = ("🔴 高异动·建议回避" if score >= 60 else
+             "🟠 中等异动·谨慎" if score >= 35 else
+             "🟢 未见明显异动")
+    if not reasons:
+        reasons = ["未命中任何异动特征(不代表无风险)"]
+    return {"score": score, "reasons": reasons, "level": level}
+
+
+def anomaly_risk_scan(codes: Optional[List[str]] = None, root: Optional[str] = None,
+                      start: str = "20230101", end: Optional[str] = None,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """『主力视角·避雷扫描』：对一篮子股票算异动/操纵风险分并按高→低排序。
+    诚实定位：跟庄不可行(拿不到 Level2/真实席位)，此模块只做**风险规避**——识别被异常拉抬/出货/操纵的特征。
+    高分≠一定跌，只提示『这只当前很不正常、离远点』。研究用途、非投资建议、不荐股、盈亏自负。"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or list(USER_WATCHLIST_CODES)
+    root = root or StockDataFetcher._resolve_local_root()
+    rows = []
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        try:
+            df, _ = (_mh_load_local_rich(code, root) if root else (None, False))
+            if df is None:
+                df, _ = _mh_load_online_rich(code, start, end, progress_cb=log)
+            if df is None or len(df) < 30:
+                rows.append({"code": code, "name": "", "score": None,
+                             "level": "数据不足", "reasons": ["本地/联网无足够数据"]}); continue
+            nm = str(df["name"].iloc[-1]) if "name" in df.columns and len(df) else code
+            res = _anomaly_risk_one(df, nm)
+            rows.append({"code": code, "name": nm, "as_of": str(df["date"].iloc[-1].date()), **res})
+            log(f"[{i}/{len(codes)}] {code} {nm}: 异动分 {res['score']} {res['level']}")
+        except Exception as e:
+            rows.append({"code": code, "name": "", "score": None, "level": "出错", "reasons": [str(e)[:80]]})
+    scored = [x for x in rows if isinstance(x.get("score"), (int, float))]
+    scored.sort(key=lambda x: -x["score"])
+    other = [x for x in rows if not isinstance(x.get("score"), (int, float))]
+    return {"ranked": scored + other, "n": len(rows),
+            "note": "异动分越高=越像被异常拉抬/出货/操纵，建议回避；≠预测下跌、≠买卖信号。",
+            "disclaimer": "主力视角·避雷扫描仅识别异常特征供规避，非投资建议、不荐股、盈亏自负；数据非实时。"}
+
+
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
 VOTE_DEFAULT_ALGOS: List[str] = ["Lasso", "RidgeReg", "ElasticNet", "PLSR", "ELM", "KNN",
                                  "RF", "ExtraTrees", "Bagging", "GBRT", "XGBoost", "LightGBM"]
@@ -15249,6 +15404,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
     p.add_argument("--rank-raw", action="store_true",
                    help="选股排序不做行业/市值中性化(默认做)。加上它可对比：中性化前后 RankIC/size暴露差多少")
+    p.add_argument("--avoid-scan", action="store_true",
+                   help="『主力视角·避雷扫描』：对一篮子股票算异动/操纵风险分并排序(高=建议回避)。配 --global-scope/--global-codes 选池")
     p.add_argument("--vote", action="store_true",
                    help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
     p.add_argument("--vote-backtest", action="store_true",
@@ -15535,6 +15692,25 @@ def main():
         print("=" * 66)
         print(f"图: {r['out_png']}")
         print("✓ 判读：RankIC>0 且『买最强一档』净值跑赢『市场等权』，才说明排序有真实相对强弱价值。")
+        print("⚠ " + r["disclaimer"])
+        return
+
+    # --avoid-scan：『主力视角·避雷扫描』异动/操纵风险分排序(高=建议回避)
+    if args.avoid_scan:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        print(f"[avoid-scan] 主力视角·避雷扫描 {len(codes)} 只")
+        r = anomaly_risk_scan(codes=codes, progress_cb=print)
+        print("\n" + "=" * 70)
+        print("主力视角·避雷扫描（异动/操纵风险分，越高越建议回避；≠预测下跌、≠买卖信号）")
+        print("-" * 70)
+        print(f"{'代码':>9}{'名称':>9}{'异动分':>8}   风险等级 / 命中特征")
+        for x in r["ranked"]:
+            sc = "-" if x.get("score") is None else x["score"]
+            print(f"{x['code']:>9}{str(x.get('name',''))[:6]:>9}{str(sc):>8}   {x['level']}｜" + "；".join(x["reasons"][:3]))
+        print("=" * 70)
         print("⚠ " + r["disclaimer"])
         return
 
