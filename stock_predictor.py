@@ -13559,7 +13559,10 @@ USER_WATCHLIST_CODES: List[str] = [
 MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
                               "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm",
                               "vol20", "mom20", "mom60", "rsi14", "dist_ma60", "dist_ma250",
-                              "dist_hi120", "dist_lo120", "macd_hist", "boll_pos", "price_tier"]
+                              "dist_hi120", "dist_lo120", "macd_hist", "boll_pos", "price_tier",
+                              # 勒贝格/值域横向分带的测度与分布特征(近60日)
+                              "lb_up_freq", "lb_bigup_freq", "lb_bigdn_freq", "lb_ret_skew",
+                              "lb_ret_q80", "lb_ret_q20"]
 # 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
 MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
 # B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
@@ -13745,6 +13748,16 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     # 布林带位置：(收盘 − 20日均) / (2×20日标准差)，落在 [-1,1] 内表示带内位置
     std20 = cl.rolling(20).std()
     df["boll_pos"] = (cl - cl.rolling(20).mean()) / (2 * std20 + 1e-9)
+    # ---- 勒贝格思路：切"涨跌幅值域"成横向分带，测量近 60 日落在各带的频率(测度)+分布形状 ----
+    #   刻画股性/波动结构(和时间窗口特征正交、跨股票可比)，全部因果(近60日、含当日及以前)。
+    r = df["ret_1d"] if "ret_1d" in df.columns else cl.pct_change() * 100
+    W = 60
+    df["lb_up_freq"] = (r > 0).rolling(W).mean() * 100                    # 上涨日占比(0带以上测度)
+    df["lb_bigup_freq"] = (r >= 7).rolling(W).mean() * 100               # 大涨(≈涨停)频率(高带测度)
+    df["lb_bigdn_freq"] = (r <= -7).rolling(W).mean() * 100              # 大跌(≈跌停)频率(低带测度)
+    df["lb_ret_skew"] = r.rolling(W).skew()                              # 收益分布偏度(左偏/右偏)
+    df["lb_ret_q80"] = r.rolling(W).quantile(0.80)                       # 收益80%分位(上带边界)
+    df["lb_ret_q20"] = r.rolling(W).quantile(0.20)                       # 收益20%分位(下带边界)
     return df, is_delisted
 
 
@@ -13812,6 +13825,10 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 "macd_hist": r.get("macd_hist"), "boll_pos": r.get("boll_pos"),
                 # 价格档位(股价区间 regime)：1-3/3-6/6-9/9-11/11-20/20-50/50+ → 1..7；树模型可据此在不同价位学不同规律
                 "price_tier": int(np.searchsorted([3, 6, 9, 11, 20, 50], float(c0)) + 1),
+                # 勒贝格/值域横向分带：近60日落在各涨跌幅带的频率(测度)+分布形状
+                "lb_up_freq": r.get("lb_up_freq"), "lb_bigup_freq": r.get("lb_bigup_freq"),
+                "lb_bigdn_freq": r.get("lb_bigdn_freq"), "lb_ret_skew": r.get("lb_ret_skew"),
+                "lb_ret_q80": r.get("lb_ret_q80"), "lb_ret_q20": r.get("lb_ret_q20"),
             }
             for h in horizons:
                 win = close[i + 1: i + h + 1]
