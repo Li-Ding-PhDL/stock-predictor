@@ -14514,7 +14514,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-global", action="store_true",
                    help="用本地数据集对『一批股票』做多期限×多目标全局池化训练，并冻结模型(不必每次重训)")
     p.add_argument("--train-xs", action="store_true",
-                   help="横截面排序训练：预测『该股未来收益−同池中位数』(相对强弱)，基准恒50%，报横截面DA/RankIC/多空价差")
+                   help="横截面排序训练：预测『该股未来收益−同池中位数』(相对强弱)，基准恒50%%，报横截面DA/RankIC/多空价差")
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
