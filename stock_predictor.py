@@ -11069,7 +11069,11 @@ if HAS_PYSIDE6:
             self.kelly_btn.clicked.connect(self._on_kelly)
             g.addWidget(self.kelly_btn, 0, 4)
             self.kelly_view = QLabel("填入胜率与赔率，点『算仓位』。")
-            self.kelly_view.setWordWrap(True); self.kelly_view.setStyleSheet("padding:6px;")
+            self.kelly_view.setWordWrap(True); self.kelly_view.setTextFormat(Qt.RichText)
+            self.kelly_view.setMinimumHeight(72)
+            self.kelly_view.setStyleSheet(
+                "padding:10px 14px; background:#f6f8fb; border:1px solid #dbe1e8; border-radius:8px;"
+                "font-size:13px; line-height:1.7;")
             g.addWidget(self.kelly_view, 1, 0, 1, 5)
             layout.addWidget(box)
 
@@ -11089,7 +11093,11 @@ if HAS_PYSIDE6:
             self.sltp_btn.clicked.connect(self._on_sltp)
             sg.addWidget(self.sltp_btn, 0, 6)
             self.sltp_view = QLabel("填『止损容忍%』(可加买入价)，点『算止盈止损』——赚到止盈位就卖、亏到止损位就走。")
-            self.sltp_view.setWordWrap(True); self.sltp_view.setStyleSheet("padding:6px;")
+            self.sltp_view.setWordWrap(True); self.sltp_view.setTextFormat(Qt.RichText)
+            self.sltp_view.setMinimumHeight(84)
+            self.sltp_view.setStyleSheet(
+                "padding:10px 14px; background:#f6f8fb; border:1px solid #dbe1e8; border-radius:8px;"
+                "font-size:13px; line-height:1.7;")
             sg.addWidget(self.sltp_view, 1, 0, 1, 7)
             layout.addWidget(sltp)
 
