@@ -14359,6 +14359,7 @@ def vote_strategy_backtest(codes: List[str], algos: Optional[List[str]] = None,
     algos = algos + (["ARIMA"] if HAS_STATSMODELS and "ARIMA" not in algos else [])
     per = []
     s_rets, b_rets = [], []
+    pool_hit = pool_tot = pool_up_hit = pool_up_tot = pool_dn_hit = pool_dn_tot = 0   # 汇总投票信号准确率
     for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
         try:
             df = StockDataFetcher().fetch(code, start, end)
@@ -14390,17 +14391,33 @@ def vote_strategy_backtest(codes: List[str], algos: Optional[List[str]] = None,
             cum_b = float(np.prod(1 + act) - 1) * 100
             traded = int(maj_up.sum())
             win = float(np.mean(act[maj_up] > 0) * 100) if traded else float("nan")
+            # 投票信号方向准确率：多数说涨→实际涨算对；多数说跌→实际跌算对
+            maj_dir = np.where(maj_up, 1, -1)
+            act_dir = np.where(act > 0, 1, -1)
+            vote_acc = float(np.mean(maj_dir == act_dir) * 100)
+            dn_mask = ~maj_up; dn_days = int(dn_mask.sum())
+            up_prec = float(np.mean(act[maj_up] > 0) * 100) if traded else float("nan")   # 说涨→真涨 精确率
+            dn_prec = float(np.mean(act[dn_mask] <= 0) * 100) if dn_days else float("nan")  # 说跌→真跌 精确率
+            pool_hit += int((maj_dir == act_dir).sum()); pool_tot += n
+            pool_up_hit += int((act[maj_up] > 0).sum()); pool_up_tot += traded
+            pool_dn_hit += int((act[dn_mask] <= 0).sum()); pool_dn_tot += dn_days
             per.append({"code": code, "n_test": n, "traded_days": traded,
                         "strat_ret_pct": round(cum_s, 2), "buyhold_ret_pct": round(cum_b, 2),
-                        "excess_pct": round(cum_s - cum_b, 2), "win_rate_pct": round(win, 1)})
+                        "excess_pct": round(cum_s - cum_b, 2), "win_rate_pct": round(win, 1),
+                        "vote_acc_pct": round(vote_acc, 1), "up_prec_pct": round(up_prec, 1),
+                        "dn_prec_pct": round(dn_prec, 1), "up_days": traded, "dn_days": dn_days})
             s_rets.append(cum_s); b_rets.append(cum_b)
-            log(f"[{i}/{len(codes)}] {code} 策略{cum_s:+.1f}% vs 买入持有{cum_b:+.1f}% (超额{cum_s-cum_b:+.1f}%, 出手{traded}/{n}日, 胜率{win:.0f}%)")
+            log(f"[{i}/{len(codes)}] {code} 投票方向准确率{vote_acc:.0f}% (说涨→真涨{up_prec:.0f}%/说跌→真跌{dn_prec:.0f}%) | 策略{cum_s:+.1f}% vs 持有{cum_b:+.1f}%")
         except Exception as e:
             log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:70]}")
     summary = {"n_stocks": len(per), "per": per,
                "avg_strat_pct": round(float(np.mean(s_rets)), 2) if s_rets else None,
                "avg_buyhold_pct": round(float(np.mean(b_rets)), 2) if b_rets else None,
                "n_beat": sum(1 for p in per if p["excess_pct"] > 0),
+               "vote_acc_pct": round(pool_hit / pool_tot * 100, 1) if pool_tot else None,
+               "up_precision_pct": round(pool_up_hit / pool_up_tot * 100, 1) if pool_up_tot else None,
+               "dn_precision_pct": round(pool_dn_hit / pool_dn_tot * 100, 1) if pool_dn_tot else None,
+               "pool_days": pool_tot, "pool_up_days": pool_up_tot, "pool_dn_days": pool_dn_tot,
                "disclaimer": "样本外历史回测；多数投票择时；含手续费；不保证未来、非投资建议、盈亏自负。"}
     return summary
 
@@ -14858,14 +14875,16 @@ def main():
                   else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         print(f"[vote-backtest] 多数投票择时 · {len(codes)} 只 · 手续费 {args.cost}%%")
         s = vote_strategy_backtest(codes, cost_bps=args.cost, progress_cb=print)
-        print("\n" + "=" * 70)
-        print(f"{'代码':<8}{'策略%':>9}{'买入持有%':>11}{'超额%':>9}{'出手日':>8}{'胜率%':>7}")
+        print("\n" + "=" * 82)
+        print(f"{'代码':<8}{'投票方向准确%':>13}{'说涨→真涨%':>11}{'说跌→真跌%':>11}{'策略%':>8}{'持有%':>8}")
         for p_ in s["per"]:
-            print(f"{p_['code']:<8}{p_['strat_ret_pct']:>9}{p_['buyhold_ret_pct']:>11}{p_['excess_pct']:>9}{p_['traded_days']:>8}{p_['win_rate_pct']:>7}")
-        print("-" * 70)
-        print(f"平均：策略 {s['avg_strat_pct']}% vs 买入持有 {s['avg_buyhold_pct']}% ｜ {s['n_beat']}/{s['n_stocks']} 只跑赢买入持有")
-        print("=" * 70)
-        print("⚠ 样本外历史回测、含手续费；跑赢买入持有才说明投票择时有用。不保证未来、非投资建议、盈亏自负。")
+            print(f"{p_['code']:<8}{p_['vote_acc_pct']:>13}{p_['up_prec_pct']:>11}{p_['dn_prec_pct']:>11}{p_['strat_ret_pct']:>8}{p_['buyhold_ret_pct']:>8}")
+        print("-" * 82)
+        print(f"【投票信号准确率·汇总】方向准确率 {s['vote_acc_pct']}% (共{s['pool_days']}股日) ｜ "
+              f"说涨→真涨 {s['up_precision_pct']}% ({s['pool_up_days']}日) ｜ 说跌→真跌 {s['dn_precision_pct']}% ({s['pool_dn_days']}日)")
+        print(f"【收益】平均策略 {s['avg_strat_pct']}% vs 买入持有 {s['avg_buyhold_pct']}% ｜ {s['n_beat']}/{s['n_stocks']} 只跑赢持有")
+        print("=" * 82)
+        print("⚠ 关键看『说涨→真涨』和『说跌→真跌』是否明显>50%；否则投票信号无用。样本外回测、含手续费、非投资建议、盈亏自负。")
         return
 
     # --vote：多模型投票统计(每只几个说涨/几个说跌)
