@@ -8419,9 +8419,13 @@ if HAS_PYSIDE6:
             bottom.addWidget(self.mldata_table)
             bottom.setSizes([560, 460])
             split.addWidget(bottom)
-            split.setSizes([280, 230, 340])
+            split.setSizes([420, 300, 480])       # 各块给足高度
             layout.addWidget(split, stretch=1)
-            return panel
+            # 整页套进纵向滚动区，并把内容整体撑高——超出可视区就出现下滚条，每块都能看得更全、往下滚
+            panel.setMinimumHeight(1250)
+            mldata_scroll = QScrollArea(); mldata_scroll.setWidgetResizable(True)
+            mldata_scroll.setWidget(panel)
+            return mldata_scroll
 
         def _best_da_model(self):
             """返回当前『DA 方向准确率最高』的模型名：优先用已训练结果的测试DA；
