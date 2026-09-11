@@ -13546,84 +13546,83 @@ UPDATED_DATA_ROOT = os.path.join(BASE_DIR, "data_updated")   # 抓取整理后�
 
 
 def update_daily_dataset(codes: List[str], out_root: str = UPDATED_DATA_ROOT,
-                         bypass_proxy: bool = True,
+                         start: str = "20180101", bypass_proxy: bool = True,
                          progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
-    """抓取整理『最新每日数据』：把 akshare 最新日线+估值**接续**到本地历史(股票4.14)之后，
-    按数据集所需字段(股票4.14 同格式)写到 out_root/每只股票一个文件/前复权/<代码>.csv。
-    这样选股/预测能用到当前数据(本地历史只到 2026-04-10)。缺 akshare 时跳过(降级，红线#5)。
-    用法：跑完把 LOCAL_DATA_ROOT/STOCK_LOCAL_DATA_ROOT 指向 out_root 即用最新数据。"""
+    """抓取整理『最新每日数据』——借鉴 Sequoia-X：改用 **baostock**(免费/无限流/无需注册/绕开东方财富反爬)
+    拉**全历史前复权**日线(含 换手率/涨跌幅/peTTM/pbMRQ/psTTM)，按数据集所需字段(股票4.14 同格式)
+    重建整段写到 out_root/每只股票一个文件/前复权/<代码>.csv(不拼接、无接缝，数据到最新交易日)。
+    名称/行业沿用本地历史(若有)。baostock 缺失/失败时跳过(降级，红线#5)。
+    用法：跑完设 STOCK_LOCAL_DATA_ROOT 指向 out_root，选股/预测即用最新数据。"""
     log = progress_cb or (lambda m: None)
+    if not HAS_BAOSTOCK:
+        log("未安装 baostock（pip install baostock），无法更新。"); return {"updated": 0, "skipped": len(codes), "out_root": out_root}
+    import baostock as bs
     hist_root = StockDataFetcher._resolve_local_root()
     os.makedirs(os.path.join(out_root, "每只股票一个文件", "前复权"), exist_ok=True)
-    today = dt.date.today().strftime("%Y%m%d")
+    end = dt.date.today().strftime("%Y-%m-%d")
+    sdash = f"{start[0:4]}-{start[4:6]}-{start[6:8]}" if len(start) == 8 else start
+    fields = "date,open,high,low,close,preclose,volume,amount,turn,pctChg,peTTM,psTTM,pbMRQ,isST"
     ok, skip = 0, 0
-    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
-        try:
-            # 1) 本地历史(全部原始列)
-            raw = None
-            if hist_root:
-                hp = StockDataFetcher._local_csv_path(code, "qfq", hist_root)
-                if os.path.exists(hp):
-                    raw = pd.read_csv(hp, dtype=str)
-                    raw["日期"] = pd.to_datetime(raw["日期"], errors="coerce").astype("datetime64[ns]")
-            # 2) akshare 最新日线(强制联网，英文列；多重试缓解东方财富限流)
-            df_new = StockDataFetcher().fetch(code, "20260101", today, source="akshare",
-                                              use_cache=False, bypass_proxy=bypass_proxy, retries=4)
-            if df_new is None or len(df_new) == 0:
-                skip += 1; log(f"[{i}/{len(codes)}] {code} 无最新数据，跳过"); continue
-            df_new["date"] = pd.to_datetime(df_new["date"]).astype("datetime64[ns]")
-            # 只保留比本地历史更新的行
-            last_hist = raw["日期"].max() if raw is not None and len(raw) else pd.Timestamp("2000-01-01")
-            add = df_new[df_new["date"] > last_hist].copy()
-            if len(add) == 0:
-                skip += 1; log(f"[{i}/{len(codes)}] {code} 本地已最新，跳过"); continue
-            # 3) 估值(日频 PE/PB/PS)
+    lg = bs.login()
+    try:
+        if getattr(lg, "error_code", "0") != "0":
+            log(f"baostock 登录失败: {getattr(lg,'error_msg','')}"); return {"updated": 0, "skipped": len(codes), "out_root": out_root}
+        for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
             try:
-                val = StockDataFetcher._fetch_valuation(code, bypass_proxy)
-                val["date"] = pd.to_datetime(val["date"]).astype("datetime64[ns]")
-            except Exception:
-                val = pd.DataFrame(columns=["date"])
-            name = raw["名称"].iloc[-1] if raw is not None and "名称" in raw.columns and len(raw) else code
-            ind = raw["所属行业"].iloc[-1] if raw is not None and "所属行业" in raw.columns and len(raw) else ""
-            # 4) 新行 → 股票4.14 中文列(成交量 手→股 ×100 与本地口径一致)
-            new_rows = pd.DataFrame({
-                "日期": add["date"], "代码": code, "名称": name, "所属行业": ind,
-                "开盘价": add.get("open"), "最高价": add.get("high"), "最低价": add.get("low"),
-                "收盘价": add.get("close"), "前收盘价": add["close"].shift(1),
-                "成交量（股）": pd.to_numeric(add.get("volume"), errors="coerce") * 100,
-                "成交额（元）": add.get("amount"), "换手率": add.get("turnover"),
-                "涨幅%": add.get("pct_change"), "振幅%": add.get("amplitude"),
-                "是否ST": "否", "退市时间": "-",
-            })
-            if len(val):
-                m = pd.merge_asof(new_rows.sort_values("日期"), val.sort_values("date"),
-                                  left_on="日期", right_on="date", direction="backward")
-                new_rows["滚动市盈率"] = m.get("val_pe_ttm").values if "val_pe_ttm" in m else np.nan
-                new_rows["市净率"] = m.get("val_pb").values if "val_pb" in m else np.nan
-                new_rows["滚动市销率"] = m.get("val_ps_ttm").values if "val_ps_ttm" in m else np.nan
-            # 5) 拼接历史+新行，对"数据集要用的派生列"在全序列上重算，保证接缝正确
-            combined = pd.concat([raw, new_rows], ignore_index=True) if raw is not None else new_rows
-            combined = combined.sort_values("日期").reset_index(drop=True)
-            cl = pd.to_numeric(combined["收盘价"], errors="coerce")
-            vol = pd.to_numeric(combined["成交量（股）"], errors="coerce")
-            # 只对新增行(尾部)回填这些派生列，历史行保留原值
-            mask_new = combined["日期"] > last_hist
-            for w, col in [(3, "3日涨幅%"), (6, "6日涨幅%"), (10, "10日涨幅%")]:
-                s = (cl / cl.shift(w) - 1) * 100
-                combined.loc[mask_new, col] = s[mask_new].values
-            for w, col in [(5, "5日线"), (10, "10日线"), (20, "20日线"), (30, "30日线"),
-                           (60, "60日线"), (120, "120日线"), (250, "250日线")]:
-                s = cl.rolling(w).mean()
-                combined.loc[mask_new, col] = s[mask_new].round(3).values
-            lb = vol / (vol.rolling(5).mean() + 1e-9)         # 量比代理 = 量 / 5日均量
-            combined.loc[mask_new, "量比"] = lb[mask_new].round(3).values
-            outp = os.path.join(out_root, "每只股票一个文件", "前复权", f"{code}.csv")
-            combined.to_csv(outp, index=False, encoding="utf-8-sig")
-            ok += 1
-            log(f"[{i}/{len(codes)}] {code} {name}：+{len(add)} 行 → 最新 {add['date'].max().date()}（写入 {os.path.basename(outp)}）")
-        except Exception as e:
-            skip += 1; log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:80]}")
-        time.sleep(1.2)          # 股间隔，缓解东方财富限流
+                c = code
+                bs_code = f"sh.{c}" if c.startswith("6") else (f"bj.{c}" if c.startswith(("4", "8")) else f"sz.{c}")
+                rs = bs.query_history_k_data_plus(bs_code, fields, start_date=sdash, end_date=end,
+                                                  frequency="d", adjustflag="2")   # 2=前复权
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    skip += 1; log(f"[{i}/{len(codes)}] {code} baostock 无数据，跳过"); continue
+                d = pd.DataFrame(rows, columns=rs.fields)
+                d["date"] = pd.to_datetime(d["date"], errors="coerce")
+                for col in ("open", "high", "low", "close", "preclose", "volume", "amount",
+                            "turn", "pctChg", "peTTM", "psTTM", "pbMRQ"):
+                    d[col] = pd.to_numeric(d[col], errors="coerce")
+                d = d.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+                # 名称/行业沿用本地历史(若有)
+                name, ind = code, ""
+                if hist_root:
+                    hp = StockDataFetcher._local_csv_path(code, "qfq", hist_root)
+                    if os.path.exists(hp):
+                        try:
+                            h = pd.read_csv(hp, dtype=str, nrows=1)  # 只读表头拿列; 名称在数据行
+                            hh = pd.read_csv(hp, dtype=str, usecols=[c for c in ["名称", "所属行业"] if c in h.columns])
+                            if "名称" in hh.columns and len(hh): name = str(hh["名称"].iloc[-1])
+                            if "所属行业" in hh.columns and len(hh): ind = str(hh["所属行业"].iloc[-1])
+                        except Exception:
+                            pass
+                cl = d["close"]
+                out = pd.DataFrame({
+                    "日期": d["date"].dt.strftime("%Y-%m-%d"), "代码": code, "名称": name, "所属行业": ind,
+                    "开盘价": d["open"], "最高价": d["high"], "最低价": d["low"], "收盘价": d["close"],
+                    "前收盘价": d["preclose"], "成交量（股）": d["volume"], "成交额（元）": d["amount"],
+                    "换手率": d["turn"], "涨幅%": d["pctChg"],
+                    "振幅%": (d["high"] - d["low"]) / (d["preclose"] + 1e-9) * 100,
+                    "是否ST": d["isST"].map(lambda x: "是" if str(x) == "1" else "否"),
+                    "量比": (d["volume"] / (d["volume"].rolling(5).mean() + 1e-9)).round(3),
+                    "3日涨幅%": (cl / cl.shift(3) - 1) * 100, "6日涨幅%": (cl / cl.shift(6) - 1) * 100,
+                    "10日涨幅%": (cl / cl.shift(10) - 1) * 100,
+                    "总市值（元）": np.nan, "流通市值（元）": np.nan,
+                    "滚动市盈率": d["peTTM"], "市净率": d["pbMRQ"], "滚动市销率": d["psTTM"],
+                    "5日线": cl.rolling(5).mean().round(3), "10日线": cl.rolling(10).mean().round(3),
+                    "20日线": cl.rolling(20).mean().round(3), "30日线": cl.rolling(30).mean().round(3),
+                    "60日线": cl.rolling(60).mean().round(3), "120日线": cl.rolling(120).mean().round(3),
+                    "250日线": cl.rolling(250).mean().round(3),
+                    "上市时间": "-", "退市时间": "-",
+                })
+                outp = os.path.join(out_root, "每只股票一个文件", "前复权", f"{code}.csv")
+                out.to_csv(outp, index=False, encoding="utf-8-sig")
+                ok += 1
+                log(f"[{i}/{len(codes)}] {code} {name}：{len(out)} 行 → 最新 {out['日期'].iloc[-1]}（baostock 前复权）")
+            except Exception as e:
+                skip += 1; log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:90]}")
+    finally:
+        bs.logout()
     log(f"完成：更新 {ok} 只，跳过 {skip} 只。数据在 {out_root}")
     return {"updated": ok, "skipped": skip, "out_root": out_root}
 

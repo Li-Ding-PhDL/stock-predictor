@@ -49,9 +49,18 @@ python stock_predictor.py --cli --train-global --global-scope all      # 本地�
 
 # 加载冻结模型预测(只加载不训练)
 python stock_predictor.py --cli --predict-frozen 600519 --global-algos "Lasso"
+
+# 抓取整理最新每日数据(baostock，绕开东方财富限流)——补齐本地历史之后到最新交易日，写到 data_updated/
+python stock_predictor.py --cli --update-data --global-scope mine
+export STOCK_LOCAL_DATA_ROOT=".../stock-predictor/data_updated"   # 指向它即用最新数据跑选股/预测
+
+# 『主力思维』横截面选股排序(相对强弱打分 + 样本外回测 + 出图)
+python stock_predictor.py --cli --rank-stocks --global-scope mine --rank-horizon 21
 ```
 
 - **本地数据源**：`StockDataFetcher.fetch(source="auto"/"local")` 本地优先；`enrich()` 用同一 CSV 的 PE/PB/PS/市值离线顶替联网估值。根目录无效时自动回落联网，不破坏原流程。
+- **数据更新(借鉴 Sequoia-X)**：`update_daily_dataset` / `--update-data` 改用 **baostock**(免费/无限流/无需注册/绕开东方财富反爬)拉全历史前复权(含 换手率/涨跌幅/peTTM/pbMRQ/psTTM)，按 股票4.14 格式整段重建到 `data_updated/`(无接缝、到最新交易日)。这是绕开 akshare/东方财富限流、把数据补到当天的推荐路径。
+- **横截面选股排序**：`rank_stocks_cross_sectional` / `--rank-stocks` + GUI「★一键打分」——目标=未来相对强弱(个股−同日中位)，基准恒50%，报 RankIC/多空价差 + 出 PNG(红=强/绿=弱，A股色)。用户自选股 `USER_WATCHLIST_CODES` / `--global-scope mine`。这是本项目里**唯一被数据证实有真实小信号**(小盘 RankIC≈0.09)的方向。
 - **多期限×多目标**：把"预测期限 h(交易日)"当输入特征，一个模型覆盖多期限；输出为未来窗口 `[t+1,t+h]` 的 最低/中位/平均/最高 **涨跌%**(诚实口径，非绝对价)。构建见 `build_multi_horizon_dataset`。
 - **全局池化 + 冻结**：`train_global_pooled` 跨股票池化，按**全局日期**切分(防泄露)、标准化只在训练集 fit、强制 Naive+DA；每模型每目标训练后用 joblib(缺失降级 pickle) 冻结到 `frozen_models/`，`predict_frozen` 加载即预测、不再训练。ARIMA 单序列模型不进池化，只给逐股基线。
 - **ARIMA 残差混合特征(B 步，opt-in)**：`--arima-features` / GUI 复选框开启后，`_arima_causal_features` 用**训练段参数**对全序列做一步向前拟合(`res.apply` 不重估计→测试段无泄露)，把"ARIMA 预测收益 / 标准化残差"作为额外输入特征(`MH_ARIMA_COLS`)喂给全局模型；冻结文件名带 `_arima` 后缀，`predict_frozen` 会为该股票现算这两个特征。
