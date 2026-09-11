@@ -8244,7 +8244,8 @@ if HAS_PYSIDE6:
             dlg.resize(1120, 640)
             lay = QVBoxLayout(dlg)
             legend = QLabel(
-                "下面就是模型真正吃进去的数据（<b>全部为本地真实行情算出，无任何合成/占位数据</b>）：<br>"
+                "下面就是模型真正吃进去的数据（<b>全部真实行情算出，无任何合成/占位数据</b>；"
+                "本地有就读本地、没有就<b>联网拉真实历史</b>现算，同一套口径）：<br>"
                 "<span style='background:#eceff1'>&nbsp;灰=标识(代码/名称/日期/收盘)&nbsp;</span> "
                 "<span style='background:#e8f0fe'>&nbsp;蓝=输入特征 X（含期限h、技术/估值/勒贝格分带、流派量化 sch_tech/pe_pctile）&nbsp;</span> "
                 "<span style='background:#e6f4ea'>&nbsp;绿=输出目标 Y（y1方向/y2低/y3中/y4均/y5高 未来涨跌%）&nbsp;</span><br>"
@@ -8268,20 +8269,19 @@ if HAS_PYSIDE6:
 
             def _gen():
                 code = code_edit.text().strip() or "600519"
-                if not root:
-                    status.setText("未配置本地真实数据集(STOCK_LOCAL_DATA_ROOT)，无法预览——绝不用假数据顶替。")
-                    tbl.setRowCount(0); return
-                gen_btn.setEnabled(False); status.setText("生成中(读本地真实行情)…")
+                src_hint = "读本地真实行情" if root else "联网拉真实历史"
+                gen_btn.setEnabled(False); status.setText(f"生成中（{src_hint}，联网首拉可能稍慢）…")
                 QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
                 try:
                     ds = build_multi_horizon_dataset([code], DEFAULT_HORIZONS,
-                                                     anchors_per_stock=int(n_spin.value()))
+                                                     anchors_per_stock=int(n_spin.value()),
+                                                     allow_online=True)
                 except Exception as e:
                     QApplication.restoreOverrideCursor(); gen_btn.setEnabled(True)
                     status.setText(f"失败：{e}"); tbl.setRowCount(0); return
                 QApplication.restoreOverrideCursor(); gen_btn.setEnabled(True)
                 if ds is None or len(ds) == 0:
-                    status.setText(f"{code}：本地无此股票或历史不足，未构建出样本(不编造数据)。")
+                    status.setText(f"{code}：本地无此股票且联网也取不到(或历史不足)，未构建出样本(不编造数据)。")
                     tbl.setRowCount(0); state["ds"] = None; return
                 state["ds"] = ds
                 self._gm_fill_table(ds.head(400), table=tbl)
@@ -14004,9 +14004,15 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-    # ---- 追加因果技术特征(只用当天及以前；rolling/shift 不含未来) ----
+    df = _mh_add_causal_features(df)
+    return df, is_delisted
+
+
+def _mh_add_causal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """在已含 date/close(及可选 ret_1d/ma20/ma60/ma250/pe_ttm 等源列)的 df 上，追加**因果**技术/分布/流派量化特征
+    (只用当天及以前；rolling/shift 不含未来)。本地 CSV 与联网取数两条路共用它，保证两边口径一致、都无泄露。"""
     cl = df["close"]
-    df["vol20"] = df["ret_1d"].rolling(20).std() if "ret_1d" in df.columns else np.nan   # 近20日涨跌幅波动率
+    df["vol20"] = df["ret_1d"].rolling(20).std() if "ret_1d" in df.columns else (cl.pct_change() * 100).rolling(20).std()
     df["mom20"] = (cl / cl.shift(20) - 1) * 100                                           # 20日动量%
     # RSI(14)
     delta = cl.diff()
@@ -14058,7 +14064,56 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     # 缺省→中性 50(不下结论、也不因缺值把整只股票从 dropna 里剔掉)
     df["sch_tech"] = df["sch_tech"].fillna(50.0)
     df["pe_pctile"] = df["pe_pctile"].fillna(50.0)
-    return df, is_delisted
+    return df
+
+
+def _mh_load_online_rich(code: str, start: str = "20150101", end: Optional[str] = None,
+                         progress_cb: Optional[Callable[[str], None]] = None):
+    """本地无此股票时的**联网兜底**：用 StockDataFetcher 拉真实历史行情(akshare/baostock)，现算出
+    与本地 CSV 同口径的特征源列(ret/ma/量比/换手)+可选估值(PE/PB/PS)，再走同一套因果特征。
+    全程真实数据、无合成；取不到或历史不足返回 (None, False)。退市信息联网不判定，返回 is_delisted=False。"""
+    log = progress_cb or (lambda m: None)
+    try:
+        df = StockDataFetcher().fetch(code, start, end or dt.date.today().strftime("%Y%m%d"))
+    except Exception as e:
+        log(f"{code} 联网取数失败: {str(e)[:80]}"); return None, False
+    if df is None or len(df) < 60:
+        return None, False
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    cl = pd.to_numeric(df["close"], errors="coerce")
+    df["close"] = cl
+    df["ret_1d"] = cl.pct_change() * 100
+    df["ret_3d"] = (cl / cl.shift(3) - 1) * 100
+    df["ret_6d"] = (cl / cl.shift(6) - 1) * 100
+    df["ret_10d"] = (cl / cl.shift(10) - 1) * 100
+    df["ma20"] = cl.rolling(20).mean(); df["ma60"] = cl.rolling(60).mean(); df["ma250"] = cl.rolling(250).mean()
+    if "volume" in df.columns:
+        vol = pd.to_numeric(df["volume"], errors="coerce")
+        df["vol_ratio"] = vol / (vol.rolling(5).mean().shift(1) + 1e-9)       # 量比近似(不含当日→无泄露)
+    else:
+        df["vol_ratio"] = np.nan
+    if "turnover" not in df.columns:
+        df["turnover"] = np.nan
+    # 估值(可选)：联网 enrich 顶替 PE/PB/PS；限流/失败就留空(绝不编造)
+    try:
+        d2, _ = StockDataFetcher.enrich(df.copy(), code, True, False, False, False, False)
+        for src, dst in (("val_pe_ttm", "pe_ttm"), ("val_pb", "pb"), ("val_ps_ttm", "ps_ttm")):
+            if src in d2.columns:
+                df[dst] = pd.to_numeric(d2[src], errors="coerce")
+    except Exception:
+        pass
+    for c in ("pe_ttm", "pb", "ps_ttm"):
+        if c not in df.columns:
+            df[c] = np.nan
+    if "name" not in df.columns:
+        try:
+            df["name"] = StockDataFetcher.fetch_stock_name(code) or code
+        except Exception:
+            df["name"] = code
+    df = df.dropna(subset=["date", "close"]).reset_index(drop=True)
+    df = _mh_add_causal_features(df)
+    return df, False
 
 
 def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] = None,
@@ -14066,25 +14121,31 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                                 root: Optional[str] = None, drop_delisted: bool = True,
                                 anchor_stride: int = 5, anchors_per_stock: Optional[int] = None,
                                 arima_features: bool = False, split_date: Optional[str] = None,
+                                allow_online: bool = False,
                                 progress_cb: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     """把多支股票池化成"多期限×多目标"数据集(与预览 CSV 同口径)。
     因果构造：第 i 行特征取自锚定日 t(及以前)，目标取自未来窗口 [t+1, t+h]，绝不泄露。
-    anchor_stride：锚定日抽样步长(默认 5≈每周一个锚点，控样本量，SVR/GPR 才跑得动)；
-    anchors_per_stock：若给定则只取每只股票最近 N 个锚定日(用于快速预览)。"""
+    数据来源：优先本地 CSV(快)；本地无该股或根目录未配时，若 allow_online 则**联网拉真实历史**现算(同口径)。
+    两条路都是真实数据、无合成。anchor_stride：锚定日抽样步长；anchors_per_stock：只取最近 N 个锚定日(快速预览)。"""
     log = progress_cb or (lambda m: None)
     horizons = horizons or DEFAULT_HORIZONS
     root = root or StockDataFetcher._resolve_local_root()
-    if not root:
-        raise RuntimeError("未配置有效的本地数据集(LOCAL_DATA_ROOT / STOCK_LOCAL_DATA_ROOT)。")
+    if not root and not allow_online:
+        raise RuntimeError("未配置本地数据集(LOCAL_DATA_ROOT / STOCK_LOCAL_DATA_ROOT)，且未允许联网兜底。")
     s = pd.to_datetime(str(start), format="%Y%m%d", errors="coerce")
     e = pd.to_datetime(str(end), format="%Y%m%d", errors="coerce") if end else None
     hmax = max(horizons)
     rows = []
     skipped_delisted = 0
     for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
-        df, is_delisted = _mh_load_local_rich(code, root)
+        df, is_delisted = (_mh_load_local_rich(code, root) if root else (None, False))
+        src = "本地"
+        if df is None and allow_online:                 # 本地无该股 → 联网拉真实历史现算(同口径、无合成)
+            log(f"[{ci}/{len(codes)}] {code} 本地无文件，改联网获取真实历史 …")
+            df, is_delisted = _mh_load_online_rich(code, start, end, progress_cb=log)
+            src = "联网"
         if df is None:
-            log(f"[{ci}/{len(codes)}] {code} 本地无文件，跳过")
+            log(f"[{ci}/{len(codes)}] {code} 本地/联网都取不到，跳过")
             continue
         if drop_delisted and is_delisted:
             skipped_delisted += 1
@@ -14108,7 +14169,7 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
             valid = valid[-anchors_per_stock:]
         elif anchor_stride > 1:
             valid = valid[::anchor_stride]
-        log(f"[{ci}/{len(codes)}] {code} {name}：{len(valid)} 个锚定日 × {len(horizons)} 期限")
+        log(f"[{ci}/{len(codes)}] {code} {name}（{src}）：{len(valid)} 个锚定日 × {len(horizons)} 期限")
         for i in valid:
             r = df.iloc[i]
             c0 = close[i]
