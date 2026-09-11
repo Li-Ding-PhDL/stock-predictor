@@ -65,7 +65,7 @@ python stock_predictor.py --cli --rank-stocks --global-scope mine --rank-horizon
 - **全局池化 + 冻结**：`train_global_pooled` 跨股票池化，按**全局日期**切分(防泄露)、标准化只在训练集 fit、强制 Naive+DA；每模型每目标训练后用 joblib(缺失降级 pickle) 冻结到 `frozen_models/`，`predict_frozen` 加载即预测、不再训练。ARIMA 单序列模型不进池化，只给逐股基线。
 - **ARIMA 残差混合特征(B 步，opt-in)**：`--arima-features` / GUI 复选框开启后，`_arima_causal_features` 用**训练段参数**对全序列做一步向前拟合(`res.apply` 不重估计→测试段无泄露)，把"ARIMA 预测收益 / 标准化残差"作为额外输入特征(`MH_ARIMA_COLS`)喂给全局模型；冻结文件名带 `_arima` 后缀，`predict_frozen` 会为该股票现算这两个特征。
 - **特征与模型(极力提升，仍守诚实)**：`MH_FEATURE_COLS` 除基础技术/估值外含 vol20/mom20/rsi14/dist_ma60/dist_ma250/dist_hi120(全部因果)；全局池化可用任意 `ALGO_REGISTRY` 模型(默认含树模型 RF/GBRT/XGBoost/LightGBM/ExtraTrees，缺库自动置灰跳过)。诚实诊断：`train_global_pooled` 汇总给出 **按期限 DA(带各期限『总是涨』基准)** 与 **高置信前20% 弃权 DA(带该子集基准+覆盖率)**——严禁把"高基准/高覆盖"当成 edge。实测：即便如此，逐股绝对涨跌的方向 DA 仍≈50–52%，长期限的高值只是基准高，不是技能。
-- **盈亏比/数学期望**：`DEFAULT_RISK_REWARD_RATIO=1.5`（盈亏比暂定 1.5:1）；`expectancy(p, rr)` 由胜率折算数学期望，`kelly_fraction` 赔率缺省即取此值。
+- **盈亏比/数学期望/止盈止损**：`DEFAULT_RISK_REWARD_RATIO=1.5`（盈亏比暂定 1.5:1）；`expectancy(p, rr)` 由胜率折算数学期望，`kelly_fraction` 赔率缺省即取此值；`stop_loss_take_profit(entry, stop_loss_pct, rr, win_rate)` 给出对称的止盈/止损位(止盈%=止损%×盈亏比)+保本胜率+期望(GUI「组合与仓位」页「止盈止损纪律计算器」)。核心信条：预测≈抛硬币，能长期活下来的是『固定止损+按盈亏比止盈+小仓位+每次执行』——通用规则、非个股建议。
 - **GUI**：机器学习板块新增「全局模型(多期限)」标签页——可视化数据集(表头标注 标识/输入/输出) + 训练冻结 + 加载预测。
 
 ### Docker / 自动化

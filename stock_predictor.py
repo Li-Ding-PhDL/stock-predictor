@@ -5250,6 +5250,36 @@ def kelly_fraction(p: float, b: Optional[float] = None) -> Dict[str, Any]:
     return {"kelly": round(f_capped, 4), "half": round(half, 4), "raw": round(f, 4), "text": text}
 
 
+def stop_loss_take_profit(entry_price: Optional[float] = None, stop_loss_pct: float = 8.0,
+                          rr: float = DEFAULT_RISK_REWARD_RATIO,
+                          win_rate: Optional[float] = None) -> Dict[str, Any]:
+    """风控纪律计算器(通用规则，非个股建议)：给『止损容忍%』和『盈亏比 rr』，算出对称的止盈%(=止损%×rr)，
+    以及(可选)买入价对应的止损价/止盈价、给定胜率下的数学期望与保本胜率。
+    核心信条：预测方向≈抛硬币，能长期活下来的是『固定止损 + 按盈亏比止盈 + 小仓位 + 每次都执行』。
+    **这是通用风控规则演示，不针对任何个股、不是买卖信号，非投资建议、盈亏自负。**"""
+    sl = abs(float(stop_loss_pct))
+    tp = sl * float(rr)                                   # 止盈% = 止损% × 盈亏比
+    out: Dict[str, Any] = {"stop_loss_pct": round(sl, 2), "take_profit_pct": round(tp, 2), "rr": rr,
+                           "breakeven_winrate_pct": round(1.0 / (1.0 + rr) * 100, 1)}
+    if entry_price and entry_price > 0:
+        out["entry"] = round(float(entry_price), 3)
+        out["stop_loss_price"] = round(entry_price * (1 - sl / 100), 3)
+        out["take_profit_price"] = round(entry_price * (1 + tp / 100), 3)
+    if win_rate is not None:
+        p = win_rate / 100 if win_rate > 1 else win_rate
+        ev = expectancy(p, rr)
+        out["expectancy_R"] = ev.get("e_per_r"); out["win_rate_pct"] = round(p * 100, 1)
+    tp_line = (f"买入 {out['entry']} → 止损价 {out['stop_loss_price']}(-{sl:.1f}%) / 止盈价 {out['take_profit_price']}(+{tp:.1f}%)"
+               if entry_price and entry_price > 0 else f"止损 -{sl:.1f}% / 止盈 +{tp:.1f}%")
+    out["text"] = (f"【风控纪律 · 盈亏比 {rr:.2f}:1】{tp_line}。"
+                   f" 只要每次都严格执行(亏到 -{sl:.1f}% 立刻走、赚到 +{tp:.1f}% 兑现)，"
+                   f"胜率≥{out['breakeven_winrate_pct']}% 就长期不亏。"
+                   + (f" 当前设定胜率 {out.get('win_rate_pct')}% → 数学期望 {out.get('expectancy_R'):+.3f}R/笔。"
+                      if win_rate is not None and out.get('expectancy_R') is not None else "")
+                   + " 通用规则演示，不针对个股、非买卖信号、非投资建议，盈亏自负。")
+    return out
+
+
 def basket_correlation(codes: List[str], start: str = "20230101", end: Optional[str] = None,
                        progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """一篮子股票的**日收益率相关性矩阵** + **等权组合**分散化分析(借鉴 correlation/portfolio-analytics skill)。
@@ -11034,6 +11064,26 @@ if HAS_PYSIDE6:
             g.addWidget(self.kelly_view, 1, 0, 1, 5)
             layout.addWidget(box)
 
+            # --- 止盈止损纪律计算器（盈亏比 → 止盈/止损位）---
+            sltp = QGroupBox("止盈止损纪律计算器（盈亏比 → 赚多少卖 / 亏多少止损）")
+            sg = QGridLayout(sltp)
+            sg.addWidget(QLabel("买入价(选填):"), 0, 0)
+            self.sltp_entry = QLineEdit(); self.sltp_entry.setPlaceholderText("如 10.50，可留空只看百分比")
+            sg.addWidget(self.sltp_entry, 0, 1)
+            sg.addWidget(QLabel("止损容忍 %:"), 0, 2)
+            self.sltp_sl = QLineEdit("8"); self.sltp_sl.setToolTip("亏到这个百分比就无条件止损。多数纪律派用 5~10%")
+            sg.addWidget(self.sltp_sl, 0, 3)
+            sg.addWidget(QLabel("盈亏比:"), 0, 4)
+            self.sltp_rr = QLineEdit("1.5"); self.sltp_rr.setToolTip("止盈% = 止损% × 盈亏比。1.5 是稳健常见值")
+            sg.addWidget(self.sltp_rr, 0, 5)
+            self.sltp_btn = QPushButton("算止盈止损")
+            self.sltp_btn.clicked.connect(self._on_sltp)
+            sg.addWidget(self.sltp_btn, 0, 6)
+            self.sltp_view = QLabel("填『止损容忍%』(可加买入价)，点『算止盈止损』——赚到止盈位就卖、亏到止损位就走。")
+            self.sltp_view.setWordWrap(True); self.sltp_view.setStyleSheet("padding:6px;")
+            sg.addWidget(self.sltp_view, 1, 0, 1, 7)
+            layout.addWidget(sltp)
+
             # --- 1%风险逆推仓位计算器 + 金字塔建仓可视化 ---
             risk_box = QGroupBox("1% 风险逆推仓位计算器 + 金字塔分批建仓（仓位铁律）")
             risk_layout = QVBoxLayout(risk_box)
@@ -11278,6 +11328,31 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "宏观取数失败", str(e))
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.macro_btn.setEnabled(True)
+
+        def _on_sltp(self):
+            try:
+                sl = float(self.sltp_sl.text()); rr = float(self.sltp_rr.text())
+                entry = float(self.sltp_entry.text()) if self.sltp_entry.text().strip() else None
+            except ValueError:
+                self.sltp_view.setText("请输入有效数字(止损容忍%、盈亏比；买入价可留空)。"); return
+            wr = None
+            try:
+                wr = float(self.kelly_p.text())          # 复用凯利面板的胜率(若填了)
+            except Exception:
+                pass
+            r = stop_loss_take_profit(entry_price=entry, stop_loss_pct=sl, rr=rr, win_rate=wr)
+            price_line = (f"<b>止损价 <span style='color:#1a9d5a'>{r['stop_loss_price']}</span>（-{r['stop_loss_pct']}%）"
+                          f" ／ 止盈价 <span style='color:#c0392b'>{r['take_profit_price']}</span>（+{r['take_profit_pct']}%）</b><br>"
+                          if 'stop_loss_price' in r else
+                          f"<b>止损 -{r['stop_loss_pct']}% ／ 止盈 +{r['take_profit_pct']}%（盈亏比 {rr:.2f}:1）</b><br>")
+            ev_line = (f"当前胜率 {r.get('win_rate_pct')}% → 数学期望 <b>{r.get('expectancy_R'):+.3f}R/笔</b><br>"
+                       if r.get('expectancy_R') is not None else "")
+            self.sltp_view.setText(
+                price_line + ev_line +
+                f"<span style='color:#555'>规则：<b>亏到止损位无条件走、赚到止盈位兑现</b>；只要每次都执行，胜率≥"
+                f"{r['breakeven_winrate_pct']}% 长期就不亏。预测方向≈抛硬币，<b>能保命的是纪律不是预测</b>。</span><br>"
+                "<span style='color:#c0392b;font-size:12px'>⚠ 通用风控规则演示，<b>不针对任何个股、不是买卖信号、非投资建议</b>，盈亏自负。</span>")
+            self._oplog(f"止盈止损：止损-{r['stop_loss_pct']}%/止盈+{r['take_profit_pct']}%(盈亏比{rr})。")
 
         def _on_kelly(self):
             try:
