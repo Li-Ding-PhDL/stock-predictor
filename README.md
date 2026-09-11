@@ -281,6 +281,9 @@ docker build -t stock-predictor . && docker run --rm stock-predictor --cli --syn
 | **yennanliu/InvestSkill** | 基本面结构化分析思路(Piotroski/质量因子) |
 | **agiprolabs/claude-trading-skills** | 凯利公式仓位、相关性/组合分散化、因子有效性 IC/ICIR、Walk-Forward 滚动前推验证、EWMA/GARCH 波动率建模、均值回归股性诊断(Hurst) |
 | **tradermonty/claude-trading-skills** | 相对强弱 RS(CANSLIM「买领涨」)、大盘状态 regime |
+| **sngyai/Sequoia-X**（MIT） | **baostock 稳定数据源思路**（免费/无限流/绕开东方财富反爬）→ `update_daily_dataset` 改用 baostock 把数据补到最新交易日；6 种规则选股策略(海龟突破/均线放量/高窄旗形/涨停洗盘/上升跌停反包/RPS 相对强度)为选股池设计参考 |
+| **UZI-Skill**（MIT） | 可量化选股法则 → **投资流派视角**（各流派通过/不通过）、**DCF 内在价值估值**、**杀猪盘/荐股推广风险词表** |
+| **ZhuLinsen/daily_stock_analysis**（MIT） | 「收盘后自动扫描全市场 → 选股 → 推送」的日常分析工作流思路（本项目对应尾盘选股/批量扫描/预测跟踪） |
 
 ### 量化交易策略参考（图文资料）
 
