@@ -32,7 +32,9 @@ python -c "import stock_predictor"
 python stock_predictor.py --cli --synthetic --algos "RF,SVR,GBRT" --json out.json
 ```
 
-没有独立的 lint 或 test 命令；改动正确的最低标准是：CLI 冒烟能跑通、结果表里有 `Naive(前值)` 一行、目标模型 R² 不是 NaN。
+改动正确的最低标准：CLI 冒烟能跑通、结果表里有 `Naive(前值)` 一行、目标模型 R² 不是 NaN。
+
+**自动化测试(红线门禁)**：`pip install pytest && python -m pytest tests/ -q`——`tests/test_redlines.py` 离线守 4 条红线(时序不shuffle/标准化只在训练集fit/Naive+DA不可缺/目标不进特征)+核心函数(指纹/蒙特卡洛/中性化/异动/多期限因果构造)。CI 见 `.github/workflows/ci.yml`(push/PR 自动跑，只装计算依赖、不联网、不需本地数据集)。改代码后务必先跑通它再提交。
 
 ### 本地离线数据集 / 全局模型 / 冻结（第八部分补充8）
 

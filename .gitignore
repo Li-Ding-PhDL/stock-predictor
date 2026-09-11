@@ -60,3 +60,9 @@ data_updated/
 参考资料/
 *.docx
 ~$*.docx
+
+# ---- 测试/CI 产物 ----
+.pytest_cache/
+__pycache__/
+out.json
+out_ci_test.json
