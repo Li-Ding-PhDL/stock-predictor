@@ -13492,15 +13492,15 @@ if HAS_PYSIDE6:
 
         # ---- 明显可见的"进程界面"(模态忙碌弹窗) ----
         def _prog_open(self, msg="⏳ 正在运行，请稍候 ……"):
-            """弹出一个居中的模态"运行中"窗口，比等待光标醒目得多。
-            range=(0,0) 表示忙碌指示(来回滚动的进度条)。同步耗时操作里它至少会"弹出来"，
-            后台线程操作里它还会持续滚动。重复调用只更新文字，不叠开多个。"""
+            """弹出一个居中的"运行中"提示窗(忙碌滚动条)。**非模态**：后台线程任务(批量预测/扫描等)
+            运行时不锁死界面，你可以同时切标签页、看别处、点其它按钮。重复调用只更新文字，不叠开多个。
+            (纯同步的耗时操作期间主线程本就繁忙、界面会短暂无响应，这与模态无关。)"""
             try:
                 dlg = getattr(self, "_prog_dlg", None)
                 if dlg is None:
                     dlg = QProgressDialog(msg, None, 0, 0, self)   # 无取消按钮
                     dlg.setWindowTitle("请稍候")
-                    dlg.setWindowModality(Qt.ApplicationModal)
+                    dlg.setWindowModality(Qt.NonModal)             # 非模态：不锁死其余界面
                     dlg.setCancelButton(None)
                     dlg.setMinimumDuration(0)       # 立刻显示，不等 4 秒
                     dlg.setAutoClose(False); dlg.setAutoReset(False)
