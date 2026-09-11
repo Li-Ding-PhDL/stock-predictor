@@ -5280,6 +5280,50 @@ def stop_loss_take_profit(entry_price: Optional[float] = None, stop_loss_pct: fl
     return out
 
 
+def monte_carlo_trading(win_rate: float, rr: float = DEFAULT_RISK_REWARD_RATIO,
+                        risk_per_trade_pct: float = 2.0, n_trades: int = 200,
+                        cost_pct: float = 0.15, n_paths: int = 5000,
+                        ruin_threshold: float = 0.5, seed: int = 42) -> Dict[str, Any]:
+    """散户『这样操作长期会怎样』蒙特卡洛生存模拟(借鉴待完善报告 P1)：
+    给定 胜率 / 盈亏比 / 每笔风险敞口% / 单笔双边成本% / 交易笔数，模拟 n_paths 条独立路径——
+    每笔以概率 p 赢(+risk×rr)、否则输(−risk)，每笔都扣成本；统计**破产概率**(净值曾跌破 ruin_threshold)、
+    终值分布、最大回撤分布。用数字直观展示：胜率不够 / 成本高 / 频繁交易，长期大概率亏乃至破产。
+    **通用风险教育演示，非投资建议、不针对任何个股，盈亏自负。**"""
+    p = win_rate / 100.0 if win_rate > 1 else float(win_rate)
+    p = min(max(p, 0.0), 1.0)
+    risk = abs(risk_per_trade_pct) / 100.0
+    c = abs(cost_pct) / 100.0
+    rng = np.random.default_rng(seed)
+    n_paths = int(max(200, min(n_paths, 50000))); n_trades = int(max(1, min(n_trades, 5000)))
+    wins = rng.random((n_paths, n_trades)) < p
+    # 每笔收益率(相对当前净值)：赢 +risk*rr、输 −risk，再各扣一次双边成本 c
+    step = np.where(wins, risk * rr, -risk) - c
+    equity = np.cumprod(1.0 + step, axis=1)
+    equity = np.concatenate([np.ones((n_paths, 1)), equity], axis=1)
+    running_max = np.maximum.accumulate(equity, axis=1)
+    drawdown = 1.0 - equity / running_max
+    max_dd = drawdown.max(axis=1) * 100.0
+    final = equity[:, -1]
+    ruined = (equity.min(axis=1) <= ruin_threshold)
+    p_ruin = float(ruined.mean()) * 100.0
+    p_loss = float((final < 1.0).mean()) * 100.0
+    be = 1.0 / (1.0 + rr) * 100.0                       # 保本胜率
+    return {
+        "win_rate_pct": round(p * 100, 1), "rr": rr, "risk_per_trade_pct": risk_per_trade_pct,
+        "cost_pct": cost_pct, "n_trades": n_trades, "n_paths": n_paths,
+        "breakeven_winrate_pct": round(be, 1),
+        "edge": round(p * 100 - be, 1),                 # 胜率−保本胜率，>0 才有正期望
+        "p_ruin_pct": round(p_ruin, 1),
+        "p_loss_pct": round(p_loss, 1),
+        "final_median": round(float(np.median(final)), 3),
+        "final_p10": round(float(np.percentile(final, 10)), 3),
+        "final_p90": round(float(np.percentile(final, 90)), 3),
+        "maxdd_median_pct": round(float(np.median(max_dd)), 1),
+        "maxdd_p90_pct": round(float(np.percentile(max_dd, 90)), 1),
+        "disclaimer": "通用风险教育模拟(独立同分布假设，真实交易有连亏/相关性会更糟)，非投资建议、盈亏自负。",
+    }
+
+
 def basket_correlation(codes: List[str], start: str = "20230101", end: Optional[str] = None,
                        progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """一篮子股票的**日收益率相关性矩阵** + **等权组合**分散化分析(借鉴 correlation/portfolio-analytics skill)。
@@ -11268,6 +11312,36 @@ if HAS_PYSIDE6:
             sg.addWidget(self.sltp_view, 1, 0, 1, 7)
             layout.addWidget(sltp)
 
+            # --- 频繁交易『生存/破产』蒙特卡洛模拟（散户视角：这样操作长期会怎样）---
+            mc = QGroupBox("频繁交易生存模拟（蒙特卡洛：胜率/盈亏比/成本/笔数 → 破产概率 + 回撤）")
+            mg = QGridLayout(mc)
+            mg.addWidget(QLabel("胜率 %:"), 0, 0)
+            self.mc_p = QLineEdit("50"); self.mc_p.setToolTip("每笔赢的概率。单股方向≈50%，别高估自己。")
+            mg.addWidget(self.mc_p, 0, 1)
+            mg.addWidget(QLabel("盈亏比:"), 0, 2)
+            self.mc_rr = QLineEdit("1.5"); mg.addWidget(self.mc_rr, 0, 3)
+            mg.addWidget(QLabel("每笔风险 %:"), 0, 4)
+            self.mc_risk = QLineEdit("2"); self.mc_risk.setToolTip("每笔亏损占总资产比例(铁律≤1~2%)。")
+            mg.addWidget(self.mc_risk, 0, 5)
+            mg.addWidget(QLabel("单笔成本 %:"), 1, 0)
+            self.mc_cost = QLineEdit("0.15"); self.mc_cost.setToolTip("每笔双边佣金+印花税+滑点近似。频繁交易这项最致命。")
+            mg.addWidget(self.mc_cost, 1, 1)
+            mg.addWidget(QLabel("交易笔数:"), 1, 2)
+            self.mc_n = QLineEdit("200"); self.mc_n.setToolTip("模拟多少笔(≈交易多频繁)。频繁=笔数多=成本累积。")
+            mg.addWidget(self.mc_n, 1, 3)
+            self.mc_btn = QPushButton("模拟一万条路径")
+            self.mc_btn.clicked.connect(self._on_montecarlo)
+            mg.addWidget(self.mc_btn, 1, 4, 1, 2)
+            self.mc_view = QLabel("填参数点模拟：用一万条随机路径看『长期这样交易』的破产概率、终值区间、最大回撤——"
+                                  "让数字告诉你频繁交易+成本有多可怕。")
+            self.mc_view.setWordWrap(True); self.mc_view.setTextFormat(Qt.RichText)
+            self.mc_view.setMinimumHeight(120)
+            self.mc_view.setStyleSheet(
+                "padding:10px 14px; background:#f6f8fb; border:1px solid #dbe1e8; border-radius:8px;"
+                "font-size:13px; line-height:1.7;")
+            mg.addWidget(self.mc_view, 2, 0, 1, 6)
+            layout.addWidget(mc)
+
             # --- 1%风险逆推仓位计算器 + 金字塔建仓可视化 ---
             risk_box = QGroupBox("1% 风险逆推仓位计算器 + 金字塔分批建仓（仓位铁律）")
             risk_layout = QVBoxLayout(risk_box)
@@ -11557,6 +11631,36 @@ if HAS_PYSIDE6:
                 QMessageBox.critical(self, "宏观取数失败", str(e))
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.macro_btn.setEnabled(True)
+
+        def _on_montecarlo(self):
+            try:
+                p = float(self.mc_p.text()); rr = float(self.mc_rr.text())
+                risk = float(self.mc_risk.text()); cost = float(self.mc_cost.text())
+                n = int(float(self.mc_n.text()))
+            except ValueError:
+                self.mc_view.setText("请输入有效数字(胜率%、盈亏比、每笔风险%、单笔成本%、交易笔数)。"); return
+            self.mc_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            try:
+                r = monte_carlo_trading(win_rate=p, rr=rr, risk_per_trade_pct=risk,
+                                        n_trades=n, cost_pct=cost, n_paths=10000)
+            finally:
+                QApplication.restoreOverrideCursor(); self.mc_btn.setEnabled(True)
+            edge = r["edge"]; ruin = r["p_ruin_pct"]; loss = r["p_loss_pct"]
+            edge_col = "#1a7f37" if edge > 0 else "#c0392b"
+            ruin_col = "#c0392b" if ruin >= 20 else ("#b9720d" if ruin >= 5 else "#1a7f37")
+            verdict = ("你的胜率<b>低于</b>保本线，长期是<b>负期望</b>——交易越多亏得越稳" if edge < 0
+                       else "胜率略高于保本线，但成本和连亏会侵蚀优势，仓位务必小")
+            self.mc_view.setText(
+                f"<b>胜率 {r['win_rate_pct']}% vs 保本胜率 {r['breakeven_winrate_pct']}%</b>"
+                f"（净优势 <span style='color:{edge_col};font-weight:700'>{edge:+.1f} 个百分点</span>）　"
+                f"盈亏比 {r['rr']}｜每笔风险 {r['risk_per_trade_pct']}%｜单笔成本 {r['cost_pct']}%｜{r['n_trades']} 笔 × 1万条路径<br>"
+                f"▸ <b>破产概率(净值曾腰斩)</b>：<span style='color:{ruin_col};font-weight:800;font-size:15px'>{ruin}%</span>"
+                f"　▸ 亏损收场概率：<b>{loss}%</b><br>"
+                f"▸ 终值分布(起点=1)：悲观p10 <b>{r['final_p10']}</b>｜中位 <b>{r['final_median']}</b>｜乐观p90 <b>{r['final_p90']}</b><br>"
+                f"▸ 最大回撤：中位 <b>{r['maxdd_median_pct']}%</b>，最坏 10% 情形 ≥ <b>{r['maxdd_p90_pct']}%</b><br>"
+                f"<span style='color:#8a3b34'>👉 {verdict}。这还是<b>乐观</b>假设(独立同分布、无连环踩雷)；真实交易有连亏、齐跌，只会更糟。"
+                f"通用风险教育、非投资建议、盈亏自负。</span>")
+            self._oplog(f"蒙特卡洛：胜率{r['win_rate_pct']}%/盈亏比{r['rr']}/成本{r['cost_pct']}%/{r['n_trades']}笔 → 破产{ruin}%")
 
         def _on_sltp(self):
             try:
@@ -13811,6 +13915,14 @@ except ImportError:
 FROZEN_DIR = os.path.join(BASE_DIR, "frozen_models")   # 冻结模型(超参+已拟合模型+scaler)的持久化目录
 os.makedirs(FROZEN_DIR, exist_ok=True)
 
+
+def _feature_fingerprint(feature_cols: List[str]) -> str:
+    """对特征列的『名称 + 顺序』求一个短指纹。冻结时存、加载时比对——
+    一旦后续代码增删/改序了特征(如新增 sch_tech/pe_pctile)，旧模型的输入 schema 与新数据不再对齐，
+    比对即可及时报错，杜绝『悄悄用 0 顶替缺失特征』导致的静默错位(见待完善报告 P0)。"""
+    import hashlib
+    return hashlib.md5("|".join(map(str, feature_cols)).encode("utf-8")).hexdigest()[:12]
+
 DEFAULT_HORIZONS: List[int] = [1, 2, 3, 5, 10, 21, 32, 42]   # 1/2/3日、一周、两周、一个月、一个半月、两个月
 # 全局模型池化用的"流动性子集"默认清单(大市值/活跃、非退市；先子集跑通用)。想换/扩量改这里或用 --global-codes。
 GLOBAL_SUBSET_CODES: List[str] = [
@@ -14372,6 +14484,7 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                 bundle = {
                     "kind": "global_pooled_multihorizon", "algo": algo,
                     "feature_cols": feature_cols, "target_cols": MH_TARGET_COLS,
+                    "feature_fp": _feature_fingerprint(feature_cols),   # 特征schema指纹(加载时比对)
                     "arima_features": use_arima,
                     "horizons": horizons, "scaler": scaler,
                     "models": per_target_models, "params": per_target_params,
@@ -14543,6 +14656,7 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
                                 split_date: str = "2024-01-01", start: str = "20150101",
                                 end: Optional[str] = None, algo: str = "ExtraTrees",
                                 root: Optional[str] = None, out_png: Optional[str] = None,
+                                cost_bps: float = 30.0,
                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """『主力思维』选股排序：用公开历史数据给一篮子股票按**未来相对强弱**(超额=个股−同日中位)打分排序，
     并**样本外回测**"买打分最高的一档、避最低一档"到底有没有用(多空价差 + 累计净值 + RankIC)。
@@ -14582,7 +14696,10 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     te = te.assign(_pred=model.predict(scaler.transform(te[feat].values.astype(float))))
     udates = sorted(te["date"].unique())
     rebal = udates[::max(1, horizon)]
-    cum_top, cum_mkt, dts, ics, spreads = [1.0], [1.0], [], [], []
+    # 交易成本：cost_bps=单边(买或卖)综合成本(佣金+印花税+滑点近似)，单位 bps(万分)。
+    # 「只买最强一档」每期全额换仓→每期扣一次卖旧+买新≈2×单边；多空两条腿→再×2。研究近似,不含涨跌停无法成交。
+    c_one = cost_bps / 1e4
+    cum_top, cum_top_net, cum_mkt, dts, ics, spreads = [1.0], [1.0], [1.0], [], [], []
     for d in rebal:
         grp = te[te["date"] == d]
         if len(grp) < 6:
@@ -14593,6 +14710,7 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
         botr = float(bot["y4_mean_pct"].mean()) / 100.0
         mktr = float(grp["y4_mean_pct"].mean()) / 100.0
         cum_top.append(cum_top[-1] * (1 + topr))
+        cum_top_net.append(cum_top_net[-1] * (1 + topr) * (1 - 2 * c_one))   # 每期换仓扣双边成本
         cum_mkt.append(cum_mkt[-1] * (1 + mktr))
         dts.append(pd.Timestamp(d)); spreads.append((topr - botr) * 100)
         ic = grp["_pred"].corr(grp["y_excess"], method="spearman")
@@ -14600,6 +14718,11 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
             ics.append(ic)
     rank_ic = float(np.mean(ics)) if ics else float("nan")
     ls_spread = float(np.mean(spreads)) if spreads else float("nan")
+    # 扣费后的多空价差(两条腿各双边成本)：spread − 4×单边成本(%)
+    cost_pct_per_period = 4 * cost_bps / 100.0
+    ls_spread_net = (ls_spread - cost_pct_per_period) if spreads else float("nan")
+    top_cagr_gross = ((cum_top[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
+    top_cagr_net = ((cum_top_net[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
 
     # ④ 最新一期打分排名(以数据集最后一个交易日的横截面)
     last_d = ds["date"].max()
@@ -14615,16 +14738,24 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
 
     if out_png:
         _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
-                            horizon, algo, str(last_d.date()), out_png)
+                            horizon, algo, str(last_d.date()), out_png,
+                            cum_top_net=cum_top_net, ls_spread_net=ls_spread_net, cost_bps=cost_bps)
         log(f"图已保存: {out_png}")
+    log(f"扣费前多空价差={ls_spread:.2f}%/期 → 扣费后≈{ls_spread_net:.2f}%/期"
+        f"(单边{cost_bps:.0f}bps)；只买最强一档年化 毛{top_cagr_gross:.1f}%/净{top_cagr_net:.1f}%")
     return {"algo": algo, "horizon": horizon, "as_of": str(last_d.date()),
             "rank_ic": round(rank_ic, 4), "ls_spread_pct": round(ls_spread, 3),
+            "ls_spread_net_pct": round(ls_spread_net, 3), "cost_bps": cost_bps,
+            "top_cagr_gross_pct": round(top_cagr_gross, 2), "top_cagr_net_pct": round(top_cagr_net, 2),
             "n_rebalance": len(dts), "ranked": ranked, "out_png": out_png,
+            "note": ("扣费后 = 每期换仓扣双边成本(单边%dbps)；多空价差再减两腿共4×单边。"
+                     "未建模涨跌停无法成交/停牌/冲击成本，实盘只会更差。" % int(cost_bps)),
             "disclaimer": "用公开历史数据的相对强弱打分，样本外回测；非投资建议、盈亏自负；数据非实时。"}
 
 
 def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
-                        horizon, algo, as_of, out_png):
+                        horizon, algo, as_of, out_png,
+                        cum_top_net=None, ls_spread_net=None, cost_bps=30.0):
     """两栏图：左=最新打分排名条形(前1/3绿/后1/3红)；右=样本外『买最强一档 vs 市场等权』累计净值。"""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -14646,9 +14777,13 @@ def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
     ax1.set_xlabel("相对强弱得分(预测超额，越大越强)")
     if dts:
         ax2.plot(dts, cum_mkt[1:], label="市场等权(全买)", color="#7f8c8d", lw=1.8)
-        ax2.plot(dts, cum_top[1:], label="只买打分最强一档", color="#c0392b", lw=2.0)
-        ax2.legend(fontsize=9); ax2.grid(alpha=0.25)
-        ax2.set_title(f"样本外回测：非重叠调仓\nRankIC={rank_ic:.3f}  多空价差均值={ls_spread:.2f}%/期", fontsize=10)
+        ax2.plot(dts, cum_top[1:], label="只买最强一档(扣费前)", color="#c0392b", lw=2.0)
+        if cum_top_net is not None:
+            ax2.plot(dts, cum_top_net[1:], label=f"只买最强一档(扣费后·单边{cost_bps:.0f}bps)",
+                     color="#c0392b", lw=1.8, ls="--")
+        ax2.legend(fontsize=8); ax2.grid(alpha=0.25)
+        _net = f"  扣费后价差≈{ls_spread_net:.2f}%/期" if ls_spread_net is not None else ""
+        ax2.set_title(f"样本外回测：非重叠调仓\nRankIC={rank_ic:.3f}  多空价差{ls_spread:.2f}%/期{_net}", fontsize=10)
         ax2.set_ylabel("累计净值(起点=1)")
     else:
         ax2.text(0.5, 0.5, "测试期调仓点不足，无法回测", ha="center", va="center")
@@ -14813,13 +14948,29 @@ def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]]
     if df is None:
         raise RuntimeError(f"本地无该股票数据：{code}")
     r = df.iloc[-1]; c0 = float(r["close"])
-    feat_base = {
-        "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
-        "ma20_dev": (c0 / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else 0.0,
-        "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
-        "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
-    }
     scaler = bundle["scaler"]; models = bundle["models"]; fcols = bundle["feature_cols"]
+    # 特征 schema 指纹校验：冻结模型的输入列必须与当前代码能供给的口径一致，否则果断报错(不静默用0顶替)。
+    special = {"h", "ma20_dev", "price_tier"} | set(MH_ARIMA_COLS) | set(MH_MARKET_COLS)
+    missing = [c for c in fcols if c not in special and c not in df.columns]
+    if missing:
+        raise RuntimeError(
+            f"冻结模型 {os.path.basename(path)} 的特征与当前数据集口径不一致(缺列: {missing})。"
+            f"多半是代码升级后特征集变了——请用当前版本重新训练+冻结，勿用旧模型硬预测(会错位)。")
+    saved_fp = bundle.get("feature_fp")
+    if saved_fp and saved_fp != _feature_fingerprint(fcols):
+        raise RuntimeError(f"冻结模型特征指纹自检不一致({saved_fp})，文件可能损坏，请重训。")
+    # 从『与训练同一套』的最新特征行取值(所有技术/勒贝格/流派量化特征直接读，绝不再用0顶替)
+    feat_base = {}
+    for c in fcols:
+        if c in ("h",) or str(c).startswith("arima") or str(c).startswith("mkt_"):
+            continue
+        if c == "ma20_dev":
+            feat_base[c] = (c0 / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else 0.0
+        elif c == "price_tier":
+            feat_base[c] = int(np.searchsorted([3, 6, 9, 11, 20, 50], c0) + 1)
+        else:
+            v = r.get(c)
+            feat_base[c] = float(v) if (v is not None and pd.notna(v)) else 0.0
     # 若冻结模型用了 ARIMA 混合特征，为该股票最新一行现算(因果：参数用其全部历史估计，末行只用自身过去)
     if any(str(c).startswith("arima") for c in fcols):
         cl = df["close"].values.astype(float)
