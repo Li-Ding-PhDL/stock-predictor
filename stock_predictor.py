@@ -7491,42 +7491,62 @@ def paper_account_report(account_id: str) -> Dict[str, Any]:
 
 
 # ==================== 第八部分补充9：板块行情（概念板块/行业板块实时涨跌） ====================
-def fetch_board_spot(board_type: str = "concept") -> pd.DataFrame:
+def fetch_board_spot(board_type: str = "concept", retries: int = 4,
+                     progress_cb: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     """拉取板块实时涨跌数据。board_type='concept' 概念板块 / 'industry' 行业板块。
-    数据来自东方财富(akshare)，取不到时返回空 DataFrame，绝不造假。"""
+    数据来自东方财富(akshare)——板块实时涨跌**只有东方财富有免费源、无备用源**(baostock 无概念/行业板块)，
+    被限流时**带退避重试**riding out，多次仍失败则抛出清晰可操作的错误(而非静默返回空)。绝不造假。"""
+    log = progress_cb or (lambda m: None)
     if not HAS_AKSHARE:
-        return pd.DataFrame()
-    try:
-        if board_type == "industry":
-            df = ak.stock_board_industry_spot_em()
-        else:
-            df = ak.stock_board_concept_spot_em()
-        # 统一列名：只保留展示需要的列
-        rename = {}
-        for col in df.columns:
-            cl = str(col).lower()
-            if "板块名称" in col or "名称" in col:
-                rename[col] = "name"
-            elif "涨跌幅" in col:
-                rename[col] = "pct"
-            elif "上涨家数" in col:
-                rename[col] = "up_cnt"
-            elif "下跌家数" in col:
-                rename[col] = "down_cnt"
-            elif "领涨股票" in col and "涨跌" not in col:
-                rename[col] = "lead_stock"
-            elif "领涨" in col and "涨跌" in col:
-                rename[col] = "lead_pct"
-            elif "换手率" in col:
-                rename[col] = "turnover"
-        df = df.rename(columns=rename)
-        need = [c for c in ["name", "pct", "up_cnt", "down_cnt", "lead_stock", "lead_pct", "turnover"] if c in df.columns]
-        df = df[need].copy()
-        df["pct"] = pd.to_numeric(df["pct"], errors="coerce").fillna(0.0)
-        df = df.sort_values("pct", ascending=False).reset_index(drop=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        raise RuntimeError("未安装 akshare —— 板块行情来自东方财富，请先 pip install akshare 后重试。")
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            with _no_proxy():                       # 绕系统代理，减少被掐连
+                if board_type == "industry":
+                    df = ak.stock_board_industry_spot_em()
+                else:
+                    df = ak.stock_board_concept_spot_em()
+            if df is None or len(df) == 0:
+                raise RuntimeError("东方财富返回空数据")
+            # 统一列名：只保留展示需要的列
+            rename = {}
+            for col in df.columns:
+                if "板块名称" in col or "名称" in col:
+                    rename[col] = "name"
+                elif "涨跌幅" in col:
+                    rename[col] = "pct"
+                elif "上涨家数" in col:
+                    rename[col] = "up_cnt"
+                elif "下跌家数" in col:
+                    rename[col] = "down_cnt"
+                elif "领涨股票" in col and "涨跌" not in col:
+                    rename[col] = "lead_stock"
+                elif "领涨" in col and "涨跌" in col:
+                    rename[col] = "lead_pct"
+                elif "换手率" in col:
+                    rename[col] = "turnover"
+            df = df.rename(columns=rename)
+            need = [c for c in ["name", "pct", "up_cnt", "down_cnt", "lead_stock", "lead_pct", "turnover"] if c in df.columns]
+            if "name" not in need or "pct" not in need:
+                raise RuntimeError("返回列结构异常(缺板块名称/涨跌幅)")
+            df = df[need].copy()
+            df["pct"] = pd.to_numeric(df["pct"], errors="coerce").fillna(0.0)
+            df = df.sort_values("pct", ascending=False).reset_index(drop=True)
+            return df
+        except Exception as e:
+            last = e
+            if attempt < retries:
+                if StockDataFetcher._is_akshare_rate_limit_error(e):
+                    wait_s = 15.0 * attempt          # 限流冷却窗口更长，多等一会(15/30/45秒)
+                    log(f"东方财富限流，第{attempt}/{retries}次未成功，等待{wait_s:.0f}秒后重试…")
+                    time.sleep(wait_s)
+                else:
+                    log(f"取数抖动，第{attempt}/{retries}次未成功，稍后重试…")
+                    time.sleep(1.5 * attempt)
+    raise RuntimeError(
+        f"多次尝试仍取不到板块行情(多半是东方财富限流或网络)。板块实时涨跌只有东方财富有免费源、"
+        f"无备用数据源，请过 1–2 分钟再点「刷新板块行情」。末次错误：{last}")
 
 
 # ==================== 第九部分：可视化 GUI 层（PySide6） ====================
@@ -7674,6 +7694,24 @@ if HAS_PYSIDE6:
                 r = evaluate_investor_schools(self.code, self.d_start, self.d_end,
                                               progress_cb=lambda m: self.progress_signal.emit(m))
                 self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
+    class BoardWorker(QThread):
+        """板块行情后台线程：东方财富板块实时涨跌，带限流退避重试(不冻结界面)。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(object)        # pd.DataFrame
+        error_signal = Signal(str)
+
+        def __init__(self, board_type: str):
+            super().__init__()
+            self.board_type = board_type
+
+        def run(self):
+            try:
+                df = fetch_board_spot(self.board_type,
+                                      progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(df)
             except Exception as e:
                 self.error_signal.emit(str(e))
 
@@ -7986,6 +8024,7 @@ if HAS_PYSIDE6:
                          "据此交易风险自负")
             bar.setStyleSheet("background:#c0392b; color:white; font-weight:bold; padding:5px;")
             bar.setAlignment(Qt.AlignCenter)
+            bar.setWordWrap(True)          # 允许换行，否则长单行会把窗口最小宽度顶得很大(窄屏放不下)
             outer.addWidget(bar)
 
             content = QWidget()
@@ -8032,7 +8071,15 @@ if HAS_PYSIDE6:
             rp_layout = QVBoxLayout(result_panel)
             self.reco_view = QTextBrowser()          # 顶部：模型推荐 + 预测依据
             self.reco_view.setOpenExternalLinks(True)
-            self.reco_view.setMaximumHeight(260)
+            # 结论摘要有 4 段(建议/多重比较/预测依据/真实数据现状)，260px 会把它压成窄条(被截)。
+            # 改为按屏高向下多申请空间(约 42% 屏高、上限 480)，并给最小高度，表格在下方仍可滚动。
+            try:
+                _sh = QApplication.primaryScreen().availableGeometry().height()
+                _rc = max(240, min(480, int(_sh * 0.42)))
+            except Exception:
+                _rc = 340
+            self.reco_view.setMinimumHeight(180)
+            self.reco_view.setMaximumHeight(_rc)
             self.reco_view.setHtml("<p style='color:#888'>运行模型后，这里给出<b>基于真实DA的模型推荐</b>与<b>预测依据</b>。</p>")
             rp_layout.addWidget(self.reco_view)
             self.result_table = QTableWidget()
@@ -8134,6 +8181,14 @@ if HAS_PYSIDE6:
                 cat_row.addWidget(btn)
                 self._category_btns[cat_name] = btn
             cat_row.addStretch()
+            # 右上角常驻「数据集」按钮：任何板块下都能一键看『模型真正吃进去的数据集』(标识/输入X/输出Y)
+            self.dataset_btn = QPushButton("📊 数据集")
+            self.dataset_btn.setToolTip("查看模型真正吃进去的『多期限×多目标』训练数据集（灰=标识 / 蓝=输入X / 绿=输出Y）")
+            self.dataset_btn.setStyleSheet(
+                "QPushButton{font-weight:bold; padding:6px 16px; border:1px solid #1a7f37; border-radius:4px; color:#1a7f37;}"
+                "QPushButton:hover{background:#e6f4ea;}")
+            self.dataset_btn.clicked.connect(self._open_dataset_viewer)
+            cat_row.addWidget(self.dataset_btn)
             nav_layout.addLayout(cat_row)
 
             self.sub_row_widget = QWidget()
@@ -8179,6 +8234,72 @@ if HAS_PYSIDE6:
             idx = self._tab_name_to_index.get(name)
             if idx is not None:
                 self.tabs.setCurrentIndex(idx)
+
+        def _open_dataset_viewer(self):
+            """右上角『数据集』按钮：任何板块下都能看『模型真正吃进去的多期限×多目标数据集』。
+            数据全部来自本地真实行情(build_multi_horizon_dataset)——取不到就如实报错，绝不用合成/假数据填充。"""
+            root = StockDataFetcher._resolve_local_root()
+            dlg = QDialog(self)
+            dlg.setWindowTitle("📊 训练数据集预览 —— 标识 / 输入X / 输出Y（均为真实股票数据）")
+            dlg.resize(1120, 640)
+            lay = QVBoxLayout(dlg)
+            legend = QLabel(
+                "下面就是模型真正吃进去的数据（<b>全部为本地真实行情算出，无任何合成/占位数据</b>）：<br>"
+                "<span style='background:#eceff1'>&nbsp;灰=标识(代码/名称/日期/收盘)&nbsp;</span> "
+                "<span style='background:#e8f0fe'>&nbsp;蓝=输入特征 X（含期限h、技术/估值/勒贝格分带、流派量化 sch_tech/pe_pctile）&nbsp;</span> "
+                "<span style='background:#e6f4ea'>&nbsp;绿=输出目标 Y（y1方向/y2低/y3中/y4均/y5高 未来涨跌%）&nbsp;</span><br>"
+                "同一只股票、同一锚定日会展开成多行——每行一个预测期限 h（1/2/3/5/10/21/32/42 交易日）。"
+                "研究用途、非投资建议、盈亏自负。")
+            legend.setWordWrap(True); lay.addWidget(legend)
+            ctl = QHBoxLayout()
+            ctl.addWidget(QLabel("股票代码:"))
+            code_edit = QLineEdit(str(list(USER_WATCHLIST_CODES)[0]) if USER_WATCHLIST_CODES else "600519")
+            code_edit.setMaximumWidth(120); ctl.addWidget(code_edit)
+            ctl.addWidget(QLabel("每股锚点数:"))
+            n_spin = QSpinBox(); n_spin.setRange(3, 80); n_spin.setValue(12); ctl.addWidget(n_spin)
+            gen_btn = QPushButton("↻ 生成/刷新"); ctl.addWidget(gen_btn)
+            exp_btn = QPushButton("导出为CSV"); ctl.addWidget(exp_btn)
+            ctl.addStretch(1)
+            status = QLabel(""); status.setStyleSheet("color:#555;"); ctl.addWidget(status)
+            lay.addLayout(ctl)
+            tbl = QTableWidget(); tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            lay.addWidget(tbl, 1)
+            state = {"ds": None}
+
+            def _gen():
+                code = code_edit.text().strip() or "600519"
+                if not root:
+                    status.setText("未配置本地真实数据集(STOCK_LOCAL_DATA_ROOT)，无法预览——绝不用假数据顶替。")
+                    tbl.setRowCount(0); return
+                gen_btn.setEnabled(False); status.setText("生成中(读本地真实行情)…")
+                QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+                try:
+                    ds = build_multi_horizon_dataset([code], DEFAULT_HORIZONS,
+                                                     anchors_per_stock=int(n_spin.value()))
+                except Exception as e:
+                    QApplication.restoreOverrideCursor(); gen_btn.setEnabled(True)
+                    status.setText(f"失败：{e}"); tbl.setRowCount(0); return
+                QApplication.restoreOverrideCursor(); gen_btn.setEnabled(True)
+                if ds is None or len(ds) == 0:
+                    status.setText(f"{code}：本地无此股票或历史不足，未构建出样本(不编造数据)。")
+                    tbl.setRowCount(0); state["ds"] = None; return
+                state["ds"] = ds
+                self._gm_fill_table(ds.head(400), table=tbl)
+                status.setText(f"{code} · 真实数据：{len(ds)} 行 × {ds.shape[1]} 列"
+                               f"（{len(DEFAULT_HORIZONS)} 期限 × {int(n_spin.value())} 锚点，表格显示前 400 行）")
+
+            def _exp():
+                if state["ds"] is None or len(state["ds"]) == 0:
+                    status.setText("请先生成数据集再导出。"); return
+                path, _ = QFileDialog.getSaveFileName(
+                    dlg, "导出数据集", f"训练数据集_{code_edit.text().strip() or '600519'}.csv", "CSV (*.csv)")
+                if path:
+                    state["ds"].to_csv(path, index=False, encoding="utf-8-sig")
+                    status.setText(f"已导出：{path}")
+
+            gen_btn.clicked.connect(_gen); exp_btn.clicked.connect(_exp)
+            _gen()                                   # 打开即自动生成一次
+            dlg.exec()
 
         def _on_tab_changed(self, idx):
             """标签页切换时：同步板块导航高亮；进入『预测跟踪』页自动把模型下拉跳到 DA 最高的模型。"""
@@ -8421,10 +8542,17 @@ if HAS_PYSIDE6:
             split.addWidget(bottom)
             split.setSizes([420, 300, 480])       # 各块给足高度
             layout.addWidget(split, stretch=1)
-            # 整页套进纵向滚动区，并把内容整体撑高——超出可视区就出现下滚条，每块都能看得更全、往下滚
-            panel.setMinimumHeight(1250)
+            # 整页套进纵向滚动区。内容高度按"屏幕可用高度"自适应(而非写死1250，否则会把整窗最小高度顶爆屏幕、
+            # 导致窗口放不下只露一角)：取屏幕可用高的约 0.95 但不超它，保证任何屏都放得下，超出部分下滚看。
+            try:
+                _ah = QApplication.primaryScreen().availableGeometry().height()
+                _ph = max(680, min(1150, int(_ah * 0.95) - 120))
+            except Exception:
+                _ph = 760
+            panel.setMinimumHeight(_ph)
             mldata_scroll = QScrollArea(); mldata_scroll.setWidgetResizable(True)
             mldata_scroll.setWidget(panel)
+            mldata_scroll.setMinimumHeight(300)   # 滚动区自身最小很小，绝不把整窗顶大
             return mldata_scroll
 
         def _best_da_model(self):
@@ -11008,8 +11136,47 @@ if HAS_PYSIDE6:
                     else:
                         lis.append(f"<li><span style='color:#bbb'>—</span> <span style='color:#999'>{it['name']}：{it['msg']}</span></li>")
                 parts.append("<ul style='margin:2px 0 6px'>" + "".join(lis) + "</ul>")
+            # ---- 综合『流派法则符合度』分(0-100)：各流派通过率按可评规则数加权 + DCF安全边际微调。仅法则回看符合度，≠买卖建议 ----
+            sc_pairs = [(s["score"], s["n_eval"]) for s in r["schools"] if s.get("score") is not None and s.get("n_eval")]
+            if sc_pairs:
+                base = sum(sv * w for sv, w in sc_pairs) / sum(w for _, w in sc_pairs)
+                adj = 0.0; adj_txt = ""
+                if dcf.get("status") == "ok":
+                    m = dcf["margin_pct"]
+                    adj = max(-8.0, min(8.0, m * 0.15))   # 低估(安全边际正)加分、高估扣分，封顶±8
+                    adj_txt = f"（含 DCF 安全边际 {m:+.0f}% → {adj:+.1f} 分微调）"
+                total = int(max(0, min(100, round(base + adj))))
+                n_ok = sum(1 for s in r["schools"] if (s.get("score") or 0) >= 60)
+                n_all = len(sc_pairs)
+                if total >= 60:
+                    tier, tcol, verdict = "法则面『及格』", "#1a9d5a", "多数流派选股法则符合，可作深入研究的起点（≠可买）"
+                elif total >= 45:
+                    tier, tcol, verdict = "法则面『观望』", "#b9720d", "法则通过参半、分歧较大，倾向继续观察"
+                else:
+                    tier, tcol, verdict = "法则面『偏回避』", "#c0392b", "多数流派法则不符，风险/瑕疵偏多"
+                chips = "".join(
+                    f"<span style='display:inline-block;margin:2px 6px 2px 0;padding:1px 9px;border-radius:11px;"
+                    f"background:{'#e7f6ee' if (s['score'] or 0)>=60 else ('#fdecea' if (s['score'] or 0)<45 else '#fcf3e2')};"
+                    f"color:{'#1a9d5a' if (s['score'] or 0)>=60 else ('#c0392b' if (s['score'] or 0)<45 else '#b9720d')};font-size:12px'>"
+                    f"{s['school']} {s['score']}%</span>"
+                    for s in r["schools"] if s.get("score") is not None)
+                composite = (
+                    f"<div style='background:#fbfdff;border:2px solid {tcol};border-radius:8px;padding:10px 14px;margin:8px 0'>"
+                    f"<div style='font-size:13px;color:#555'>综合『流派法则符合度』分（{n_all} 个可评流派按规则数加权 + DCF 微调）</div>"
+                    f"<div style='margin:3px 0'><span style='font-size:34px;font-weight:800;color:{tcol}'>{total}</span>"
+                    f"<span style='font-size:15px;color:#888'> / 100</span>　"
+                    f"<span style='font-size:15px;font-weight:700;color:{tcol}'>{tier}</span>"
+                    f"<span style='font-size:12px;color:#888'>（60＝及格线）</span></div>"
+                    f"<div style='font-size:13px;color:#333;margin:2px 0 5px'>{verdict}；{n_ok}/{n_all} 个流派通过率≥60%。{adj_txt}</div>"
+                    f"<div>{chips}</div>"
+                    f"<div style='background:#fff6f6;border-left:3px solid #c0392b;padding:6px 10px;margin-top:7px;font-size:12px;color:#8a3b34'>"
+                    f"⚠ 这只是<b>『当下有多符合各流派公开选股标准』的回看打分</b>，"
+                    f"<b>不预测涨跌、不是买卖建议、也不代表能赚钱</b>。及格≠可买；本软件多模型实测已证明"
+                    f"单股次日涨跌≈抛硬币，这个分说明不了明天的价格。买卖请自行判断、盈亏自负。</div>"
+                    f"</div>")
+                parts.insert(2, composite)
             parts.append("<hr><p style='color:#888;font-size:12px'>法则借鉴 UZI-Skill(github.com/wbh604/UZI-Skill, MIT)，"
-                         "阈值为各流派公开的选股原则；本页只做客观计算，不神化、不保证有效。</p>")
+                         "阈值为各流派公开的选股原则；综合分＝各流派法则通过率的加权符合度，只做客观计算，不神化、不保证有效。</p>")
             self.school_view.setHtml("".join(parts))
             self._oplog(f"投资流派视角完成：{r['code']}")
 
@@ -11312,6 +11479,47 @@ if HAS_PYSIDE6:
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.pf_ic_btn.setEnabled(True)
 
+        def _macro_regime_text(self, mac):
+            """大白话『大环境判读』：市场牛/熊/震荡(沪深300 价 vs 年线 + 近3月) + 经济景气(PMI/PPI/GDP)。
+            纯客观规则描述当前状态，不预测、非投资建议。"""
+            lines = []
+            try:
+                idx = StockDataFetcher.fetch_index_close(symbol="sh000300")
+                _pxcol = "idx_px" if "idx_px" in idx.columns else "close"
+                c = pd.to_numeric(idx[_pxcol], errors="coerce").dropna().reset_index(drop=True)
+                if len(c) >= 120:
+                    last = float(c.iloc[-1]); ma60 = float(c.tail(60).mean())
+                    ma200 = float(c.tail(min(200, len(c))).mean()); r60 = (last / float(c.iloc[-60]) - 1) * 100
+                    if last > ma200 and ma60 >= ma200 and r60 > 3:
+                        mk = "🐂 牛市 / 上升趋势"
+                    elif last < ma200 and ma60 <= ma200 and r60 < -3:
+                        mk = "🐻 熊市 / 下降趋势"
+                    else:
+                        mk = "〽️ 震荡 / 方向不明"
+                    lines.append(f"📈【市场】沪深300 → {mk}\n      现价{last:.0f}｜年线(200日){ma200:.0f}｜近3月{r60:+.1f}%"
+                                 f"（价在年线{'上方' if last > ma200 else '下方'}）")
+                else:
+                    lines.append("📈【市场】沪深300 历史不足，牛熊判读跳过")
+            except Exception:
+                lines.append("📈【市场】沪深300 取数失败(网络/限流)，牛熊判读本次跳过")
+
+            def g(sub):
+                for k, v in mac.items():
+                    if sub in k and isinstance(v.get("latest"), (int, float)):
+                        return v["latest"]
+                return None
+            pmi, ppi, gdp, cpi = g("PMI"), g("PPI"), g("GDP"), g("CPI")
+            econ = []
+            if pmi is not None: econ.append(f"PMI {pmi:.1f}" + ("(>50扩张)" if pmi >= 50 else "(<50收缩)"))
+            if ppi is not None: econ.append(f"PPI {ppi:+.1f}%" + ("(通缩压力)" if ppi < 0 else "(回升)"))
+            if gdp is not None: econ.append(f"GDP {gdp:.1f}%")
+            if cpi is not None: econ.append(f"CPI {cpi:+.1f}%")
+            score = (0 + (1 if (pmi is not None and pmi >= 50) else -1 if pmi is not None else 0)
+                     + (1 if (ppi is not None and ppi > 0) else -1 if ppi is not None else 0))
+            lab = "🔥 偏暖/扩张" if score > 0 else ("❄️ 偏冷/收缩" if score < 0 else "➖ 中性")
+            lines.append(f"🏭【经济景气】→ {lab}\n      " + "、".join(econ))
+            return "\n".join(lines)
+
         def _on_macro(self):
             self.macro_btn.setEnabled(False)
             QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -11323,7 +11531,7 @@ if HAS_PYSIDE6:
                 names = list(mac.keys())
                 n = len(names)
                 cols = 2; rows = (n + 1) // 2
-                fig = Figure(figsize=(9, 2.6 * rows))
+                fig = Figure(figsize=(9, 3.1 * rows))
                 for i, nm in enumerate(names):
                     ax = fig.add_subplot(rows, cols, i + 1)
                     d = mac[nm]
@@ -11332,14 +11540,18 @@ if HAS_PYSIDE6:
                     ax.set_title(f"{nm}  最新={d['latest']:.2f}", fontsize=9)
                     ax.grid(True, alpha=0.25); ax.tick_params(labelsize=7)
                 fig.suptitle("中国宏观经济趋势（仅研究背景·不入训练特征·数据有发布滞后）", fontsize=10, color="#c0392b")
-                fig.tight_layout(rect=(0, 0, 1, 0.96))
+                # 拉开上下/左右间距，避免下排子图标题压到上排横轴刻度
+                fig.subplots_adjust(top=0.93, bottom=0.06, left=0.08, right=0.97, hspace=0.62, wspace=0.22)
                 self._show_fig_dialog(fig, "宏观经济快照")
                 summ = "　｜　".join(f"{nm} {mac[nm]['latest']:.2f}" for nm in names)
                 self._oplog(f"宏观快照：{summ}")
                 explain = "\n\n".join(f"【{nm}】{MACRO_EXPLAIN[nm]}" for nm in names if nm in MACRO_EXPLAIN)
+                regime = self._macro_regime_text(mac)      # 一眼看懂：牛市/熊市/震荡 + 经济偏暖/偏冷
                 QMessageBox.information(self, "宏观经济快照",
-                    summ + "\n\n⚠ 宏观数据低频且发布滞后2-4周，若直接喂日频模型=前视泄漏+信息冗余；"
-                    "故本模块只画趋势供你判断大环境(牛/熊/景气)，不参与任何预测训练。非投资建议。"
+                    "==== 大环境判读（一句话看懂）====\n" + regime + "\n\n"
+                    + "—— 明细 ——\n" + summ + "\n\n⚠ 宏观数据低频且发布滞后2-4周，若直接喂日频模型=前视泄漏+信息冗余；"
+                    "故本模块只画趋势供你判断大环境(牛/熊/景气)，不参与任何预测训练。"
+                    "牛/熊/震荡按沪深300价与年线+近3月客观规则判定，非预测、非投资建议。"
                     + ("\n\n—— 为什么要关注这些指标 ——\n" + explain if explain else ""))
             except Exception as e:
                 QMessageBox.critical(self, "宏观取数失败", str(e))
@@ -12046,16 +12258,22 @@ if HAS_PYSIDE6:
         def _on_board_refresh(self):
             btype = "industry" if self.board_type_combo.currentIndex() == 1 else "concept"
             self.board_refresh_btn.setEnabled(False)
-            self.board_status.setText("正在拉取数据…")
-            try:
-                df = fetch_board_spot(btype)
-            except Exception as e:
-                self.board_status.setText(f"获取失败: {e}")
-                self.board_refresh_btn.setEnabled(True)
-                return
-            if df.empty:
-                self.board_status.setText("未获取到数据（akshare 未安装或接口异常）")
-                self.board_refresh_btn.setEnabled(True)
+            self.board_status.setText("正在拉取数据…（被东方财富限流时会自动退避重试，请稍候）")
+            self._board_worker = BoardWorker(btype)
+            self._board_worker.progress_signal.connect(lambda m: self.board_status.setText(m))
+            self._board_worker.finished_signal.connect(self._on_board_finished)
+            self._board_worker.error_signal.connect(self._on_board_error)
+            self._board_worker.start()
+
+        def _on_board_error(self, msg: str):
+            self.board_status.setText(f"获取失败：{msg}")
+            self.board_refresh_btn.setEnabled(True)
+            self._oplog(f"板块行情获取失败：{msg}")
+
+        def _on_board_finished(self, df):
+            self.board_refresh_btn.setEnabled(True)
+            if df is None or df.empty:
+                self.board_status.setText("未获取到数据（东方财富限流/接口异常，请过 1–2 分钟再刷新）")
                 return
 
             # 清空旧卡片
@@ -12850,14 +13068,19 @@ if HAS_PYSIDE6:
                 ax.fill_between(fut_dates, lo_band, hi_band, color="#c0392b", alpha=0.12,
                                 label="约80%置信区间(历史波动)")
             if weekly:
-                # 逐日模式：每个交易日都标注(周几 + 预测价 + 相对最新收盘涨跌)
-                for p in ok_points:
+                # 逐日模式：5个交易日的标注若都压在各自点上方会糊成一团(点挤在最右侧)。
+                # 改为：标注竖排在右侧留白区、按点的先后均匀铺开，各自用细引线指向对应点——不再互相叠。
+                n = len(ok_points)
+                for i, p in enumerate(ok_points):
                     fdate = fut_map[p["horizon"]]
                     chg = p["change_pct"]; col = "#c0392b" if chg >= 0 else "#1a9d5a"
                     ax.scatter([fdate], [p["pred_close"]], color=col, s=45, zorder=5)
-                    ax.annotate(f"{self._cn_weekday(fdate)}\n{p['pred_close']:.2f}\n{chg:+.1f}%",
-                                (fdate, p["pred_close"]), textcoords="offset points",
-                                xytext=(0, 10), ha="center", color=col, fontsize=8)
+                    frac = 0.92 - (0.80 * i / max(1, n - 1))      # 从上到下均匀分布在 [0.12, 0.92]
+                    ax.annotate(f"{self._cn_weekday(fdate)} {p['pred_close']:.2f}（{chg:+.1f}%）",
+                                xy=(fdate, p["pred_close"]), xycoords="data",
+                                xytext=(1.02, frac), textcoords="axes fraction",
+                                ha="left", va="center", color=col, fontsize=8,
+                                arrowprops=dict(arrowstyle="-", color=col, lw=0.6, alpha=0.55))
             else:
                 label_map = {20: ("1个月", "#1e8449"), 60: ("3个月", "#d35400")}
                 for p in ok_points:
@@ -12870,8 +13093,12 @@ if HAS_PYSIDE6:
             ax.axvline(last_date, color="#aaa", linestyle=":", linewidth=1)
             ttl = "未来一周·逐日" if weekly else "1日~3个月"
             ax.set_ylabel("收盘价"); ax.set_title(f"{code} 未来走势预测（{fc['algo']}，{ttl}）")
-            ax.legend(loc="best", fontsize=8); ax.grid(True, alpha=0.25)
-            self.fc_figure.autofmt_xdate(); self.fc_canvas.draw()
+            ax.legend(loc="upper left" if weekly else "best", fontsize=8); ax.grid(True, alpha=0.25)
+            self.fc_figure.autofmt_xdate()
+            # 逐日模式在右侧留出一条空白带，放竖排的预测日标注(上一段用 axes-fraction x=1.02 定位)
+            if weekly:
+                self.fc_figure.subplots_adjust(right=0.80)
+            self.fc_canvas.draw()
 
             # 右侧：每股预测价
             name_map = {1: "明日", 5: "1周后", 10: "2周后", 20: "1个月后", 40: "2个月后", 60: "3个月后"}
@@ -13466,14 +13693,44 @@ if HAS_PYSIDE6:
             self.figure.subplots_adjust(bottom=0.42)
             self.canvas.draw()
 
-        # ---- 9.7 日志输出 ----
+        # ---- 9.7 日志输出（带语义高亮，让重点一眼可见）----
+        @staticmethod
+        def _emph_log_html(msg: str, ts: str = None) -> str:
+            """把一行日志格式成带重点高亮的 HTML：
+            行首[标签]着蓝、关键指标『DA=xx%』加粗、整行按语义上色
+            (诚实/无泄露=琥珀警示 · 失败/跳过/限流=红 · 完成/已接入=绿 · 分节标题=深蓝粗)。"""
+            def esc(s):
+                return (s.replace("&", "&amp;").replace("<", "&lt;")
+                        .replace(">", "&gt;").replace("\n", "<br>"))
+            raw = msg or ""
+            e = esc(raw)
+            # 关键指标：把 DA=xx% / DA xx% 高亮加粗(蓝)
+            e = re.sub(r"(DA[=＝]?\s*[0-9.]+\s*%)", r"<b style='color:#0b62c4'>\1</b>", e)
+            # 整行语义色(按优先级判定)
+            color, weight = "#3a3f45", "normal"
+            if any(k in raw for k in ("诚实", "无泄露", "别被", "必须明显", "⚠", "警示", "占比", "基准")):
+                color, weight = "#b9720d", "600"           # 诚实提示/基准 → 琥珀警示
+            elif any(k in raw for k in ("失败", "错误", "跳过", "限流", "未接入", "无法", "异常")):
+                color = "#c0392b"                           # 出问题 → 红
+            elif any(k in raw for k in ("完成", "成功", "已接入", "已就绪", "已加载", "已自动", "已更新")):
+                color = "#1a7f37"                           # 成功/接入 → 绿
+            elif any(k in raw for k in ("开始训练", "数据集三分", "全部模型", "开始", "启动")):
+                color, weight = "#17324d", "700"            # 分节标题 → 深蓝粗
+            # 行首 [标签] 着蓝(不覆盖整行色)
+            m = re.match(r"^(\[[^\]]+\])", raw)
+            if m:
+                tag = esc(m.group(1))
+                e = e.replace(tag, f"<span style='color:#2c6fbb;font-weight:600'>{tag}</span>", 1)
+            ts_html = f"<span style='color:#9aa4ad'>[{ts}]</span> " if ts else ""
+            return f"<div style='color:{color};font-weight:{weight};margin:0;line-height:1.5'>{ts_html}{e}</div>"
+
         def _log(self, msg: str):
-            self.log_box.append(msg)
+            self.log_box.append(self._emph_log_html(msg))
 
         def _oplog(self, msg: str):
             """记录用户操作到"操作日志"页，带时间戳。"""
             ts = dt.datetime.now().strftime("%H:%M:%S")
-            self.oplog_box.append(f"[{ts}] {msg}")
+            self.oplog_box.append(self._emph_log_html(msg, ts=ts))
 
         @contextlib.contextmanager
         def _busy(self, label=None, msg="⏳ 正在运行，请稍候 ...", btn=None):
@@ -13580,7 +13837,9 @@ MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
                               "dist_hi120", "dist_lo120", "macd_hist", "boll_pos", "price_tier",
                               # 勒贝格/值域横向分带的测度与分布特征(近60日)
                               "lb_up_freq", "lb_bigup_freq", "lb_bigdn_freq", "lb_ret_skew",
-                              "lb_ret_q80", "lb_ret_q20"]
+                              "lb_ret_q80", "lb_ret_q20",
+                              # 投资流派规则的可量化+因果子集(技术/趋势符合度、PE滚动分位)；财报口径因披露滞后不入时序
+                              "sch_tech", "pe_pctile"]
 # 模型 Y：4 个"涨跌%"回归目标(方向 y1 由 y4 符号导出)
 MH_TARGET_COLS: List[str] = ["y2_min_pct", "y3_med_pct", "y4_mean_pct", "y5_max_pct"]
 # B 步：ARIMA 残差混合特征(可选)。借鉴 AttCLX 思路——ARIMA 拟合线性成分，把"预测收益/残差"作特征喂给全局模型。
@@ -13776,6 +14035,29 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     df["lb_ret_skew"] = r.rolling(W).skew()                              # 收益分布偏度(左偏/右偏)
     df["lb_ret_q80"] = r.rolling(W).quantile(0.80)                       # 收益80%分位(上带边界)
     df["lb_ret_q20"] = r.rolling(W).quantile(0.20)                       # 收益20%分位(下带边界)
+    # ---- 投资流派规则的『可量化 + 因果』子集(把流派视角里能安全时序化的指标喂给模型) ----
+    #   只收录用『当日及以前价/估值』就能逐日算出的规则；ROE/净利率/PEG/DCF 等财报口径因披露滞后(未来函数)一律不做时序特征。
+    ma5 = cl.rolling(5).mean(); ma10 = cl.rolling(10).mean()
+    if "ma20" in df.columns and "ma60" in df.columns:
+        _bull = (ma5 > ma10) & (ma10 > df["ma20"]) & (df["ma20"] > df["ma60"])   # 均线多头排列
+        _above60 = cl > df["ma60"]                                                # 站上60日线(趋势派)
+    else:
+        _bull = _above60 = pd.Series(False, index=df.index)
+    _near_hi = df["dist_hi120"] > -20                                            # 距120日高点≤20%(强势/Stage2近似)
+    _rsi_ok = df["rsi14"].between(45, 72)                                        # RSI 健康区(非超买、未破位)
+    _mom_ok = (df["mom20"] > 0) & (df["mom60"] > 0)                              # 20/60日双动量为正
+    df["sch_tech"] = (_bull.astype(float) + _above60.astype(float) + _near_hi.astype(float)
+                      + _rsi_ok.astype(float) + _mom_ok.astype(float)) / 5 * 100  # 技术/趋势流派符合度 0-100
+    # PE 因果滚动分位(过去至多约2年、含当日)：越低越『便宜』，价值/量化派共用的『PE分位』量化，只用历史PE→无泄露
+    if "pe_ttm" in df.columns:
+        pe = df["pe_ttm"].where(df["pe_ttm"] > 0)
+        df["pe_pctile"] = pe.rolling(500, min_periods=120).apply(
+            lambda a: float((a <= a[-1]).mean() * 100), raw=True)
+    else:
+        df["pe_pctile"] = np.nan
+    # 缺省→中性 50(不下结论、也不因缺值把整只股票从 dropna 里剔掉)
+    df["sch_tech"] = df["sch_tech"].fillna(50.0)
+    df["pe_pctile"] = df["pe_pctile"].fillna(50.0)
     return df, is_delisted
 
 
@@ -13847,6 +14129,8 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 "lb_up_freq": r.get("lb_up_freq"), "lb_bigup_freq": r.get("lb_bigup_freq"),
                 "lb_bigdn_freq": r.get("lb_bigdn_freq"), "lb_ret_skew": r.get("lb_ret_skew"),
                 "lb_ret_q80": r.get("lb_ret_q80"), "lb_ret_q20": r.get("lb_ret_q20"),
+                # 流派规则可量化子集(因果)：技术/趋势符合度 + PE滚动分位
+                "sch_tech": r.get("sch_tech"), "pe_pctile": r.get("pe_pctile"),
             }
             for h in horizons:
                 win = close[i + 1: i + h + 1]
