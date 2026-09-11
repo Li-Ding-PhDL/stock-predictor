@@ -7896,6 +7896,9 @@ if HAS_PYSIDE6:
                 self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
             else:
                 self.resize(1280, 800)
+            # 允许窗口缩到很小(而非被内容最小尺寸顶大导致"只露一角、缩不动")：给一个小的硬下限，
+            # 配合左侧配置区滚动 + 右侧画布/文本框的小 minimumHeight，长和宽都能自由缩小。
+            self.setMinimumSize(640, 460)
 
             self.raw_df: Optional[pd.DataFrame] = None
             self.results: List[ModelResult] = []
@@ -7989,8 +7992,9 @@ if HAS_PYSIDE6:
             main_layout = QHBoxLayout(content)
             outer.addWidget(content, stretch=1)
 
-            # 左：配置区（滚动，防止算法太多超出屏幕）
-            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFixedWidth(560)
+            # 左：配置区（滚动，防止算法太多超出屏幕）。宽度可缩(300~560)而非锁死，允许窗口横向缩小
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            scroll.setMinimumWidth(300); scroll.setMaximumWidth(560)
             config_panel = QWidget()
             config_layout = QVBoxLayout(config_panel)
             config_layout.addWidget(self._build_data_group())
@@ -8012,6 +8016,7 @@ if HAS_PYSIDE6:
 
             # 右：结果展示区（Tab：行情K线 / 预测图 / 表格 / 日志）
             self.tabs = QTabWidget()
+            self.tabs.setMinimumWidth(320)   # 允许右侧收窄，配合左侧可缩，整窗宽度可明显缩小
 
             # 第 1 个标签页：真实行情 K 线图（点按钮即可先预览数据，不必先跑模型）
             self.tabs.addTab(self._build_kline_tab(), "行情K线图")
@@ -11024,7 +11029,7 @@ if HAS_PYSIDE6:
             row1.addWidget(self.pf_corr_btn)
             layout.addLayout(row1)
             self.pf_corr_view = QTextBrowser(); self.pf_corr_view.setOpenExternalLinks(True)
-            self.pf_corr_view.setMinimumHeight(200)
+            self.pf_corr_view.setMinimumHeight(120)
             layout.addWidget(self.pf_corr_view, stretch=1)
 
             # --- 因子有效性检验 IC/ICIR ---
@@ -11042,7 +11047,7 @@ if HAS_PYSIDE6:
             row2.addStretch()
             layout.addLayout(row2)
             self.pf_ic_view = QTextBrowser()
-            self.pf_ic_view.setMinimumHeight(160)
+            self.pf_ic_view.setMinimumHeight(100)
             layout.addWidget(self.pf_ic_view, stretch=1)
 
             # --- 凯利仓位计算器 ---
@@ -11155,7 +11160,7 @@ if HAS_PYSIDE6:
                 self._risk_fig, self._risk_ax = plt.subplots(figsize=(8, 4))
                 self._risk_fig.patch.set_facecolor("#f8f9fa")
                 self._risk_canvas = FigureCanvas(self._risk_fig)
-                self._risk_canvas.setMinimumHeight(280)
+                self._risk_canvas.setMinimumHeight(160)
                 risk_layout.addWidget(self._risk_canvas)
                 self._draw_pyramid_default()
             else:
