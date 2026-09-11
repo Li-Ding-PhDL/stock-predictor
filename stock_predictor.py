@@ -10620,6 +10620,15 @@ if HAS_PYSIDE6:
             self._gm_fill_table(pd.DataFrame(r["ranked"]))
             self._gm_logmsg(f"完成：模型={r['algo']} 期限={r['horizon']}日 基准日={r['as_of']} ｜ "
                             f"样本外 RankIC={r['rank_ic']} 多空价差={r['ls_spread_pct']}%/期 调仓{r['n_rebalance']}次")
+            # 中性化 + IC稳定性 + size暴露：判断到底是真alpha还是押小盘
+            _sz = r.get("size_exposure"); _proxy = "价位档位弱代理" if r.get("size_exposure_proxy") else "log市值"
+            _neu = f"行业{'√' if r.get('neutralize_industry') else '×'}/市值{'√' if r.get('neutralize_size') else '×'}"
+            self._gm_logmsg(f"净值(扣费): 多空价差 {r['ls_spread_pct']}%→{r.get('ls_spread_net_pct')}%/期 ｜ "
+                            f"只买最强档年化 毛{r.get('top_cagr_gross_pct')}%/净{r.get('top_cagr_net_pct')}%")
+            self._gm_logmsg(f"IC稳定性: IC_IR={r.get('ic_ir')} IC>0占比={r.get('ic_pos_ratio_pct')}% 逐年={r.get('ic_by_year')}")
+            if _sz is not None:
+                judge = "≈0，不是靠押小盘(偏真alpha)" if abs(_sz) < 0.15 else "偏高，信号可能主要是size/价位风格"
+                self._gm_logmsg(f"中性化[{_neu}] ｜ size暴露(预测 vs {_proxy})={_sz:+.3f} → {judge}")
             top3 = "、".join(f"{x['code']}({x['score']})" for x in r["ranked"][:3])
             bot3 = "、".join(f"{x['code']}({x['score']})" for x in r["ranked"][-3:])
             self._gm_logmsg(f"最强前3：{top3} ｜ 最弱后3：{bot3}")
@@ -14105,14 +14114,15 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     ren = {"日期": "date", "名称": "name", "收盘价": "close",
            "涨幅%": "ret_1d", "3日涨幅%": "ret_3d", "6日涨幅%": "ret_6d", "10日涨幅%": "ret_10d",
            "量比": "vol_ratio", "换手率": "turnover", "20日线": "ma20", "60日线": "ma60", "250日线": "ma250",
-           "滚动市盈率": "pe_ttm", "市净率": "pb", "滚动市销率": "ps_ttm", "退市时间": "delist"}
+           "滚动市盈率": "pe_ttm", "市净率": "pb", "滚动市销率": "ps_ttm",
+           "总市值（元）": "total_mv", "所属行业": "industry", "退市时间": "delist"}
     cols = {k: v for k, v in ren.items() if k in raw.columns}
     df = raw[list(cols)].rename(columns=cols)
     delist_vals = df["delist"].dropna().astype(str) if "delist" in df.columns else pd.Series([], dtype=str)
     is_delisted = bool((~delist_vals.isin(["-", "", "nan", "None"])).any())
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     for c in ["close", "ret_1d", "ret_3d", "ret_6d", "ret_10d", "vol_ratio", "turnover",
-              "ma20", "ma60", "ma250", "pe_ttm", "pb", "ps_ttm"]:
+              "ma20", "ma60", "ma250", "pe_ttm", "pb", "ps_ttm", "total_mv"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
@@ -14210,7 +14220,8 @@ def _mh_load_online_rich(code: str, start: str = "20150101", end: Optional[str] 
     # 估值(可选)：联网 enrich 顶替 PE/PB/PS；限流/失败就留空(绝不编造)
     try:
         d2, _ = StockDataFetcher.enrich(df.copy(), code, True, False, False, False, False)
-        for src, dst in (("val_pe_ttm", "pe_ttm"), ("val_pb", "pb"), ("val_ps_ttm", "ps_ttm")):
+        for src, dst in (("val_pe_ttm", "pe_ttm"), ("val_pb", "pb"), ("val_ps_ttm", "ps_ttm"),
+                         ("val_total_mv", "total_mv")):
             if src in d2.columns:
                 df[dst] = pd.to_numeric(d2[src], errors="coerce")
     except Exception:
@@ -14288,6 +14299,8 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
             base = {
                 "code": code, "name": name, "date": r["date"],
                 "close": round(float(c0), 3),
+                # 中性化用(非模型特征)：市值(size)、行业。缺则 NaN/空，中性化时自动跳过、如实说明。
+                "total_mv": r.get("total_mv"), "industry": r.get("industry", ""),
                 "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
                 "ma20_dev": (float(c0) / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
                 "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
@@ -14652,11 +14665,42 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
             "disclaimer": "研究性回测，非投资建议、盈亏自负。"}
 
 
+def _neutralize_cross_section(ds: pd.DataFrame, ycol: str,
+                              use_size: bool = True, use_industry: bool = True):
+    """把目标(相对强弱超额)做**行业/市值中性化**：逐日截面上，先按行业去均值(剔除行业beta)，
+    再对 log(市值) 做一元回归取残差(剔除 size 暴露)。返回 (中性化后的Series, 说明dict)。
+    数据缺失(无市值/无行业/同日样本太少)时自动跳过对应步骤并如实记录——绝不假装做了。"""
+    y = ds[ycol].astype(float).copy()
+    info = {"industry_applied": False, "size_applied": False, "reason": []}
+    has_ind = use_industry and ("industry" in ds.columns) and (ds["industry"].astype(str).str.len() > 0).any()
+    has_mv = use_size and ("total_mv" in ds.columns) and pd.to_numeric(ds["total_mv"], errors="coerce").notna().sum() >= 3
+    if has_ind:
+        # 逐(日,行业)去均值：只在同日该行业≥2只时才减，单只行业不动(否则等于抹掉信号)
+        grp = ds.groupby(["date", ds["industry"].astype(str)])[ycol].transform(lambda s: s - s.mean() if len(s) >= 2 else s)
+        y = grp.astype(float); info["industry_applied"] = True
+    else:
+        info["reason"].append("行业缺失/无效→跳过行业中性化")
+    if has_mv:
+        lmv = np.log(pd.to_numeric(ds["total_mv"], errors="coerce").clip(lower=1.0))
+        out = y.copy()
+        for d, idx in ds.groupby("date").groups.items():
+            idx = list(idx)
+            xi = lmv.loc[idx].values.astype(float); yi = y.loc[idx].values.astype(float)
+            ok = np.isfinite(xi) & np.isfinite(yi)
+            if ok.sum() >= 3 and np.nanstd(xi[ok]) > 1e-9:
+                b, a = np.polyfit(xi[ok], yi[ok], 1)          # y ≈ a + b·log(mv)
+                out.loc[idx] = yi - (a + b * xi)              # 残差=剔除size后的alpha
+        y = out.astype(float); info["size_applied"] = True
+    else:
+        info["reason"].append("市值缺失→跳过市值中性化")
+    return y, info
+
+
 def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int = 21,
                                 split_date: str = "2024-01-01", start: str = "20150101",
                                 end: Optional[str] = None, algo: str = "ExtraTrees",
                                 root: Optional[str] = None, out_png: Optional[str] = None,
-                                cost_bps: float = 30.0,
+                                cost_bps: float = 30.0, neutralize: bool = True,
                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """『主力思维』选股排序：用公开历史数据给一篮子股票按**未来相对强弱**(超额=个股−同日中位)打分排序，
     并**样本外回测**"买打分最高的一档、避最低一档"到底有没有用(多空价差 + 累计净值 + RankIC)。
@@ -14674,12 +14718,21 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     if len(ds) == 0:
         raise RuntimeError("横截面为空(同日同池股票不足5只)，请多给些股票。")
     ds["y_excess"] = ds["y4_mean_pct"] - ds["xs_med"]
+    # ①b 行业/市值中性化：把目标里的『行业beta + size暴露』剔掉，让模型学的是纯相对强弱 alpha 而非小盘风格
+    neu_info = {"industry_applied": False, "size_applied": False, "reason": ["未启用中性化"]}
+    if neutralize:
+        ds["y_target"], neu_info = _neutralize_cross_section(ds, "y_excess", use_size=True, use_industry=True)
+        log(f"①b 中性化：行业={'是' if neu_info['industry_applied'] else '否'} "
+            f"市值={'是' if neu_info['size_applied'] else '否'}"
+            + ("（" + "；".join(neu_info["reason"]) + "）" if neu_info["reason"] else ""))
+    else:
+        ds["y_target"] = ds["y_excess"]
     xr = ["mom20", "rsi14", "dist_hi120", "ret_10d", "vol20", "mom60"]
     for f in xr:
         if f in ds.columns:
             ds[f + "_xr"] = ds.groupby("date")[f].rank(pct=True)
     feat = MH_FEATURE_COLS + [f + "_xr" for f in xr if (f + "_xr") in ds.columns]
-    ds = ds.dropna(subset=feat + ["y_excess"]).reset_index(drop=True)
+    ds = ds.dropna(subset=feat + ["y_target"]).reset_index(drop=True)
 
     split = pd.to_datetime(split_date)
     tr, te = ds[ds["date"] < split], ds[ds["date"] >= split]
@@ -14688,9 +14741,9 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     scaler = StandardScaler().fit(tr[feat].values.astype(float))
     if algo not in ALGO_REGISTRY or not ALGO_AVAILABILITY.get(algo, True):
         algo = "ExtraTrees" if ALGO_AVAILABILITY.get("ExtraTrees", True) else "RF"
-    log(f"② 训练排序模型 [{algo}]（目标=未来{horizon}日相对强弱超额）...")
+    log(f"② 训练排序模型 [{algo}]（目标=未来{horizon}日相对强弱{'(已中性化)' if neutralize else ''}）...")
     model = ALGO_REGISTRY[algo]()
-    model.fit(scaler.transform(tr[feat].values.astype(float)), tr["y_excess"].values.astype(float))
+    model.fit(scaler.transform(tr[feat].values.astype(float)), tr["y_target"].values.astype(float))
 
     # ③ 样本外回测：非重叠调仓(每 horizon 天一次)，买打分前1/3、避后1/3；对比市场等权
     te = te.assign(_pred=model.predict(scaler.transform(te[feat].values.astype(float))))
@@ -14713,16 +14766,38 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
         cum_top_net.append(cum_top_net[-1] * (1 + topr) * (1 - 2 * c_one))   # 每期换仓扣双边成本
         cum_mkt.append(cum_mkt[-1] * (1 + mktr))
         dts.append(pd.Timestamp(d)); spreads.append((topr - botr) * 100)
-        ic = grp["_pred"].corr(grp["y_excess"], method="spearman")
+        ic = grp["_pred"].corr(grp["y_target"], method="spearman")   # IC 对『中性化后的目标』——衡量纯 alpha
         if pd.notna(ic):
-            ics.append(ic)
-    rank_ic = float(np.mean(ics)) if ics else float("nan")
+            ics.append((pd.Timestamp(d), float(ic)))
+    ic_vals = [v for _, v in ics]
+    rank_ic = float(np.mean(ic_vals)) if ic_vals else float("nan")
+    # 滚动 IC 稳定性：IC_IR=均值/标准差、IC>0 占比、逐年 IC——一个均值会骗人，稳定性才是真信号
+    ic_std = float(np.std(ic_vals)) if len(ic_vals) > 1 else float("nan")
+    ic_ir = (rank_ic / ic_std) if (ic_std and ic_std > 1e-9) else float("nan")
+    ic_pos_ratio = (float(np.mean([1 for v in ic_vals if v > 0])) * 100) if ic_vals else float("nan")
+    ic_by_year = {}
+    for d, v in ics:
+        ic_by_year.setdefault(d.year, []).append(v)
+    ic_by_year = {int(y): round(float(np.mean(vs)), 3) for y, vs in sorted(ic_by_year.items())}
     ls_spread = float(np.mean(spreads)) if spreads else float("nan")
     # 扣费后的多空价差(两条腿各双边成本)：spread − 4×单边成本(%)
     cost_pct_per_period = 4 * cost_bps / 100.0
     ls_spread_net = (ls_spread - cost_pct_per_period) if spreads else float("nan")
     top_cagr_gross = ((cum_top[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
     top_cagr_net = ((cum_top_net[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
+    # size 暴露诊断：预测分 vs log(市值) 的截面相关(越接近0越『不是靠押小盘』)。无市值则用价位档位作弱代理并标注
+    size_col = "total_mv" if ("total_mv" in te.columns and pd.to_numeric(te["total_mv"], errors="coerce").notna().sum() >= 3) else "price_tier"
+    size_is_proxy = (size_col == "price_tier")
+    _sz = []
+    for d in rebal:
+        grp = te[te["date"] == d]
+        if len(grp) < 6:
+            continue
+        sv = pd.to_numeric(grp[size_col], errors="coerce")
+        cc = grp["_pred"].corr(sv, method="spearman")
+        if pd.notna(cc):
+            _sz.append(float(cc))
+    size_expo = float(np.mean(_sz)) if _sz else float("nan")
 
     # ④ 最新一期打分排名(以数据集最后一个交易日的横截面)
     last_d = ds["date"].max()
@@ -14743,13 +14818,26 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
         log(f"图已保存: {out_png}")
     log(f"扣费前多空价差={ls_spread:.2f}%/期 → 扣费后≈{ls_spread_net:.2f}%/期"
         f"(单边{cost_bps:.0f}bps)；只买最强一档年化 毛{top_cagr_gross:.1f}%/净{top_cagr_net:.1f}%")
+    log(f"IC稳定性：均值{rank_ic:.3f} / IC_IR{ic_ir:.2f} / IC>0占比{ic_pos_ratio:.0f}% / 逐年{ic_by_year}")
+    _sz_lab = "价位档位(弱代理)" if size_is_proxy else "log市值"
+    log(f"size暴露：预测分 vs {_sz_lab} 相关={size_expo:+.3f}"
+        f"（{'中性化后接近0=不是靠押小盘' if abs(size_expo)<0.15 else '仍偏高=信号可能主要是size风格'}）"
+        f"｜中性化 行业{'√' if neu_info['industry_applied'] else '×'} 市值{'√' if neu_info['size_applied'] else '×'}")
     return {"algo": algo, "horizon": horizon, "as_of": str(last_d.date()),
             "rank_ic": round(rank_ic, 4), "ls_spread_pct": round(ls_spread, 3),
             "ls_spread_net_pct": round(ls_spread_net, 3), "cost_bps": cost_bps,
             "top_cagr_gross_pct": round(top_cagr_gross, 2), "top_cagr_net_pct": round(top_cagr_net, 2),
+            "ic_ir": (round(ic_ir, 3) if ic_ir == ic_ir else None),
+            "ic_pos_ratio_pct": (round(ic_pos_ratio, 1) if ic_pos_ratio == ic_pos_ratio else None),
+            "ic_by_year": ic_by_year,
+            "neutralized": bool(neutralize),
+            "neutralize_industry": neu_info["industry_applied"], "neutralize_size": neu_info["size_applied"],
+            "size_exposure": (round(size_expo, 3) if size_expo == size_expo else None),
+            "size_exposure_proxy": size_is_proxy,
             "n_rebalance": len(dts), "ranked": ranked, "out_png": out_png,
             "note": ("扣费后 = 每期换仓扣双边成本(单边%dbps)；多空价差再减两腿共4×单边。"
-                     "未建模涨跌停无法成交/停牌/冲击成本，实盘只会更差。" % int(cost_bps)),
+                     "未建模涨跌停无法成交/停牌/冲击成本，实盘只会更差。"
+                     "IC 已对『行业/市值中性化后的目标』计算；size暴露越接近0说明越不是靠押小盘。" % int(cost_bps)),
             "disclaimer": "用公开历史数据的相对强弱打分，样本外回测；非投资建议、盈亏自负；数据非实时。"}
 
 
@@ -15159,6 +15247,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
+    p.add_argument("--rank-raw", action="store_true",
+                   help="选股排序不做行业/市值中性化(默认做)。加上它可对比：中性化前后 RankIC/size暴露差多少")
     p.add_argument("--vote", action="store_true",
                    help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
     p.add_argument("--vote-backtest", action="store_true",
@@ -15428,10 +15518,16 @@ def main():
         png = os.path.join(BASE_DIR, "选股排序_result.png")
         print(f"[rank-stocks] {len(codes)} 只 / 期限 {args.rank_horizon}日 / 切分 {args.split_date}")
         r = rank_stocks_cross_sectional(codes=codes, horizon=args.rank_horizon,
-                                        split_date=args.split_date, out_png=png, progress_cb=print)
+                                        split_date=args.split_date, out_png=png,
+                                        neutralize=not args.rank_raw, progress_cb=print)
         print("\n" + "=" * 66)
         print(f"『主力思维』选股排序  模型={r['algo']}  期限={r['horizon']}日  基准日={r['as_of']}")
-        print(f"样本外：RankIC={r['rank_ic']}  多空价差均值={r['ls_spread_pct']}%/期  调仓{r['n_rebalance']}次")
+        print(f"样本外：RankIC={r['rank_ic']}  多空价差 {r['ls_spread_pct']}%→扣费{r.get('ls_spread_net_pct')}%/期  调仓{r['n_rebalance']}次")
+        print(f"IC稳定性：IC_IR={r.get('ic_ir')}  IC>0占比={r.get('ic_pos_ratio_pct')}%  逐年={r.get('ic_by_year')}")
+        _sz = r.get("size_exposure")
+        print(f"中性化：行业{'√' if r.get('neutralize_industry') else '×'}/市值{'√' if r.get('neutralize_size') else '×'}"
+              f"  size暴露={_sz}（{'≈0=真alpha' if (_sz is not None and abs(_sz)<0.15) else '偏高=可能只是押小盘' if _sz is not None else '市值缺失'}）"
+              + ("  [用价位档位弱代理]" if r.get("size_exposure_proxy") else ""))
         print("-" * 66)
         print(f"{'排名':>4}{'代码':>9}{'名称':>8}{'得分':>10}   标签")
         for x in r["ranked"]:

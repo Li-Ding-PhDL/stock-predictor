@@ -61,6 +61,10 @@ python stock_predictor.py --cli --rank-stocks --global-scope mine --rank-horizon
 - **本地数据源**：`StockDataFetcher.fetch(source="auto"/"local")` 本地优先；`enrich()` 用同一 CSV 的 PE/PB/PS/市值离线顶替联网估值。根目录无效时自动回落联网，不破坏原流程。
 - **数据更新(借鉴 Sequoia-X)**：`update_daily_dataset` / `--update-data` 改用 **baostock**(免费/无限流/无需注册/绕开东方财富反爬)拉全历史前复权(含 换手率/涨跌幅/peTTM/pbMRQ/psTTM)，按 股票4.14 格式整段重建到 `data_updated/`(无接缝、到最新交易日)。这是绕开 akshare/东方财富限流、把数据补到当天的推荐路径。
 - **横截面选股排序**：`rank_stocks_cross_sectional` / `--rank-stocks` + GUI「★一键打分」——目标=未来相对强弱(个股−同日中位)，基准恒50%，报 RankIC/多空价差 + 出 PNG(红=强/绿=弱，A股色)。用户自选股 `USER_WATCHLIST_CODES` / `--global-scope mine`。这是本项目里**唯一被数据证实有真实小信号**(小盘 RankIC≈0.09)的方向。
+  - **行业/市值中性化(默认开，`--rank-raw` 关)**：`_neutralize_cross_section` 逐日先按行业去均值、再对 log(市值) 回归取残差，让目标是纯 alpha 而非小盘风格；IC 对中性化后目标算。诊断 **size 暴露**(预测分 vs log市值/价位档位的截面相关，≈0 才不是靠押小盘) + **滚动 IC 稳定性**(IC_IR/IC>0占比/逐年)。市值列来自本地 CSV 的 总市值（元）(缺则用 price_tier 弱代理并标注)。
+  - **扣费**：`cost_bps`(单边,默认30) 给『扣费后净值曲线 + 扣费后多空价差 + 毛/净年化』——实测微弱信号扣费后常≈0 甚至转负，务必看净值不看毛值。
+- **散户风险教育**：`monte_carlo_trading`(胜率/盈亏比/每笔风险/单笔成本/笔数 → 1万条路径的破产概率+终值分布+最大回撤) + GUI「组合与仓位」页面板；`edge=胜率−保本胜率`。
+- **冻结模型 schema 指纹**：`_feature_fingerprint` 冻结时存 `feature_fp`；`predict_frozen` 从 `_mh_load_local_rich` 同口径行按列取真实特征值(不再用0顶替缺列)，缺列/指纹不符即报错。改特征集后旧模型须重训。
 - **多期限×多目标**：把"预测期限 h(交易日)"当输入特征，一个模型覆盖多期限；输出为未来窗口 `[t+1,t+h]` 的 最低/中位/平均/最高 **涨跌%**(诚实口径，非绝对价)。构建见 `build_multi_horizon_dataset`。
 - **全局池化 + 冻结**：`train_global_pooled` 跨股票池化，按**全局日期**切分(防泄露)、标准化只在训练集 fit、强制 Naive+DA；每模型每目标训练后用 joblib(缺失降级 pickle) 冻结到 `frozen_models/`，`predict_frozen` 加载即预测、不再训练。ARIMA 单序列模型不进池化，只给逐股基线。
 - **ARIMA 残差混合特征(B 步，opt-in)**：`--arima-features` / GUI 复选框开启后，`_arima_causal_features` 用**训练段参数**对全序列做一步向前拟合(`res.apply` 不重估计→测试段无泄露)，把"ARIMA 预测收益 / 标准化残差"作为额外输入特征(`MH_ARIMA_COLS`)喂给全局模型；冻结文件名带 `_arima` 后缀，`predict_frozen` 会为该股票现算这两个特征。
