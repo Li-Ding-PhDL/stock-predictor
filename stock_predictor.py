@@ -14295,6 +14295,116 @@ def _plot_stock_ranking(latest, dts, cum_top, cum_mkt, rank_ic, ls_spread,
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
 
 
+# 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
+VOTE_DEFAULT_ALGOS: List[str] = ["Lasso", "RidgeReg", "ElasticNet", "PLSR", "ELM", "KNN",
+                                 "RF", "ExtraTrees", "Bagging", "GBRT", "XGBoost", "LightGBM"]
+
+
+def forecast_vote(code: str, algos: Optional[List[str]] = None, start: str = "20200101",
+                  end: Optional[str] = None, window: int = 20, horizon: int = 1,
+                  target_mode: str = "return", use_valuation: bool = True,
+                  progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """多模型投票：让一批模型各自预测某股票下一交易日涨跌，统计『几个说涨 / 几个说跌』。
+    返回 per_model(各模型预测涨跌幅) + n_up/n_down + 多数方向。
+    **注意：多数一致≠更准(模型同吃一批特征会一起错)，仅为描述性统计，非买卖信号、非投资建议、盈亏自负。**"""
+    algos = algos or [a for a in VOTE_DEFAULT_ALGOS if a in ALGO_REGISTRY and ALGO_AVAILABILITY.get(a, True)]
+    algos = algos + (["ARIMA"] if HAS_STATSMODELS and "ARIMA" not in algos else [])
+    out = run_experiment(code=code, algos=algos, hpo="关闭", window=window, horizon=horizon,
+                         target_mode=target_mode, forecast=True, add_naive_baseline=False,
+                         use_valuation=use_valuation, use_index=False, use_fundflow=False,
+                         progress_cb=progress_cb)
+    per, up, dn = {}, [], []
+    ld = lc = None
+    for f in out.get("forecast") or []:
+        if f.get("error"):
+            continue
+        ld = ld or f.get("last_date"); lc = lc or f.get("last_close")
+        pc = f.get("pred_change_pct")
+        per[f["algo"]] = pc
+        if isinstance(pc, (int, float)):
+            (up if pc > 0 else dn).append(f["algo"])
+    nu, nd = len(up), len(dn)
+    maj = "涨" if nu > nd else ("跌" if nd > nu else "平")
+    return {"code": code, "last_date": ld, "last_close": lc, "n_models": nu + nd,
+            "n_up": nu, "n_down": nd, "up_pct": round(nu / max(1, nu + nd) * 100, 1),
+            "majority": maj, "up_models": up, "down_models": dn, "per_model": per,
+            "disclaimer": "多模型投票统计；多数一致≠更准(同吃特征会一起错)，非买卖信号、非投资建议、盈亏自负。"}
+
+
+def forecast_vote_batch(codes: List[str], **kw) -> List[Dict[str, Any]]:
+    """对一批股票逐只做多模型投票统计。"""
+    log = kw.pop("progress_cb", None) or (lambda m: None)
+    rows = []
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        try:
+            r = forecast_vote(code, progress_cb=None, **kw)
+            log(f"[{i}/{len(codes)}] {code} 基准{r['last_date']} → 涨{r['n_up']}/跌{r['n_down']} 多数={r['majority']}")
+            rows.append(r)
+        except Exception as e:
+            log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:60]}")
+            rows.append({"code": code, "error": str(e)[:80]})
+    return rows
+
+
+def vote_strategy_backtest(codes: List[str], algos: Optional[List[str]] = None,
+                           start: str = "20200101", end: Optional[str] = None,
+                           horizon: int = 1, target_mode: str = "return", cost_bps: float = 0.2,
+                           use_valuation: bool = True,
+                           progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """多模型投票择时策略回测：在**测试集(样本外)**上，每个交易日多数模型说涨→持有(吃当日真实收益)，
+    说跌→空仓；含往返手续费 cost_bps(%%)。逐股对比『买入持有』，再汇总。
+    **诚实：这是历史回测，不保证未来；多数一致≠更准；非投资建议、盈亏自负。**"""
+    log = progress_cb or (lambda m: None)
+    algos = algos or [a for a in VOTE_DEFAULT_ALGOS if a in ALGO_REGISTRY and ALGO_AVAILABILITY.get(a, True)]
+    algos = algos + (["ARIMA"] if HAS_STATSMODELS and "ARIMA" not in algos else [])
+    per = []
+    s_rets, b_rets = [], []
+    for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        try:
+            df = StockDataFetcher().fetch(code, start, end)
+            if use_valuation:
+                df, _ = StockDataFetcher.enrich(df, code, True, False, False, False, False)
+            cfg = TrainConfig(horizon=horizon, target_mode=target_mode, hpo_method="关闭",
+                              metrics=["RMSE", "DA"])
+            res = TrainingPipeline(cfg).run_batch(algos, df)
+            good = [r for r in res if (not r.error) and r.y_test_pred is not None
+                    and r.prev_close is not None and len(r.y_test_pred) == len(r.prev_close)]
+            good = [r for r in good if not r.algo_name.startswith(("Naive", "总是涨"))]
+            if len(good) < 3:
+                log(f"[{i}/{len(codes)}] {code} 有效模型不足，跳过"); continue
+            prev = np.asarray(good[0].prev_close, float)
+            ytrue = np.asarray(good[0].y_test_true, float)
+            n = len(prev)
+            dirs = np.zeros(n)
+            for r in good:
+                yp = np.asarray(r.y_test_pred, float)
+                if len(yp) == n:
+                    dirs += (yp > prev).astype(float)      # 每个模型投"涨"计 1
+            nmods = len(good)
+            maj_up = dirs > (nmods / 2.0)                    # 多数说涨
+            act = ytrue / prev - 1.0                          # 当期真实收益
+            pos = maj_up.astype(float)
+            cost = np.abs(np.diff(np.concatenate([[0.0], pos]))) * (cost_bps / 100.0)
+            strat = np.where(maj_up, act, 0.0) - cost
+            cum_s = float(np.prod(1 + strat) - 1) * 100
+            cum_b = float(np.prod(1 + act) - 1) * 100
+            traded = int(maj_up.sum())
+            win = float(np.mean(act[maj_up] > 0) * 100) if traded else float("nan")
+            per.append({"code": code, "n_test": n, "traded_days": traded,
+                        "strat_ret_pct": round(cum_s, 2), "buyhold_ret_pct": round(cum_b, 2),
+                        "excess_pct": round(cum_s - cum_b, 2), "win_rate_pct": round(win, 1)})
+            s_rets.append(cum_s); b_rets.append(cum_b)
+            log(f"[{i}/{len(codes)}] {code} 策略{cum_s:+.1f}% vs 买入持有{cum_b:+.1f}% (超额{cum_s-cum_b:+.1f}%, 出手{traded}/{n}日, 胜率{win:.0f}%)")
+        except Exception as e:
+            log(f"[{i}/{len(codes)}] {code} 失败: {str(e)[:70]}")
+    summary = {"n_stocks": len(per), "per": per,
+               "avg_strat_pct": round(float(np.mean(s_rets)), 2) if s_rets else None,
+               "avg_buyhold_pct": round(float(np.mean(b_rets)), 2) if b_rets else None,
+               "n_beat": sum(1 for p in per if p["excess_pct"] > 0),
+               "disclaimer": "样本外历史回测；多数投票择时；含手续费；不保证未来、非投资建议、盈亏自负。"}
+    return summary
+
+
 def list_frozen_models(out_dir: str = FROZEN_DIR) -> List[Dict[str, Any]]:
     """列出已冻结的全局模型(文件名 + 元信息)。"""
     items = []
@@ -14518,6 +14628,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
+    p.add_argument("--vote", action="store_true",
+                   help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
+    p.add_argument("--vote-backtest", action="store_true",
+                   help="回测『多数说涨就持有/说跌就空仓』策略(测试集样本外+手续费)，对比买入持有")
     p.add_argument("--update-data", action="store_true",
                    help="抓取整理『最新每日数据』：akshare 最新日线+估值接续到本地历史，写到 data_updated/(补上4月后的缺口)")
     p.add_argument("--global-scope", default="subset", choices=["subset", "all", "mine"],
@@ -14734,6 +14848,42 @@ def main():
         r = update_daily_dataset(codes, progress_cb=print)
         print(f"完成：更新 {r['updated']} / 跳过 {r['skipped']}。数据在: {r['out_root']}")
         print("提示：把 STOCK_LOCAL_DATA_ROOT 指向该目录，或设 LOCAL_DATA_ROOT，即用最新数据跑选股/预测。")
+        return
+
+    # --vote-backtest：回测"多数说涨买/说跌卖"策略
+    if args.vote_backtest:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        print(f"[vote-backtest] 多数投票择时 · {len(codes)} 只 · 手续费 {args.cost}%%")
+        s = vote_strategy_backtest(codes, cost_bps=args.cost, progress_cb=print)
+        print("\n" + "=" * 70)
+        print(f"{'代码':<8}{'策略%':>9}{'买入持有%':>11}{'超额%':>9}{'出手日':>8}{'胜率%':>7}")
+        for p_ in s["per"]:
+            print(f"{p_['code']:<8}{p_['strat_ret_pct']:>9}{p_['buyhold_ret_pct']:>11}{p_['excess_pct']:>9}{p_['traded_days']:>8}{p_['win_rate_pct']:>7}")
+        print("-" * 70)
+        print(f"平均：策略 {s['avg_strat_pct']}% vs 买入持有 {s['avg_buyhold_pct']}% ｜ {s['n_beat']}/{s['n_stocks']} 只跑赢买入持有")
+        print("=" * 70)
+        print("⚠ 样本外历史回测、含手续费；跑赢买入持有才说明投票择时有用。不保证未来、非投资建议、盈亏自负。")
+        return
+
+    # --vote：多模型投票统计(每只几个说涨/几个说跌)
+    if args.vote:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        print(f"[vote] 多模型投票 · {len(codes)} 只 ...")
+        rows = forecast_vote_batch(codes, progress_cb=print)
+        print("\n" + "=" * 60)
+        print(f"{'代码':<8}{'基准日':<12}{'说涨':>5}{'说跌':>5}{'涨占比':>8}{'多数':>6}")
+        for r in rows:
+            if r.get("error"):
+                print(f"{r['code']:<8}  失败: {r['error']}"); continue
+            print(f"{r['code']:<8}{str(r.get('last_date')):<12}{r['n_up']:>5}{r['n_down']:>5}{str(r['up_pct'])+'%':>8}{r['majority']:>6}")
+        print("=" * 60)
+        print("⚠ 多数一致≠更准(模型同吃特征会一起错，见 9-11 血证)；描述性统计，非买卖信号、非投资建议、盈亏自负。")
         return
 
     # --rank-stocks：『主力思维』选股排序 + 回测 + 出图
