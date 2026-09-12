@@ -10929,21 +10929,58 @@ if HAS_PYSIDE6:
             algos = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()]
             algo1 = algos[0] if algos else "Lasso"
             self._gm_logmsg(f"加载冻结预测：{len(codes)} 只，用模型 {algo1} ……")
-            ok = 0
+            ok = 0; rows = []
             for code in codes:
                 try:
                     r = predict_frozen(code, algo=algo1)
                 except Exception as e:
                     self._gm_logmsg(f"  ✗ {code} 预测失败：{str(e)[:110]}"); continue
                 ok += 1
-                self._gm_logmsg(f"[{r['code']}] {r['algo']} 基于 {r['as_of']} 收盘 {r['from_close']}元：")
+                self._gm_logmsg(f"[{r['code']} {r.get('name','')}] {r['algo']} 基于 {r['as_of']} 收盘 {r['from_close']}元：")
                 for p_ in r["predictions"]:
                     self._gm_logmsg(f"   期限{p_['h']:>2}日 {p_['方向']} y4平均={p_['y4平均%']:+}% "
                                     f"y5最高={p_['y5最高%']:+}% (y4≈{p_['y4平均(元)']} / y5≈{p_['y5最高(元)']}元)")
+                    rows.append({"代码": r["code"], "名称": r.get("name", ""), "模型": r["algo"],
+                                 "基准日": r["as_of"], "基准收盘": r["from_close"],
+                                 "期限(日)": p_["h"], "方向": p_["方向"],
+                                 "y2最低%": p_["y2最低%"], "y3中位%": p_["y3中位%"],
+                                 "y4平均%": p_["y4平均%"], "y5最高%": p_["y5最高%"],
+                                 "y4≈元": p_["y4平均(元)"], "y5≈元": p_["y5最高(元)"]})
             if ok:
                 self._gm_logmsg("⚠ 加载冻结模型的研究性估算，非投资建议、盈亏自负；数据非实时。请先『⟳ 更新数据到最新』再预测。")
             if ok < len(codes):
                 self._gm_logmsg(f"（{len(codes)-ok} 只失败，多为该股未冻结模型或本地无数据——请先『② 训练+冻结』。）")
+            if rows:
+                self._show_prediction_table(rows)          # 结果写入表格(每只×各期限一行，方向红涨绿跌)
+
+        def _show_prediction_table(self, rows: List[dict]):
+            """把加载冻结预测的结果渲染成一张表：每只股票×各期限一行，方向红涨/绿跌(A股色)。"""
+            dlg = QDialog(self); dlg.setWindowTitle("加载冻结预测 · 结果表（每只股票 × 各期限）")
+            dlg.resize(1060, 560)
+            lay = QVBoxLayout(dlg)
+            tip = QLabel("每行对应『某只股票在某预测期限』的结果：<b>y4平均%</b>=未来窗口平均涨跌、"
+                         "<b>y5最高%</b>=窗口最高、≈元=按基准收盘折算的预测价。"
+                         "<span style='color:#c0392b'>方向红=涨/绿=跌(A股色)。研究估算、非投资建议、盈亏自负。</span>")
+            tip.setWordWrap(True); tip.setTextFormat(Qt.RichText); lay.addWidget(tip)
+            cols = ["代码", "名称", "模型", "基准日", "基准收盘", "期限(日)", "方向",
+                    "y2最低%", "y3中位%", "y4平均%", "y5最高%", "y4≈元", "y5≈元"]
+            t = QTableWidget(); t.setEditTriggers(QTableWidget.NoEditTriggers)
+            t.setColumnCount(len(cols)); t.setHorizontalHeaderLabels(cols); t.setRowCount(len(rows))
+            up, dn = QColor("#c0392b"), QColor("#1a9d5a")
+            for i, rw in enumerate(rows):
+                is_up = str(rw.get("方向", "")).startswith("涨")
+                for j, c in enumerate(cols):
+                    v = rw.get(c, "")
+                    it = QTableWidgetItem("" if v is None else str(v))
+                    if c in ("方向", "y4平均%", "y5最高%", "y3中位%", "y2最低%"):
+                        it.setForeground(up if is_up else dn)
+                    if c in ("代码", "名称"):
+                        it.setBackground(QColor("#eceff1"))
+                    t.setItem(i, j, it)
+            t.resizeColumnsToContents()
+            lay.addWidget(t, 1)
+            self._oplog(f"预测结果表：{len({r['代码'] for r in rows})} 只 × 各期限，共 {len(rows)} 行。")
+            dlg.exec()
 
         def _on_gm_predict(self):
             # 预测按钮：优先用框里输入的代码(支持逗号多只)；框空则用表格选中行
@@ -15638,7 +15675,8 @@ def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]]
             "y4平均(元)": round(c0 * (1 + out.get("y4_mean_pct", 0.0) / 100), 3),
             "y5最高(元)": round(c0 * (1 + out.get("y5_max_pct", 0.0) / 100), 3),
         })
-    return {"code": code, "algo": algo, "from_close": round(c0, 3),
+    nm = str(df["name"].iloc[-1]) if ("name" in df.columns and len(df)) else code
+    return {"code": code, "name": nm, "algo": algo, "from_close": round(c0, 3),
             "as_of": str(r["date"].date()), "frozen_file": os.path.basename(path),
             "predictions": preds,
             "disclaimer": "加载冻结模型的研究性估算，非投资建议、盈亏自负；数据非实时。"}
