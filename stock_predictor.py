@@ -8101,6 +8101,9 @@ if HAS_PYSIDE6:
             self.tabs = QTabWidget()
             self.tabs.setMinimumWidth(320)   # 允许右侧收窄，配合左侧可缩，整窗宽度可明显缩小
 
+            # 首屏：诚实定位 + 三件套导航（把产品叙事从"预测单股"扭到"排序/避雷/风控"）
+            self.tabs.addTab(self._build_home_tab(), "开始")
+
             # 第 1 个标签页：真实行情 K 线图（点按钮即可先预览数据，不必先跑模型）
             self.tabs.addTab(self._build_kline_tab(), "行情K线图")
 
@@ -8171,6 +8174,7 @@ if HAS_PYSIDE6:
 
             # 按功能把散乱的标签页归并为「板块」二级导航：先选板块，再选板块内的具体页面
             self._tab_categories = [
+                ("🏠 开始", ["开始"]),
                 ("行情板块", ["行情K线图", "板块行情"]),
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部", "全局模型(多期限)"]),
@@ -8206,6 +8210,65 @@ if HAS_PYSIDE6:
                 _cv.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
             self._on_category_clicked(self._tab_categories[0][0])   # 默认展开第一个板块
+
+        # ---- 9.2.1_home 首屏：诚实定位 + 三件套导航 ----
+        def _build_home_tab(self) -> QWidget:
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            panel = QWidget(); lay = QVBoxLayout(panel); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(12)
+
+            title = QLabel("A 股预测研究平台 · 请先读这里")
+            title.setStyleSheet("font-size:20px;font-weight:800;color:#1f4e79;")
+            lay.addWidget(title)
+
+            honest = QLabel(
+                "本软件的实测结论(用你自己的真实数据反复验证过)：<br>"
+                "<b style='color:#c0392b;font-size:15px'>单只股票的次日涨跌方向 ≈ 抛硬币（准确率≈50%），这不是 bug，是市场噪声的硬上限。</b><br>"
+                "所以本平台<b>不预测点位、不给买卖信号、不荐股</b>。把力气放在三件真正可能有价值的事上——"
+                "①横截面相对强弱排序 ②异动避雷 ③风控与生存纪律。下面三张卡片直达。")
+            honest.setWordWrap(True); honest.setTextFormat(Qt.RichText)
+            honest.setStyleSheet("background:#fff6f6;border:1px solid #f0c8c4;border-radius:8px;padding:12px 14px;font-size:13px;line-height:1.7;")
+            lay.addWidget(honest)
+
+            cards = QHBoxLayout(); cards.setSpacing(12)
+            def _card(emoji, name, desc, btn_text, jump_to, color):
+                box = QGroupBox(); box.setStyleSheet(
+                    f"QGroupBox{{border:2px solid {color};border-radius:10px;margin-top:2px;background:#fbfdff;}}")
+                v = QVBoxLayout(box); v.setContentsMargins(12, 12, 12, 12); v.setSpacing(6)
+                h = QLabel(f"{emoji} <b>{name}</b>"); h.setTextFormat(Qt.RichText)
+                h.setStyleSheet(f"font-size:15px;color:{color};"); v.addWidget(h)
+                d = QLabel(desc); d.setWordWrap(True); d.setStyleSheet("font-size:12px;color:#555;line-height:1.6;")
+                v.addWidget(d, stretch=1)
+                b = QPushButton(btn_text)
+                b.setStyleSheet(f"font-weight:bold;padding:6px;background:{color};color:white;border-radius:5px;")
+                b.clicked.connect(lambda _=False, t=jump_to: self._select_tab_by_name(t))
+                v.addWidget(b)
+                return box
+            cards.addWidget(_card(
+                "📊", "相对强弱排序", "本项目<b>唯一被数据证实</b>有微弱信号的方向：横截面比谁更强，不猜绝对涨跌。"
+                "已做行业/市值中性化 + 滚动IC + 扣费净值(诚实提示：扣费后常≈0)。",
+                "去『全局模型·一键打分』", "全局模型(多期限)", "#1a7f37"))
+            cards.addWidget(_card(
+                "🛡️", "异动避雷(主力视角)", "跟庄不可行→改识别被<b>异常拉抬/出货/操纵</b>的特征(换手暴增/频繁涨跌停/急拉/闪崩)，"
+                "给异动分，高=回避。高分≠预测下跌。",
+                "去『异动避雷』", "异动避雷", "#c0392b"))
+            cards.addWidget(_card(
+                "⚖️", "风控与生存", "预测≈抛硬币，能活下来靠纪律：盈亏比/凯利仓位/止盈止损，"
+                "还有<b>蒙特卡洛</b>让你看清『频繁交易+成本』长期的破产概率。",
+                "去『组合与仓位』", "组合与仓位", "#1f4e79"))
+            lay.addLayout(cards)
+
+            more = QLabel(
+                "其它功能仍在（K线、多模型训练、精度评估、模拟交易、投资流派视角…），但请始终记住："
+                "它们是<b>研究/教学</b>工具，任何数字都不构成投资建议。")
+            more.setWordWrap(True); more.setStyleSheet("color:#666;font-size:12px;padding:2px 2px;")
+            lay.addWidget(more)
+
+            disc = QLabel("⚠ 仅供学术研究，不构成任何投资建议、不推荐任何股票、不保证任何收益；据此交易风险自负。")
+            disc.setWordWrap(True); disc.setStyleSheet("background:#f2f4f7;border-radius:6px;padding:8px 12px;color:#8a3b34;font-size:12px;")
+            lay.addWidget(disc)
+            lay.addStretch()
+            scroll.setWidget(panel)
+            return scroll
 
         # ---- 9.2.1a 板块导航（板块按钮 + 板块内子标签按钮） ----
         def _build_tab_nav(self):

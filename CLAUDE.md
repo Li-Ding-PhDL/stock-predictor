@@ -74,6 +74,7 @@ python stock_predictor.py --cli --rank-stocks --global-scope mine --rank-horizon
 - **特征与模型(极力提升，仍守诚实)**：`MH_FEATURE_COLS` 除基础技术/估值外含 vol20/mom20/mom60/rsi14/dist_ma60/dist_ma250/dist_hi120/dist_lo120/macd_hist/boll_pos/price_tier(价格档位)，以及**勒贝格/值域横向分带特征**(`lb_*`：近60日落在各涨跌幅带的频率——上涨/大涨/大跌频率+偏度+80/20分位，刻画股性分布、跨股票可比)(全部因果)；全局池化可用任意 `ALGO_REGISTRY` 模型(默认含树模型 RF/GBRT/XGBoost/LightGBM/ExtraTrees，缺库自动置灰跳过)。诚实诊断：`train_global_pooled` 汇总给出 **按期限 DA(带各期限『总是涨』基准)** 与 **高置信前20% 弃权 DA(带该子集基准+覆盖率)**——严禁把"高基准/高覆盖"当成 edge。实测：即便如此，逐股绝对涨跌的方向 DA 仍≈50–52%，长期限的高值只是基准高，不是技能。
 - **盈亏比/数学期望/止盈止损**：`DEFAULT_RISK_REWARD_RATIO=1.5`（盈亏比暂定 1.5:1）；`expectancy(p, rr)` 由胜率折算数学期望，`kelly_fraction` 赔率缺省即取此值；`stop_loss_take_profit(entry, stop_loss_pct, rr, win_rate)` 给出对称的止盈/止损位(止盈%=止损%×盈亏比)+保本胜率+期望(GUI「组合与仓位」页「止盈止损纪律计算器」)。核心信条：预测≈抛硬币，能长期活下来的是『固定止损+按盈亏比止盈+小仓位+每次执行』——通用规则、非个股建议。
 - **GUI**：机器学习板块新增「全局模型(多期限)」标签页——可视化数据集(表头标注 标识/输入/输出) + 训练冻结 + 加载预测。
+- **首屏诚实定位(`_build_home_tab`)**：默认落地页「🏠 开始」——首屏即讲『单股次日≈抛硬币、不预测点位/不荐股』，并用三张卡片直达真正有价值的三件套(相对强弱排序 / 异动避雷 / 风控与生存)。产品叙事从"预测单股"扭到"排序+避雷+风控"。
 
 ### Docker / 自动化
 
