@@ -62,7 +62,8 @@ python stock_predictor.py --cli --rank-stocks --global-scope mine --rank-horizon
 
 - **本地数据源**：`StockDataFetcher.fetch(source="auto"/"local")` 本地优先；`enrich()` 用同一 CSV 的 PE/PB/PS/市值离线顶替联网估值。根目录无效时自动回落联网，不破坏原流程。
 - **数据更新(借鉴 Sequoia-X)**：`update_daily_dataset` / `--update-data` 改用 **baostock**(免费/无限流/无需注册/绕开东方财富反爬)拉全历史前复权(含 换手率/涨跌幅/peTTM/pbMRQ/psTTM)，按 股票4.14 格式整段重建到 `data_updated/`(无接缝、到最新交易日)。这是绕开 akshare/东方财富限流、把数据补到当天的推荐路径。
-- **数据新鲜度(GUI 全局模型页)**：顶部横幅 `_refresh_gm_freshness` 实时显示『今天几号 / 数据到几号 / 滞后天数』——原始 股票4.14 常滞后上百天，红色告警。绿色按钮「⟳ 更新数据到最新」= `UpdateWorker`→`update_daily_dataset`，完成后**自动把 `STOCK_LOCAL_DATA_ROOT` 环境变量切到 `data_updated`**(本会话即用最新数据)。一键打分若数据>15天过期会先弹窗拦截。`next_trading_days(last_date,1)` 保证预测的是数据最新日之后的下一交易日——所以务必先更新再预测，否则是在预测几个月前。
+- **数据新鲜度(GUI 全局模型页)**：顶部横幅 `_refresh_gm_freshness` 实时显示『今天几号 / 数据到几号 / 滞后天数』——原始 股票4.14 常滞后上百天，红色告警。绿色按钮「⟳ 更新数据到最新」= `UpdateWorker`→`update_daily_dataset`。一键打分若数据>15天过期会先弹窗拦截。`next_trading_days(last_date,1)` 保证预测的是数据最新日之后的下一交易日。
+- **自动优先最新数据(`_best_local_csv`)**：读单股时**逐股自动优先 `data_updated/` 里的最新该股**，没有才回退传入 root(如 股票4.14)。所以只要更新过一次(自选在 data_updated 里)，之后每个会话/预览/打分/预测都**自动用最新数据、无需再手动切源**；非自选全量股票仍从旧库读到、不丢。`_mh_load_local_rich`/`_peek_last_local_date`/数据集查看器均走这条优先。
 - **横截面选股排序**：`rank_stocks_cross_sectional` / `--rank-stocks` + GUI「★一键打分」——目标=未来相对强弱(个股−同日中位)，基准恒50%，报 RankIC/多空价差 + 出 PNG(红=强/绿=弱，A股色)。用户自选股 `USER_WATCHLIST_CODES` / `--global-scope mine`。这是本项目里**唯一被数据证实有真实小信号**(小盘 RankIC≈0.09)的方向。
   - **行业/市值中性化(默认开，`--rank-raw` 关)**：`_neutralize_cross_section` 逐日先按行业去均值、再对 log(市值) 回归取残差，让目标是纯 alpha 而非小盘风格；IC 对中性化后目标算。诊断 **size 暴露**(预测分 vs log市值/价位档位的截面相关，≈0 才不是靠押小盘) + **滚动 IC 稳定性**(IC_IR/IC>0占比/逐年)。市值列来自本地 CSV 的 总市值（元）(缺则用 price_tier 弱代理并标注)。
   - **扣费**：`cost_bps`(单边,默认30) 给『扣费后净值曲线 + 扣费后多空价差 + 毛/净年化』——实测微弱信号扣费后常≈0 甚至转负，务必看净值不看毛值。

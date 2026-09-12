@@ -8480,13 +8480,19 @@ if HAS_PYSIDE6:
                 state["ds"] = ds
                 # 按日期倒序显示——最新的锚定日排最上面(否则升序时最新在最底、看着像"没到最新")
                 self._gm_fill_table(ds.sort_values(["date", "h"], ascending=[False, True]).head(400), table=tbl)
-                base = os.path.basename(str(cur_root).rstrip("/\\")) if cur_root else "联网"
+                # 实际用的源(自动优先 data_updated 的该股；没有才回退旧库/联网)
+                if os.path.exists(StockDataFetcher._local_csv_path(code, "qfq", UPDATED_DATA_ROOT)):
+                    base = "data_updated(最新)"
+                elif cur_root:
+                    base = os.path.basename(str(cur_root).rstrip("/\\"))
+                else:
+                    base = "联网"
                 last_anchor = ds["date"].max()
                 today = pd.Timestamp(dt.date.today())
                 stale = (today - last_anchor).days
-                # 短周期锚点应接近今天；差得多说明数据源本身旧(去『全局模型』页点⟳更新)
+                # 短周期锚点应接近今天；差得多说明该股数据本身旧(去『全局模型』页点⟳更新到最新)
                 warn = ("" if stale <= 50 else
-                        f"　⚠ 数据源偏旧，最新锚点距今 {stale} 天——去『机器学习板块·全局模型』点『⟳ 更新数据到最新』")
+                        f"　⚠ 该股数据偏旧，最新锚点距今 {stale} 天——去『机器学习板块·全局模型』点『⟳ 更新数据到最新』")
                 status.setText(f"{code} · 真实数据 {len(ds)} 行 × {ds.shape[1]} 列（数据源『{base}』，"
                                f"最新锚定日 {last_anchor.date()}，表格倒序显示前 400 行）。{warn}")
 
@@ -10638,8 +10644,8 @@ if HAS_PYSIDE6:
             """轻量探测：只读若干只股票 CSV 的『日期』列末值，取最大，作为数据集最新日期(快、不整表加载)。"""
             dates = []
             for code in list(codes)[:3]:
-                p = StockDataFetcher._local_csv_path(code, "qfq", root)
-                if os.path.exists(p):
+                p = _best_local_csv(code, root)          # 优先 data_updated 的最新该股
+                if p and os.path.exists(p):
                     try:
                         d = pd.read_csv(p, usecols=["日期"])
                         dd = pd.to_datetime(d["日期"], errors="coerce").max()
@@ -14528,11 +14534,22 @@ def update_daily_dataset(codes: List[str], out_root: str = UPDATED_DATA_ROOT,
     return {"updated": ok, "skipped": skip, "out_root": out_root}
 
 
+def _best_local_csv(code: str, root: str, adjust: str = "qfq") -> Optional[str]:
+    """返回该股『最新可用』的本地 CSV 路径：优先用『更新到最新』的 data_updated 里的该股(若存在)，
+    否则回退传入 root(如 股票4.14)。这样自选(已更新)自动用最新数据、全量非自选仍能从旧库读到，无需手动切源。"""
+    upd = StockDataFetcher._local_csv_path(code, adjust, UPDATED_DATA_ROOT)
+    if os.path.exists(upd):
+        return upd
+    p = StockDataFetcher._local_csv_path(code, adjust, root) if root else None
+    return p if (p and os.path.exists(p)) else None
+
+
 def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
     """读单只股票本地 CSV，返回含 date/close/name + 各特征源列的 DataFrame；
-    已退市(退市时间非'-')返回 (df, True)。文件缺失返回 (None, False)。"""
-    path = StockDataFetcher._local_csv_path(code, adjust, root)
-    if not os.path.exists(path):
+    已退市(退市时间非'-')返回 (df, True)。文件缺失返回 (None, False)。
+    自动优先 data_updated 里的最新该股(见 _best_local_csv)。"""
+    path = _best_local_csv(code, root, adjust)
+    if not path:
         return None, False
     raw = pd.read_csv(path, dtype=str)
     ren = {"日期": "date", "名称": "name", "收盘价": "close",
