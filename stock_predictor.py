@@ -516,6 +516,8 @@ class StockDataFetcher:
                 continue
             for attempt in range(1, retries + 1):
                 try:
+                    if name.startswith("akshare"):
+                        _AK_THROTTLE.wait()          # akshare(东方财富)易限流→过全局限流闸门；baostock 免限流不拦
                     proxy_ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
                     with proxy_ctx:
                         df = fn(code, start_date, end_date, adjust)
@@ -746,10 +748,12 @@ class StockDataFetcher:
 
     @staticmethod
     def _retry(fn, tries: int = 3, delay: float = 1.0):
-        """对外部网络接口做几次重试，缓解 RemoteDisconnected 等瞬时抖动；最后一次失败则抛出。"""
+        """对外部网络接口做几次重试，缓解 RemoteDisconnected 等瞬时抖动；最后一次失败则抛出。
+        每次调用前过全局限流闸门(相邻外部请求至少隔 0.5s)，削峰、少被东方财富限流。"""
         last = None
         for i in range(tries):
             try:
+                _AK_THROTTLE.wait()          # 全局限流：外部请求削峰
                 return fn()
             except Exception as e:
                 last = e
@@ -7595,9 +7599,15 @@ def fetch_board_spot(board_type: str = "concept", retries: int = 4,
     log = progress_cb or (lambda m: None)
     if not HAS_AKSHARE:
         raise RuntimeError("未安装 akshare —— 板块行情来自东方财富，请先 pip install akshare 后重试。")
+    cache_key = f"board_spot::{board_type}"
+    cached = _SESSION_CACHE.get(cache_key)           # 板块行情慢变：60s 内重复刷新直接复用，少打接口、少限流
+    if cached is not None:
+        log("板块行情：命中会话缓存(60s内)，未重复请求东方财富")
+        return cached.copy()
     last = None
     for attempt in range(1, retries + 1):
         try:
+            _AK_THROTTLE.wait()                     # 过全局限流闸门
             with _no_proxy():                       # 绕系统代理，减少被掐连
                 if board_type == "industry":
                     df = ak.stock_board_industry_spot_em()
@@ -7629,6 +7639,7 @@ def fetch_board_spot(board_type: str = "concept", retries: int = 4,
             df = df[need].copy()
             df["pct"] = pd.to_numeric(df["pct"], errors="coerce").fillna(0.0)
             df = df.sort_values("pct", ascending=False).reset_index(drop=True)
+            _SESSION_CACHE.set(cache_key, df.copy(), ttl=60)     # 存 60s，供快速重复刷新复用
             return df
         except Exception as e:
             last = e

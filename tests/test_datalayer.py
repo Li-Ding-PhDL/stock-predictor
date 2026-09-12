@@ -49,3 +49,27 @@ def test_session_cache_and_throttle_singletons_exist():
     # 模块级单例存在且类型正确（接入热路径时依赖它们）
     assert isinstance(s._AK_THROTTLE, s._RateLimiter)
     assert isinstance(s._SESSION_CACHE, s._TTLCache)
+
+
+def test_fetch_board_spot_served_from_cache(monkeypatch):
+    """接入验证：第二次 fetch_board_spot 应命中 60s 会话缓存，不再打接口(ak 只被调用1次)。"""
+    import pandas as pd
+    calls = {"n": 0}
+
+    def fake_spot():
+        calls["n"] += 1
+        return pd.DataFrame({"板块名称": ["A", "B"], "涨跌幅": [1.0, -2.0],
+                             "上涨家数": [3, 1], "下跌家数": [1, 3]})
+
+    fake_ak = type("FakeAk", (), {
+        "stock_board_concept_spot_em": staticmethod(fake_spot),
+        "stock_board_industry_spot_em": staticmethod(fake_spot)})
+    monkeypatch.setattr(s, "HAS_AKSHARE", True, raising=False)
+    monkeypatch.setattr(s, "ak", fake_ak, raising=False)
+    monkeypatch.setattr(s._AK_THROTTLE, "min_interval", 0.0, raising=False)  # 测试别真等
+    s._SESSION_CACHE.clear()
+    d1 = s.fetch_board_spot("concept")
+    d2 = s.fetch_board_spot("concept")          # 命中缓存
+    assert calls["n"] == 1, "第二次未命中缓存，重复打了接口"
+    assert list(d1["name"]) == ["A", "B"] and list(d2["name"]) == ["A", "B"]
+    s._SESSION_CACHE.clear()
