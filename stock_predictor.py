@@ -61,6 +61,7 @@ import json                    # 配置/缓存的序列化
 import re                      # 解析"增持400.00万"这类文本字段(大股东增减持数据)
 import argparse                # 命令行/无界面模式参数解析（方便脚本或其它 AI 程序化调用）
 import time                    # 计时、生成随机种子
+import threading               # 数据层全局限流闸门(跨线程串行化外部请求)用到的锁
 import warnings                # 屏蔽第三方库的冗余警告信息
 import contextlib              # 临时忽略系统代理时用到的上下文管理器
 import sqlite3                 # 预测跟踪记录存储（内置，无需安装）
@@ -297,6 +298,57 @@ def _no_proxy():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+# ==================== 数据层护栏：全局限流闸门 + 会话内 TTL 缓存 ====================
+# 目的(见待完善报告 P2)：把散在各处的外部请求统一做『最小间隔限流 + 相同请求去重』，
+# 缓解东方财富/akshare 频繁限流。刻意做成**小而独立**的工具，不改数据契约(fetch 仍返回同样的 DataFrame)。
+class _RateLimiter:
+    """全局最小间隔限流闸门(线程安全)：保证相邻两次外部请求至少间隔 min_interval 秒，削峰、少被限流。"""
+    def __init__(self, min_interval: float = 0.5):
+        self.min_interval = float(min_interval)
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            gap = now - self._last
+            if 0 <= gap < self.min_interval:
+                time.sleep(self.min_interval - gap)
+            self._last = time.monotonic()
+
+
+_AK_THROTTLE = _RateLimiter(min_interval=0.5)   # 全局限流：外部行情/财务请求相邻至少隔 0.5s
+
+
+class _TTLCache:
+    """会话内 TTL 缓存(线程安全)：对『同一 key 的重复只读请求』在 ttl 秒内直接返回上次结果，避免重复打接口。
+    只缓存显式传入的结果，不猜、不持久化(进程退出即失效)——用于慢变的只读数据(如板块行情)去重。"""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store: Dict[str, tuple] = {}     # key -> (expire_ts, value)
+
+    def get(self, key: str):
+        with self._lock:
+            hit = self._store.get(key)
+            if hit is None:
+                return None
+            if time.monotonic() >= hit[0]:
+                self._store.pop(key, None)     # 过期清掉
+                return None
+            return hit[1]
+
+    def set(self, key: str, value, ttl: float):
+        with self._lock:
+            self._store[key] = (time.monotonic() + float(ttl), value)
+
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+
+
+_SESSION_CACHE = _TTLCache()
 
 
 class StockDataFetcher:
