@@ -10725,8 +10725,12 @@ if HAS_PYSIDE6:
             self.gm_export_btn.setEnabled(ds is not None and len(ds) > 0)
             if ds is None or len(ds) == 0:
                 self._gm_logmsg("数据集为空。"); return
-            self._gm_logmsg(f"完成：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票。表格仅显示前 500 行。")
-            self._gm_fill_table(ds.head(500))
+            # 预览按日期倒序取最近 500 行——否则默认前500行全是第一只股票最早年份的锚点(看着像"只到2019、只有1只")
+            preview = ds.sort_values(["date", "code"], ascending=[False, True]).head(500)
+            self._gm_logmsg(f"完成：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票。"
+                            f"表格显示<最近 500 行>(按日期倒序，覆盖 {preview['code'].nunique()} 只、"
+                            f"{preview['date'].min().date()}~{preview['date'].max().date()})。完整数据可『导出数据集CSV』。")
+            self._gm_fill_table(preview)
 
         # 列名 → 中文显示名（数据集预览用；未收录的列回退英文原名）
         _GM_CN = {
@@ -10778,13 +10782,23 @@ if HAS_PYSIDE6:
             def _header(c):
                 cn = self._GM_CN.get(str(c), str(c))
                 return (f"{self._gm_group(c)}·{cn}") if has_io else cn
+            def _fmt(v):
+                try:
+                    if v is None or pd.isna(v):
+                        return ""
+                except Exception:
+                    pass
+                if isinstance(v, pd.Timestamp):
+                    return v.strftime("%Y-%m-%d")                 # 日期去掉 00:00:00
+                if isinstance(v, (float, np.floating)):
+                    return f"{float(v):.4f}"                      # 统一保留 4 位小数
+                return str(v)
             table.setColumnCount(len(cols))
             table.setHorizontalHeaderLabels([_header(c) for c in cols])
             table.setRowCount(len(ds))
             for i in range(len(ds)):
                 for j, c in enumerate(cols):
-                    v = ds.iloc[i][c]
-                    it = QTableWidgetItem("" if pd.isna(v) else str(v))
+                    it = QTableWidgetItem(_fmt(ds.iloc[i][c]))
                     it.setBackground(bg_of[self._gm_group(c)])
                     table.setItem(i, j, it)
             table.resizeColumnsToContents()
