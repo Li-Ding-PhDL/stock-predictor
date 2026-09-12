@@ -193,7 +193,7 @@ try:
         QLineEdit, QDateEdit, QComboBox, QTableWidget, QTableWidgetItem,
         QTabWidget, QProgressBar, QMessageBox, QScrollArea, QSplitter, QTextEdit, QTextBrowser,
         QFileDialog, QDialog, QProgressDialog, QSpinBox, QDoubleSpinBox, QHeaderView, QFrame,
-        QToolButton, QListWidget, QListWidgetItem, QInputDialog, QSizePolicy
+        QToolButton, QListWidget, QListWidgetItem, QInputDialog, QSizePolicy, QAbstractItemView
     )
     from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer, QEvent, QObject
     from PySide6.QtGui import QFont, QColor
@@ -10588,12 +10588,17 @@ if HAS_PYSIDE6:
             self.gm_rank_btn.clicked.connect(self._on_gm_rank)
             btns.addWidget(self.gm_rank_btn)
             btns.addWidget(QLabel("③ 加载冻结预测:"))
-            self.gm_predict_edit = QLineEdit(); self.gm_predict_edit.setPlaceholderText("股票代码，如 600519")
-            self.gm_predict_edit.setMaximumWidth(140)
+            self.gm_predict_edit = QLineEdit(); self.gm_predict_edit.setPlaceholderText("代码(可逗号多只)，或直接点/多选表格行")
+            self.gm_predict_edit.setMaximumWidth(240)
             btns.addWidget(self.gm_predict_edit)
             self.gm_predict_btn = QPushButton("预测")
             self.gm_predict_btn.clicked.connect(self._on_gm_predict)
             btns.addWidget(self.gm_predict_btn)
+            self.gm_predict_sel_btn = QPushButton("预测选中行")
+            self.gm_predict_sel_btn.setStyleSheet("font-weight:bold;")
+            self.gm_predict_sel_btn.setToolTip("在下方表格里点选一行或多行(按住 Ctrl/Shift 多选)，点此对选中股票批量加载冻结模型预测；双击某行=直接预测该只")
+            self.gm_predict_sel_btn.clicked.connect(self._on_gm_predict_selected)
+            btns.addWidget(self.gm_predict_sel_btn)
             btns.addStretch(1)
             layout.addLayout(btns)
 
@@ -10601,6 +10606,11 @@ if HAS_PYSIDE6:
             self.gm_table = QTableWidget()
             self.gm_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self.gm_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            # 支持整行、多选(Ctrl/Shift)；双击行=直接预测该只
+            self.gm_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.gm_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.gm_table.doubleClicked.connect(self._on_gm_row_dblclick)
+            self._gm_cols = []
             layout.addWidget(self.gm_table, stretch=3)
             self.gm_log = QTextEdit(); self.gm_log.setReadOnly(True); self.gm_log.setMaximumHeight(150)
             self.gm_log.setStyleSheet("font-family:Consolas,monospace;font-size:12px;")
@@ -10793,6 +10803,8 @@ if HAS_PYSIDE6:
                 if isinstance(v, (float, np.floating)):
                     return f"{float(v):.4f}"                      # 统一保留 4 位小数
                 return str(v)
+            if table is getattr(self, "gm_table", None):
+                self._gm_cols = list(cols)          # 记住主表当前列顺序，供点行取『代码』
             table.setColumnCount(len(cols))
             table.setHorizontalHeaderLabels([_header(c) for c in cols])
             table.setRowCount(len(ds))
@@ -10880,22 +10892,62 @@ if HAS_PYSIDE6:
                 self._gm_logmsg("已冻结: " + " ".join(os.path.basename(v) for v in summary["frozen"].values()))
             self._gm_logmsg("⚠ DA需显著>50%且高于基准、y4RMSE优于Naive才算真有用。研究性回测，非投资建议、盈亏自负。")
 
+        def _gm_selected_codes(self) -> List[str]:
+            """从主表选中的行里取『代码』列(去重、保序)。列名映射用 _gm_fill_table 记下的 _gm_cols。"""
+            cols = getattr(self, "_gm_cols", []) or []
+            if "code" not in cols:
+                return []
+            ci = cols.index("code")
+            out = []
+            for rrow in sorted({idx.row() for idx in self.gm_table.selectedIndexes()}):
+                it = self.gm_table.item(rrow, ci)
+                c = it.text().strip() if it else ""
+                if c and c not in out:
+                    out.append(c)
+            return out
+
+        def _gm_predict_codes(self, codes: List[str]):
+            """对一批代码逐只加载冻结模型预测(不重训)，结果写日志。多只批量、逐只容错。"""
+            codes = [c.strip() for c in codes if c.strip()]
+            if not codes:
+                QMessageBox.warning(self, "缺代码", "请在框里填代码(可逗号多只)，或在下方表格点选一/多行。"); return
+            algos = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()]
+            algo1 = algos[0] if algos else "Lasso"
+            self._gm_logmsg(f"加载冻结预测：{len(codes)} 只，用模型 {algo1} ……")
+            ok = 0
+            for code in codes:
+                try:
+                    r = predict_frozen(code, algo=algo1)
+                except Exception as e:
+                    self._gm_logmsg(f"  ✗ {code} 预测失败：{str(e)[:110]}"); continue
+                ok += 1
+                self._gm_logmsg(f"[{r['code']}] {r['algo']} 基于 {r['as_of']} 收盘 {r['from_close']}元：")
+                for p_ in r["predictions"]:
+                    self._gm_logmsg(f"   期限{p_['h']:>2}日 {p_['方向']} y4平均={p_['y4平均%']:+}% "
+                                    f"y5最高={p_['y5最高%']:+}% (y4≈{p_['y4平均(元)']} / y5≈{p_['y5最高(元)']}元)")
+            if ok:
+                self._gm_logmsg("⚠ 加载冻结模型的研究性估算，非投资建议、盈亏自负；数据非实时。请先『⟳ 更新数据到最新』再预测。")
+            if ok < len(codes):
+                self._gm_logmsg(f"（{len(codes)-ok} 只失败，多为该股未冻结模型或本地无数据——请先『② 训练+冻结』。）")
+
         def _on_gm_predict(self):
-            code = self.gm_predict_edit.text().strip()
-            if not code:
-                QMessageBox.warning(self, "缺代码", "请填写要预测的股票代码。"); return
-            if not self._gm_preview_and_confirm("预测"):     # 预测前也先弹出该股数据集(输入蓝/输出绿)确认
-                self._gm_logmsg("已取消(未确认数据集)。"); return
-            algo1 = [a.strip() for a in self.gm_algos_edit.text().split(",") if a.strip()][0]
-            try:
-                r = predict_frozen(code, algo=algo1)
-            except Exception as e:
-                QMessageBox.critical(self, "预测失败", str(e)); return
-            self._gm_logmsg(f"[加载冻结预测] {r['code']} 用 {r['algo']}({r['frozen_file']}) 基于 {r['as_of']} 收盘 {r['from_close']}元")
-            for p_ in r["predictions"]:
-                self._gm_logmsg(f"  期限{p_['h']:>2}日  {p_['方向']}  y4平均={p_['y4平均%']:+}%  y5最高={p_['y5最高%']:+}%  "
-                                f"(y4≈{p_['y4平均(元)']}元 / y5≈{p_['y5最高(元)']}元)")
-            self._gm_logmsg("⚠ " + r["disclaimer"])
+            # 预测按钮：优先用框里输入的代码(支持逗号多只)；框空则用表格选中行
+            typed = [c.strip() for c in self.gm_predict_edit.text().replace("，", ",").split(",") if c.strip()]
+            codes = typed or self._gm_selected_codes()
+            if not codes:
+                QMessageBox.warning(self, "缺代码", "请填写代码(可逗号多只)，或在下方表格点选一/多行再点『预测选中行』。"); return
+            self._gm_predict_codes(codes)
+
+        def _on_gm_predict_selected(self):
+            codes = self._gm_selected_codes()
+            if not codes:
+                QMessageBox.information(self, "未选行", "请先在下方表格点选一行或多行(按住 Ctrl/Shift 多选)。"); return
+            self._gm_predict_codes(codes)
+
+        def _on_gm_row_dblclick(self, index):
+            codes = self._gm_selected_codes()          # 双击=预测选中行(至少含双击那行)
+            if codes:
+                self._gm_predict_codes(codes)
 
         def _on_gm_rank(self):
             codes = self._gm_codes()
