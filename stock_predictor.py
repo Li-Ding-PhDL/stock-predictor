@@ -8462,7 +8462,8 @@ if HAS_PYSIDE6:
 
             def _gen():
                 code = code_edit.text().strip() or "600519"
-                src_hint = "读本地真实行情" if root else "联网拉真实历史"
+                cur_root = StockDataFetcher._resolve_local_root()      # 每次实时解析(可能刚点过『更新数据』切了源)
+                src_hint = "读本地真实行情" if cur_root else "联网拉真实历史"
                 gen_btn.setEnabled(False); status.setText(f"生成中（{src_hint}，联网首拉可能稍慢）…")
                 QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
                 try:
@@ -8477,9 +8478,17 @@ if HAS_PYSIDE6:
                     status.setText(f"{code}：本地无此股票且联网也取不到(或历史不足)，未构建出样本(不编造数据)。")
                     tbl.setRowCount(0); state["ds"] = None; return
                 state["ds"] = ds
-                self._gm_fill_table(ds.head(400), table=tbl)
-                status.setText(f"{code} · 真实数据：{len(ds)} 行 × {ds.shape[1]} 列"
-                               f"（{len(DEFAULT_HORIZONS)} 期限 × {int(n_spin.value())} 锚点，表格显示前 400 行）")
+                # 按日期倒序显示——最新的锚定日排最上面(否则升序时最新在最底、看着像"没到最新")
+                self._gm_fill_table(ds.sort_values(["date", "h"], ascending=[False, True]).head(400), table=tbl)
+                base = os.path.basename(str(cur_root).rstrip("/\\")) if cur_root else "联网"
+                last_anchor = ds["date"].max()
+                today = pd.Timestamp(dt.date.today())
+                stale = (today - last_anchor).days
+                # 短周期锚点应接近今天；差得多说明数据源本身旧(去『全局模型』页点⟳更新)
+                warn = ("" if stale <= 50 else
+                        f"　⚠ 数据源偏旧，最新锚点距今 {stale} 天——去『机器学习板块·全局模型』点『⟳ 更新数据到最新』")
+                status.setText(f"{code} · 真实数据 {len(ds)} 行 × {ds.shape[1]} 列（数据源『{base}』，"
+                               f"最新锚定日 {last_anchor.date()}，表格倒序显示前 400 行）。{warn}")
 
             def _exp():
                 if state["ds"] is None or len(state["ds"]) == 0:
