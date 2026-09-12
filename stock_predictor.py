@@ -14308,6 +14308,12 @@ USER_WATCHLIST_CODES: List[str] = [
     "600207", "002560", "002692", "000523", "002377",   # 新增：安彩高科/通达股份/远程股份/红棉股份/国创高新
 ]
 
+# 股票名称覆盖表：本地数据集/baostock 不带名或名字过期时，用同花顺现名顶替(纯显示、不影响任何计算)。
+STOCK_NAME_OVERRIDES: Dict[str, str] = {
+    "000908": "石药景峰",   # 原名『景峰医药/ST景峰』，已更名
+    "002743": "ST富煌",     # 原『富煌钢构』，已被 ST
+}
+
 # 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
 MH_FEATURE_COLS: List[str] = ["h", "ret_1d", "ret_3d", "ret_6d", "ret_10d",
                               "ma20_dev", "vol_ratio", "turnover", "pe_ttm", "pb", "ps_ttm",
@@ -14483,6 +14489,8 @@ def _mh_load_local_rich(code: str, root: str, adjust: str = "qfq"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    if str(code) in STOCK_NAME_OVERRIDES:                 # 名字过期→用同花顺现名(纯显示)
+        df["name"] = STOCK_NAME_OVERRIDES[str(code)]
     df = _mh_add_causal_features(df)
     return df, is_delisted
 
@@ -14591,6 +14599,8 @@ def _mh_load_online_rich(code: str, start: str = "20150101", end: Optional[str] 
             df["name"] = StockDataFetcher.fetch_stock_name(code) or code
         except Exception:
             df["name"] = code
+    if str(code) in STOCK_NAME_OVERRIDES:                 # 名字过期→用同花顺现名(纯显示)
+        df["name"] = STOCK_NAME_OVERRIDES[str(code)]
     df = df.dropna(subset=["date", "close"]).reset_index(drop=True)
     df = _mh_add_causal_features(df)
     return df, False
