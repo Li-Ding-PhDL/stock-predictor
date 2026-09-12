@@ -84,6 +84,11 @@ from matplotlib.figure import Figure
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei",
                                           "Arial Unicode MS", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
+# 中文字体(雅黑/黑体)多数没登记 bold 变体，标题用粗体时 matplotlib 会反复刷
+# "findfont: Failed to find font weight bold, now using 400."——纯字重回退、不影响出图，
+# 直接把 font_manager 的 WARNING 级日志压到 ERROR，消除终端刷屏噪声。
+import logging as _logging
+_logging.getLogger("matplotlib.font_manager").setLevel(_logging.ERROR)
 MATPLOTLIB_OK = True   # matplotlib 为硬依赖（无 try/except），能导入到这里就一定可用
 # 注意：FigureCanvasQTAgg 依赖 PySide6/PyQt 才能导入，放到"可选依赖"区域（1.3.7）里按需导入，
 # 这样在没装 GUI 库、只想用本文件做命令行训练/批量实验的场景下，导入本文件不会直接报错。
