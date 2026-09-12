@@ -7954,6 +7954,23 @@ if HAS_PYSIDE6:
                 return True
             return False
 
+    class UpdateWorker(QThread):
+        """数据更新后台线程：baostock 把所选股票重建到最新交易日(免限流)，不卡界面。"""
+        progress_signal = Signal(str)
+        finished_signal = Signal(dict)
+        error_signal = Signal(str)
+
+        def __init__(self, codes):
+            super().__init__()
+            self.codes = codes
+
+        def run(self):
+            try:
+                r = update_daily_dataset(self.codes, progress_cb=lambda m: self.progress_signal.emit(m))
+                self.finished_signal.emit(r)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+
     class GlobalDatasetWorker(QThread):
         """全局『多期限×多目标』数据集构建后台线程：批量读本地 CSV → 池化，不卡界面。"""
         progress_signal = Signal(str)
@@ -10501,6 +10518,12 @@ if HAS_PYSIDE6:
             intro.setStyleSheet("color:#555;background:#f6f8fb;padding:6px;")
             layout.addWidget(intro)
 
+            # ── 数据新鲜度横幅（先看今天几号、数据到几号，过期就醒目提醒去更新）──
+            self.gm_fresh_lbl = QLabel("数据新鲜度：待检测…")
+            self.gm_fresh_lbl.setWordWrap(True)
+            self.gm_fresh_lbl.setStyleSheet("padding:6px 10px;border-radius:6px;background:#eef1f5;color:#333;font-size:12px;")
+            layout.addWidget(self.gm_fresh_lbl)
+
             # ── 参数区 ──
             box = QGroupBox("参数")
             g = QGridLayout(box)
@@ -10539,6 +10562,12 @@ if HAS_PYSIDE6:
 
             # ── 按钮区 ──
             btns = QHBoxLayout()
+            self.gm_update_btn = QPushButton("⟳ 更新数据到最新")
+            self.gm_update_btn.setStyleSheet("font-weight:bold;background:#1a7f37;color:white;")
+            self.gm_update_btn.setToolTip("用 baostock(免限流)把所选股票的历史重建到最新交易日，写入 data_updated 并自动切换。"
+                                          "预测前先点它，否则你在用旧数据预测过去。")
+            self.gm_update_btn.clicked.connect(self._on_gm_update)
+            btns.addWidget(self.gm_update_btn)
             self.gm_build_btn = QPushButton("① 生成数据集(预览)")
             self.gm_build_btn.clicked.connect(self._on_gm_build)
             btns.addWidget(self.gm_build_btn)
@@ -10573,7 +10602,90 @@ if HAS_PYSIDE6:
             layout.addWidget(self.gm_log, stretch=1)
 
             self._gm_dataset = None
+            try:
+                self.gm_scope_combo.currentIndexChanged.connect(lambda _=0: self._refresh_gm_freshness())
+                self.gm_codes_edit.editingFinished.connect(self._refresh_gm_freshness)
+                self._refresh_gm_freshness()
+            except Exception:
+                pass
             return panel
+
+        def _peek_last_local_date(self, codes, root):
+            """轻量探测：只读若干只股票 CSV 的『日期』列末值，取最大，作为数据集最新日期(快、不整表加载)。"""
+            dates = []
+            for code in list(codes)[:3]:
+                p = StockDataFetcher._local_csv_path(code, "qfq", root)
+                if os.path.exists(p):
+                    try:
+                        d = pd.read_csv(p, usecols=["日期"])
+                        dd = pd.to_datetime(d["日期"], errors="coerce").max()
+                        if pd.notna(dd):
+                            dates.append(dd)
+                    except Exception:
+                        pass
+            return max(dates) if dates else None
+
+        def _refresh_gm_freshness(self):
+            """刷新数据新鲜度横幅：今天几号 / 数据到几号 / 滞后多少天；过期就红色提醒去更新。"""
+            if not hasattr(self, "gm_fresh_lbl"):
+                return
+            today = pd.Timestamp(dt.date.today())
+            root = StockDataFetcher._resolve_local_root()
+            if not root:
+                self.gm_fresh_lbl.setText(f"今天 {today.date()}｜当前<b>无本地数据集</b>，将走联网兜底(较慢/可能限流)。"
+                                          f"建议配置本地数据或点『⟳ 更新数据到最新』。")
+                self.gm_fresh_lbl.setStyleSheet("padding:6px 10px;border-radius:6px;background:#fcf3e2;color:#8a5b0d;font-size:12px;")
+                return
+            try:
+                last = self._peek_last_local_date(self._gm_codes(), root)
+            except Exception:
+                last = None
+            if last is None:
+                self.gm_fresh_lbl.setText(f"今天 {today.date()}｜数据最新日期探测失败(本地可能缺该范围股票)。")
+                self.gm_fresh_lbl.setStyleSheet("padding:6px 10px;border-radius:6px;background:#fcf3e2;color:#8a5b0d;font-size:12px;")
+                return
+            stale = (today - last).days
+            base = os.path.basename(str(root).rstrip("/\\"))
+            if stale <= 5:
+                self.gm_fresh_lbl.setText(f"✅ 今天 {today.date()}｜数据已到 <b>{last.date()}</b>(滞后 {stale} 天，数据源『{base}』)。"
+                                          f"下一交易日预测有效。")
+                self.gm_fresh_lbl.setStyleSheet("padding:6px 10px;border-radius:6px;background:#e6f4ea;color:#1a7f37;font-size:12px;")
+            else:
+                self.gm_fresh_lbl.setText(f"⚠ 今天 {today.date()}｜数据只到 <b>{last.date()}</b>，<b>已过期 {stale} 天</b>(数据源『{base}』)！"
+                                          f"用它排序/预测=在预测过去、毫无意义。请先点右边绿色『⟳ 更新数据到最新』补齐到今天。")
+                self.gm_fresh_lbl.setStyleSheet("padding:6px 10px;border-radius:6px;background:#fdecea;color:#b0302c;font-weight:bold;font-size:12px;")
+
+        def _on_gm_update(self):
+            codes = self._gm_codes()
+            if not codes:
+                QMessageBox.warning(self, "无股票", "请先选择股票范围或填写自定义代码。"); return
+            n = len(codes)
+            if QMessageBox.question(
+                    self, "更新数据到最新",
+                    f"将用 baostock(免限流) 把 {n} 只股票的历史重建到最新交易日，写入 data_updated/ 并自动切换为当前数据源。\n"
+                    f"本地全部({n}只)可能耗时较久。是否继续？") != QMessageBox.Yes:
+                return
+            self.gm_update_btn.setEnabled(False); self.gm_log.clear()
+            self._gm_logmsg(f"更新数据到最新：{n} 只(baostock 重建全历史前复权到最新交易日)…")
+            self._gm_update_worker = UpdateWorker(codes)
+            self._gm_update_worker.progress_signal.connect(self._gm_logmsg)
+            self._gm_update_worker.finished_signal.connect(self._on_gm_update_done)
+            self._gm_update_worker.error_signal.connect(
+                lambda e: (self._gm_logmsg("更新失败: " + e), self.gm_update_btn.setEnabled(True)))
+            self._gm_update_worker.start()
+
+        def _on_gm_update_done(self, res: dict):
+            self.gm_update_btn.setEnabled(True)
+            out_root = res.get("out_root")
+            if out_root and os.path.isdir(os.path.join(out_root, "每只股票一个文件")):
+                os.environ["STOCK_LOCAL_DATA_ROOT"] = out_root      # 会话内切到最新数据(_resolve_local_root 每次读环境变量)
+            self._gm_logmsg(f"完成：更新 {res.get('updated')} 只 / 跳过 {res.get('skipped')} 只 → 数据源已切到 {out_root}")
+            self._refresh_gm_freshness()
+            QMessageBox.information(self, "已更新到最新",
+                f"已更新 {res.get('updated')} 只到最新交易日，并自动切换为当前数据源。\n"
+                f"现在『生成数据集/一键打分/加载预测』都用最新数据；预测的是最新交易日之后的下一交易日。\n\n"
+                f"研究用途、非投资建议、盈亏自负。")
+            self._oplog(f"数据更新到最新：{res.get('updated')}只，已切换数据源。")
 
         def _gm_codes(self) -> List[str]:
             scope = self.gm_scope_combo.currentText()
@@ -10770,6 +10882,17 @@ if HAS_PYSIDE6:
             codes = self._gm_codes()
             if len(codes) < 5:
                 QMessageBox.warning(self, "股票太少", "选股排序需要至少 5 只股票(要形成横截面)。"); return
+            self._refresh_gm_freshness()
+            # 数据过期(>15天)时先拦一道，避免"拿几个月前的数据当最新"去排序
+            root = StockDataFetcher._resolve_local_root()
+            last = self._peek_last_local_date(codes, root) if root else None
+            if last is not None and (pd.Timestamp(dt.date.today()) - last).days > 15:
+                if QMessageBox.question(
+                        self, "数据可能过期",
+                        f"当前数据只到 {last.date()}，已过期 {(pd.Timestamp(dt.date.today())-last).days} 天。\n"
+                        f"用旧数据排序=在给几个月前的行情打分，最新一档不是『现在』的强弱。\n"
+                        f"建议先点『⟳ 更新数据到最新』。仍要用旧数据继续吗？") != QMessageBox.Yes:
+                    return
             self.gm_rank_btn.setEnabled(False); self.gm_log.clear()
             self._gm_logmsg(f"一键打分：在 {len(codes)} 只的**过往历史**上训练相对强弱模型 → 排序 → 样本外回测 → 出图 ...")
             png = os.path.join(BASE_DIR, "选股排序_result.png")
