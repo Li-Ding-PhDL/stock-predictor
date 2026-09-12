@@ -173,10 +173,13 @@ def test_build_multi_horizon_causal(tmp_path):
         assert c in ds.columns
     assert set(s.MH_FEATURE_COLS).isdisjoint(s.MH_TARGET_COLS)
     assert "y4_mean_pct" in ds.columns
-    # 因果：最后一个锚定日必须给未来窗口留出 hmax 天（不越界取未来）
-    hmax = 10
+    # 因果(逐期限)：期限 h 的每一行，其锚定日之后必须至少还有 h 个交易日(该行目标窗口真实存在、不越界取未来)。
+    # 新构造允许最近日期贡献短周期样本，故按『每个 h 单独留 h 天』校验，而非一刀切留 max(h)。
     df_raw, _ = s._mh_load_local_rich(code, root)
-    last_dt = df_raw["date"].max()
-    max_anchor = ds["date"].max()
-    future_room = (df_raw["date"] > max_anchor).sum()
-    assert future_room >= hmax, "锚定日越界取了不存在的未来 → 泄露风险"
+    for h in [1, 5, 10]:
+        sub = ds[ds["h"] == h]
+        if len(sub) == 0:
+            continue
+        max_anchor_h = sub["date"].max()
+        room = int((df_raw["date"] > max_anchor_h).sum())
+        assert room >= h, f"h={h} 的锚定日越界取了不存在的未来({room}<{h}) → 泄露风险"

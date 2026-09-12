@@ -14644,7 +14644,10 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
         if arima_features and HAS_STATSMODELS and n > 60:
             si = int((df["date"] < pd.to_datetime(split_date)).sum()) if split_date else int(n * 0.7)
             arima_pr, arima_rz = _arima_causal_features(close.astype(float), max(si, 40))
-        valid = [i for i in range(n - hmax) if pd.notna(df["ret_10d"].iloc[i])]
+        # 锚定日上界用『最短期限』而非最长：这样最近的日期也能贡献短周期(h=1/2/3…)样本，
+        # 只有长周期(h=32/42)因未来窗口不足被逐期限跳过(见下方 len(win)<h)。数据集因此能排到接近今天、不再被最长期限一刀切。
+        hmin = min(horizons)
+        valid = [i for i in range(n - hmin) if pd.notna(df["ret_10d"].iloc[i])]
         if anchors_per_stock:
             valid = valid[-anchors_per_stock:]
         elif anchor_stride > 1:
