@@ -10611,26 +10611,64 @@ if HAS_PYSIDE6:
             self._gm_logmsg(f"完成：{len(ds)} 行 × {ds.shape[1]} 列，{ds['code'].nunique()} 只股票。表格仅显示前 500 行。")
             self._gm_fill_table(ds.head(500))
 
+        # 列名 → 中文显示名（数据集预览用；未收录的列回退英文原名）
+        _GM_CN = {
+            # 标识/辅助
+            "code": "代码", "name": "名称", "date": "日期", "close": "收盘价",
+            "total_mv": "总市值", "industry": "所属行业",
+            "rank": "排名", "score": "得分", "tag": "标签",
+            # 输入 X（技术/估值/分布/流派量化 + 期限）
+            "h": "期限h(交易日)", "ret_1d": "昨日涨跌%", "ret_3d": "近3日涨跌%",
+            "ret_6d": "近6日涨跌%", "ret_10d": "近10日涨跌%", "ma20_dev": "距20日线%",
+            "vol_ratio": "量比", "turnover": "换手率%", "pe_ttm": "市盈率TTM",
+            "pb": "市净率", "ps_ttm": "市销率TTM", "vol20": "20日波动率",
+            "mom20": "20日动量%", "mom60": "60日动量%", "rsi14": "RSI(14)",
+            "dist_ma60": "距60日线%", "dist_ma250": "距250日线%", "dist_hi120": "距120日高%",
+            "dist_lo120": "距120日低%", "macd_hist": "MACD柱", "boll_pos": "布林位置",
+            "price_tier": "价格档位", "lb_up_freq": "上涨日占比%", "lb_bigup_freq": "大涨频率%",
+            "lb_bigdn_freq": "大跌频率%", "lb_ret_skew": "收益偏度", "lb_ret_q80": "收益80分位",
+            "lb_ret_q20": "收益20分位", "sch_tech": "技术流派符合度", "pe_pctile": "PE分位%",
+            "arima_pred_ret": "ARIMA预测收益", "arima_resid_z": "ARIMA残差(标准化)",
+            "mkt_ret1": "大盘当日涨跌%", "mkt_mom20": "大盘20日动量%",
+            # 输出 Y（未来窗口涨跌%/价格；方向由 y4 符号导出）
+            "y1_dir": "方向(涨+1/跌-1)", "y2_min_pct": "未来最低涨跌%", "y3_med_pct": "未来中位涨跌%",
+            "y4_mean_pct": "未来平均涨跌%", "y5_max_pct": "未来最高涨跌%",
+            "y2_min_yuan": "未来最低价(元)", "y3_med_yuan": "未来中位价(元)",
+            "y4_mean_yuan": "未来平均价(元)", "y5_max_yuan": "未来最高价(元)",
+            "end_close_yuan": "期末收盘价(元)",
+        }
+
+        def _gm_group(self, c):
+            """把列归到 标识/输入/输出。输入=模型特征(含h/arima/大盘/横截面排名)；
+            输出=未来窗口派生(y* 及 期末收盘价)；其余为标识/辅助。"""
+            c = str(c)
+            if c.startswith("y") or c == "end_close_yuan":
+                return "输出"
+            if c in set(MH_FEATURE_COLS) | set(MH_ARIMA_COLS) | set(MH_MARKET_COLS) or c.endswith("_xr"):
+                return "输入"
+            return "标识"
+
         def _gm_fill_table(self, ds, table=None):
             table = table if table is not None else self.gm_table
-            # 表头按 标识/输入/输出 归类标注；输入=淡蓝、输出=淡绿、标识=淡灰，一眼分清 X 与 Y
-            id_cols = ["code", "name", "date", "close"]
-            out_cols = [c for c in ds.columns if str(c).startswith("y")]
-            def _tag(c):
-                if c in id_cols: return f"标识·{c}"
-                if c in out_cols: return f"输出·{c}"
-                return f"输入·{c}"
+            # 列重排：标识 → 输入X → 输出Y（组内保持原顺序）；表头中文；输入淡蓝/输出淡绿/标识淡灰
+            _rank = {"标识": 0, "输入": 1, "输出": 2}
+            has_io = any(self._gm_group(c) != "标识" for c in ds.columns)
             cols = list(ds.columns)
-            col_bg = {c: (QColor("#eceff1") if c in id_cols else
-                          QColor("#e6f4ea") if c in out_cols else QColor("#e8f0fe")) for c in cols}
+            if has_io:
+                cols = sorted(cols, key=lambda c: _rank[self._gm_group(c)])   # 稳定排序，组内原序不变
+            bg_of = {"标识": QColor("#eceff1"), "输入": QColor("#e8f0fe"), "输出": QColor("#e6f4ea")}
+
+            def _header(c):
+                cn = self._GM_CN.get(str(c), str(c))
+                return (f"{self._gm_group(c)}·{cn}") if has_io else cn
             table.setColumnCount(len(cols))
-            table.setHorizontalHeaderLabels([_tag(c) for c in cols])
+            table.setHorizontalHeaderLabels([_header(c) for c in cols])
             table.setRowCount(len(ds))
             for i in range(len(ds)):
                 for j, c in enumerate(cols):
                     v = ds.iloc[i][c]
                     it = QTableWidgetItem("" if pd.isna(v) else str(v))
-                    it.setBackground(col_bg[c])
+                    it.setBackground(bg_of[self._gm_group(c)])
                     table.setItem(i, j, it)
             table.resizeColumnsToContents()
 
