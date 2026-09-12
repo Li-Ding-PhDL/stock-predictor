@@ -14651,7 +14651,8 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
         if anchors_per_stock:
             valid = valid[-anchors_per_stock:]
         elif anchor_stride > 1:
-            valid = valid[::anchor_stride]
+            # 从最新一天倒着按步长取，保证『最近交易日』一定入选(否则从最早起步会把最新几天漏掉)
+            valid = valid[::-1][::anchor_stride][::-1]
         log(f"[{ci}/{len(codes)}] {code} {name}（{src}）：{len(valid)} 个锚定日 × {len(horizons)} 期限")
         for i in valid:
             r = df.iloc[i]
