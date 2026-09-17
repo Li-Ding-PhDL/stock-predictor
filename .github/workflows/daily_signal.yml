@@ -35,13 +35,18 @@ jobs:
       - name: 扫今日买点+风险并推送微信
         env:
           STOCK_LOCAL_DATA_ROOT: ${{ github.workspace }}/data_updated
+          # PUSH_SPEC(推荐)=完整推送方式, 可填: 'serverchan:你的SENDKEY' / 'https://企业微信群机器人webhook' / 'pushplus:token'
+          # 兼容旧的 PUSHPLUS_TOKEN(仅pushplus, 需实名)。二者都没配则只生成HTML不推送。
+          PUSH_SPEC: ${{ secrets.PUSH_SPEC }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
-          if [ -z "$PUSHPLUS_TOKEN" ]; then
-            echo "未配置 PUSHPLUS_TOKEN Secret，仅生成不推送。去 仓库Settings→Secrets→Actions 添加。"
+          PUSH="$PUSH_SPEC"
+          if [ -z "$PUSH" ] && [ -n "$PUSHPLUS_TOKEN" ]; then PUSH="pushplus:${PUSHPLUS_TOKEN}"; fi
+          if [ -z "$PUSH" ]; then
+            echo "未配置推送 Secret(PUSH_SPEC 或 PUSHPLUS_TOKEN)，仅生成HTML不推送。"
             python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5
           else
-            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5 --push "pushplus:${PUSHPLUS_TOKEN}"
+            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5 --push "$PUSH"
           fi
       - name: 保存信号HTML为构件(Actions页可下载)
         uses: actions/upload-artifact@v4
