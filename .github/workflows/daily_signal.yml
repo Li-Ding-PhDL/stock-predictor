@@ -1,0 +1,51 @@
+name: 每日选股信号推送微信
+
+# 云端定时(GitHub 服务器跑，不用你电脑开机)：每交易日收盘后扫『暴跌抄反弹』买点 + 风险，推送到微信。
+# 需要：仓库 Settings → Secrets and variables → Actions 里新增一个 Secret，名字 PUSHPLUS_TOKEN，值=你在 pushplus.plus 的 token。
+# ⚠ 诚实提示：GitHub 服务器在境外，连 A 股数据(baostock)可能不稳/偶尔失败；失败时会推"数据未更新/命中0只"，据此判断。
+# ⚠ 命中≠推荐买入；研究用途、非投资建议、盈亏自负。
+
+on:
+  schedule:
+    - cron: "35 7 * * 1-5"      # 07:35 UTC = 北京时间 15:35(收盘后)，周一~周五
+  workflow_dispatch: {}          # 支持在 Actions 页手动点「Run workflow」测试
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-signal
+  cancel-in-progress: false
+
+jobs:
+  push-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖(仅计算+baostock+requests)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy scikit-learn requests baostock
+      - name: 更新自选数据到最新(baostock, 免注册; 境外可能失败,不阻断)
+        run: python stock_predictor.py --cli --update-data --global-scope mine
+        continue-on-error: true
+      - name: 扫今日买点+风险并推送微信
+        env:
+          STOCK_LOCAL_DATA_ROOT: ${{ github.workspace }}/data_updated
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          if [ -z "$PUSHPLUS_TOKEN" ]; then
+            echo "未配置 PUSHPLUS_TOKEN Secret，仅生成不推送。去 仓库Settings→Secrets→Actions 添加。"
+            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5
+          else
+            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5 --push "pushplus:${PUSHPLUS_TOKEN}"
+          fi
+      - name: 保存信号HTML为构件(Actions页可下载)
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-signal-html
+          path: 每日信号_*.html
+          if-no-files-found: ignore
