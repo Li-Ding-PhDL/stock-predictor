@@ -8252,6 +8252,7 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_school_tab(), "投资流派视角")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_avoid_tab(), "异动避雷")
+            self.tabs.addTab(self._build_dip_tab(), "暴跌抄反弹")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
             self.tabs.addTab(self._build_paper_trade_tab(), "模拟交易")
@@ -8264,7 +8265,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部", "全局模型(多期限)"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位", "异动避雷"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位", "异动避雷", "暴跌抄反弹"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -12102,6 +12103,95 @@ if HAS_PYSIDE6:
             t.horizontalHeader().setStretchLastSection(True)
             self._oplog(f"异动避雷扫描完成：{len(rows)}只，最高分 {rows[0].get('score') if rows else '-'}。")
 
+        # ---- 9.2.1h4 暴跌抄反弹标签页（用户规则策略：回测 + 今日买点+风险）----
+        def _build_dip_tab(self) -> QWidget:
+            panel = QWidget(); layout = QVBoxLayout(panel)
+            intro = QLabel(
+                "💡 <b>暴跌抄反弹</b>（你的规则）：近 N 日里≥X 天下跌 + 最后一天是涨的(首根阳线) → 买入，持 Y 日卖。"
+                "样本外验证最稳的是 <b>N=10 / X≥8 / 持5日</b>(近10天至少8天跌=极度超卖)。"
+                "<br><span style='color:#c0392b'>⚠ 历史回测有正期望但约4成会亏、样本偏差会高估；命中≠推荐买入，非投资建议、盈亏自负。</span>")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#fef6f6;padding:6px;border-radius:4px")
+            layout.addWidget(intro)
+            box = QGroupBox("参数"); g = QGridLayout(box)
+            g.addWidget(QLabel("股票篮子:"), 0, 0)
+            self.dip_codes = QLineEdit(",".join(list(USER_WATCHLIST_CODES)))
+            g.addWidget(self.dip_codes, 0, 1, 1, 5)
+            g.addWidget(QLabel("N 窗口:"), 1, 0)
+            self.dip_n = QSpinBox(); self.dip_n.setRange(5, 40); self.dip_n.setValue(10); g.addWidget(self.dip_n, 1, 1)
+            g.addWidget(QLabel("X≥跌天:"), 1, 2)
+            self.dip_x = QSpinBox(); self.dip_x.setRange(3, 40); self.dip_x.setValue(8); g.addWidget(self.dip_x, 1, 3)
+            g.addWidget(QLabel("Y 持有:"), 1, 4)
+            self.dip_y = QSpinBox(); self.dip_y.setRange(1, 30); self.dip_y.setValue(5); g.addWidget(self.dip_y, 1, 5)
+            g.addWidget(QLabel("回撤过滤:"), 2, 0)
+            self.dip_drop = QComboBox(); self.dip_drop.addItems(["不过滤", "回撤≥10%", "回撤≥15%", "回撤≥20%"]); g.addWidget(self.dip_drop, 2, 1)
+            g.addWidget(QLabel("月均线:"), 2, 2)
+            self.dip_monthly = QComboBox(); self.dip_monthly.addItems(["不看", "价在月线下方(超卖)", "价在月线上方(趋势)"]); g.addWidget(self.dip_monthly, 2, 3)
+            self.dip_bt_btn = QPushButton("① 回测这套参数"); self.dip_bt_btn.clicked.connect(self._on_dip_backtest); g.addWidget(self.dip_bt_btn, 2, 4)
+            self.dip_scan_btn = QPushButton("② 今日买点+风险"); self.dip_scan_btn.setStyleSheet("font-weight:bold;background:#c0392b;color:white;")
+            self.dip_scan_btn.clicked.connect(self._on_dip_scan); g.addWidget(self.dip_scan_btn, 2, 5)
+            layout.addWidget(box)
+            self.dip_bt_view = QLabel("点「回测」看这套参数的历史胜率/收益；点「今日买点」看现在哪些自选触发+风险。")
+            self.dip_bt_view.setWordWrap(True); self.dip_bt_view.setTextFormat(Qt.RichText)
+            self.dip_bt_view.setStyleSheet("padding:8px 12px;background:#f6f8fb;border:1px solid #dbe1e8;border-radius:8px;font-size:13px")
+            layout.addWidget(self.dip_bt_view)
+            self.dip_table = QTableWidget(); self.dip_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            layout.addWidget(self.dip_table, stretch=1)
+            return panel
+
+        def _dip_params(self):
+            codes = [c.strip() for c in self.dip_codes.text().replace("，", ",").split(",") if c.strip()] or list(USER_WATCHLIST_CODES)
+            drop = {0: 0.0, 1: -0.10, 2: -0.15, 3: -0.20}[self.dip_drop.currentIndex()]
+            monthly = {0: "off", 1: "below", 2: "above"}[self.dip_monthly.currentIndex()]
+            return codes, int(self.dip_n.value()), int(self.dip_x.value()), int(self.dip_y.value()), drop, monthly
+
+        def _on_dip_backtest(self):
+            codes, N, X, Y, drop, monthly = self._dip_params()
+            self.dip_bt_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.WaitCursor); QApplication.processEvents()
+            try:
+                r = dip_bounce_backtest(codes=codes, n_win=N, x_down=X, y_hold=Y, drop_pct=drop, monthly=monthly, progress_cb=self._log)
+            finally:
+                QApplication.restoreOverrideCursor(); self.dip_bt_btn.setEnabled(True)
+            if r.get("n_trades", 0) == 0:
+                self.dip_bt_view.setText("该参数下历史无触发，换宽松点的参数试试。"); return
+            col = "#1a7f37" if r["net_per_trade_pct"] > 0 else "#c0392b"
+            self.dip_bt_view.setText(
+                f"<b>回测：近{N}日≥{X}跌+末日涨→持{Y}日</b>"
+                + (f"（回撤≥{-drop*100:.0f}%）" if drop < 0 else "") + (f"（月线{monthly}）" if monthly != 'off' else "") + "<br>"
+                f"触发 <b>{r['n_trades']}</b> 笔｜胜率 <b>{r['win_pct']}%</b>(赚{r['n_win']}/亏{r['n_loss']})｜"
+                f"每笔净 <b style='color:{col}'>{r['net_per_trade_pct']:+.2f}%</b>｜中位 {r['median_pct']:+.2f}%<br>"
+                f"赚的平均 <span style='color:#c0392b'>{r['avg_win_pct']:+.2f}%</span> / 亏的平均 <span style='color:#1a7f37'>{r['avg_loss_pct']:+.2f}%</span>｜"
+                f"最好 {r['best_pct']:+.0f}% / 最差 {r['worst_pct']:+.0f}%<br>"
+                f"<span style='color:#555'>对比基准(随便买持{Y}日)：胜率 {r['base_win_pct']}% / 每笔净 {r['base_net_per_trade_pct']:+.2f}%。"
+                f"⚠ 样本偏差会高估、约4成会亏、非投资建议。</span>")
+            self.dip_table.setRowCount(0); self.dip_table.setColumnCount(0)
+            self._oplog(f"暴跌抄反弹回测：N={N}/X={X}/Y={Y} → {r['n_trades']}笔 胜率{r['win_pct']}% 净{r['net_per_trade_pct']:+.2f}%")
+
+        def _on_dip_scan(self):
+            codes, N, X, Y, drop, monthly = self._dip_params()
+            self.dip_scan_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._prog_open("⏳ 扫今日买点 + 公司/交易风险 …"); QApplication.processEvents()
+            try:
+                r = dip_daily_report(codes=codes, n_win=N, x_down=X, y_hold=Y, drop_pct=drop, monthly=monthly,
+                                     out_html=os.path.join(BASE_DIR, f"每日信号_{time.strftime('%Y%m%d')}.html"),
+                                     progress_cb=self._log)
+            finally:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.dip_scan_btn.setEnabled(True)
+            hits = r["hits"]
+            self.dip_bt_view.setText(f"<b>今日买点（截至 {r['as_of']}）：命中 {len(hits)} 只</b>　"
+                                     f"<span style='color:#555'>手机友好HTML已存：{os.path.basename(r['out_html'])}（可发到手机看）。命中≠推荐买入。</span>")
+            cols = ["代码", "名称", "收盘", "近N日跌", "回撤%", "当日%", "风险等级", "风险提示"]
+            t = self.dip_table; t.setColumnCount(len(cols)); t.setHorizontalHeaderLabels(cols); t.setRowCount(len(hits))
+            for i, h in enumerate(hits):
+                rs = h.get("risk_score"); rc = QColor("#fdecea") if (isinstance(rs, (int, float)) and rs >= 60) else (QColor("#fcf3e2") if (isinstance(rs, (int, float)) and rs >= 35) else QColor("#eef7f0"))
+                vals = [h["code"], h["name"], h["close"], h["down_days"], f"{h['drawdown_pct']:+.0f}", f"{h['last_ret_pct']:+.1f}",
+                        h.get("risk_level", "?"), "；".join(h.get("risk_reasons", [])[:3]) or "无明显异动"]
+                for j, v in enumerate(vals):
+                    it = QTableWidgetItem(str(v)); it.setBackground(rc); t.setItem(i, j, it)
+            t.resizeColumnsToContents(); t.horizontalHeader().setStretchLastSection(True)
+            if not hits:
+                self.dip_bt_view.setText(f"今日（{r['as_of']}）无股票触发该买点。手机HTML已存：{os.path.basename(r['out_html'])}")
+            self._oplog(f"暴跌抄反弹今日扫描：命中{len(hits)}只 → {r['out_html']}")
+
         def _on_montecarlo(self):
             try:
                 p = float(self.mc_p.text()); rr = float(self.mc_rr.text())
@@ -15516,7 +15606,7 @@ def _dip_load(code: str, root: str):
     return df["date"].values, cl, ret, prev_ma, name
 
 
-def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 15, x_down: int = 10,
+def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
                         y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
                         cost_bps: float = 15.0, root: Optional[str] = None,
                         progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
@@ -15568,7 +15658,7 @@ def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 15, x_do
         "disclaimer": "研究性回测，非投资建议、不荐股、盈亏自负；数据非实时。"}
 
 
-def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 15, x_down: int = 10,
+def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
                     drop_pct: float = 0.0, monthly: str = "off", root: Optional[str] = None,
                     progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """今日买点扫描：一批股票里，哪些在『最新一根K』正好触发买点(近n_win日≥x_down跌+末日涨+可选过滤)。
@@ -15597,6 +15687,103 @@ def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 15, x_down: 
             "params": {"n_win": n_win, "x_down": x_down, "drop_pct": drop_pct, "monthly": monthly},
             "note": "命中=最新一根K符合『暴跌后首阳』买点规则，≠推荐买入。买卖自行判断。",
             "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
+
+
+def _push_message(spec: str, title: str, text: str) -> str:
+    """把一段文本推到手机(用户自备的免费推送服务)。spec 形如:
+      'pushplus:TOKEN'  → 微信(pushplus.plus)  ; 'serverchan:SENDKEY' → 微信(方糖 sct.ftqq.com)
+      'https://...'     → 通用/企业微信群机器人 webhook(POST markdown)。
+    只 POST 到用户显式给的地址，绝不内置任何 token。失败返回原因字符串。"""
+    try:
+        import requests as _rq
+    except Exception:
+        return "未安装 requests，无法推送"
+    try:
+        if spec.startswith("pushplus:"):
+            tok = spec.split(":", 1)[1]
+            r = _rq.post("https://www.pushplus.plus/send", json={
+                "token": tok, "title": title, "content": text.replace("\n", "<br>"), "template": "html"}, timeout=15)
+            return f"pushplus: {r.status_code} {r.text[:80]}"
+        if spec.startswith("serverchan:"):
+            key = spec.split(":", 1)[1]
+            r = _rq.post(f"https://sctapi.ftqq.com/{key}.send", data={"title": title, "desp": text}, timeout=15)
+            return f"serverchan: {r.status_code}"
+        if spec.startswith("http"):
+            # 企业微信/钉钉群机器人等：发 markdown；失败再试纯文本
+            try:
+                r = _rq.post(spec, json={"msgtype": "markdown", "markdown": {"content": f"## {title}\n{text}"}}, timeout=15)
+            except Exception:
+                r = _rq.post(spec, json={"title": title, "content": text}, timeout=15)
+            return f"webhook: {r.status_code}"
+        return f"未知推送方式: {spec[:20]}"
+    except Exception as e:
+        return f"推送失败: {str(e)[:100]}"
+
+
+def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
+                     y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
+                     out_html: Optional[str] = None, push: Optional[str] = None,
+                     root: Optional[str] = None, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """每日信号：扫出符合『暴跌抄反弹』买点的股票 + 给每只附上**公司/交易风险提示**(ST/亏损/异动等)，
+    产出**手机友好 HTML**，并可选推送到手机(push=用户自备的 pushplus/serverchan/webhook)。研究用途、非投资建议。"""
+    log = progress_cb or (lambda m: None)
+    root = root or StockDataFetcher._resolve_local_root()
+    scan = dip_bounce_scan(codes=codes, n_win=n_win, x_down=x_down, drop_pct=drop_pct,
+                           monthly=monthly, root=root, progress_cb=log)
+    # 给每个命中附风险(复用异动/避雷诊断：ST/亏损/异动分/闪崩等)
+    for h in scan["hits"]:
+        try:
+            df, _ = _mh_load_local_rich(h["code"], root)
+            rr = _anomaly_risk_one(df, h.get("name", "")) if df is not None else {"score": None, "level": "?", "reasons": []}
+        except Exception:
+            rr = {"score": None, "level": "?", "reasons": []}
+        h["risk_score"] = rr.get("score"); h["risk_level"] = rr.get("level")
+        h["risk_reasons"] = rr.get("reasons", [])
+    hits = scan["hits"]; as_of = scan["as_of"]
+    # 文本(推送用)
+    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}",
+             f"规则: 近{n_win}日≥{x_down}天跌+末日涨→持{y_hold}日 | 命中 {len(hits)} 只"]
+    for h in hits:
+        lines.append(f"· {h['code']} {h['name']} 收{h['close']} 近{n_win}日跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
+                     f" | 风险:{h.get('risk_level','?')}({'；'.join(h.get('risk_reasons',[])[:2]) or '无明显异动'})")
+    if not hits:
+        lines.append("· 今日无股票触发该买点。")
+    lines.append("⚠ 命中≠推荐买入；风险提示仅供参考。研究用途、非投资建议、盈亏自负。")
+    text = "\n".join(lines)
+    # 手机友好 HTML(窄屏自适应)
+    cards = ""
+    for h in hits:
+        rl = h.get("risk_level", "?"); rc = "#c0392b" if (isinstance(h.get("risk_score"), (int, float)) and h["risk_score"] >= 60) else ("#b9720d" if (isinstance(h.get("risk_score"), (int, float)) and h["risk_score"] >= 35) else "#1a7f37")
+        cards += (f'<div class="c"><div class="h"><b>{h["code"]} {h["name"]}</b> <span class="px">收 {h["close"]}</span></div>'
+                  f'<div class="m">近{n_win}日跌 <b>{h["down_days"]}</b> 天 · 回撤 <b>{h["drawdown_pct"]:+.0f}%</b> · 当日 <b style="color:#c0392b">{h["last_ret_pct"]:+.1f}%</b></div>'
+                  f'<div class="r" style="color:{rc}">风险：{rl}｜{("；".join(h.get("risk_reasons", [])[:3]) or "无明显异动")}</div></div>')
+    if not hits:
+        cards = '<div class="c" style="text-align:center;color:#888">今日无股票触发该买点。</div>'
+    html = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>每日信号 {as_of}</title>
+<style>:root{{color-scheme:light dark}}body{{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#17212b}}
+@media(prefers-color-scheme:dark){{body{{background:#10161d;color:#e7edf3}}.c{{background:#182029!important;border-color:#2b3946!important}}}}
+.wrap{{max-width:560px;margin:0 auto;padding:16px}}.hd{{font-size:18px;font-weight:800;margin:4px 0}}
+.sub{{font-size:13px;color:#54626f;margin-bottom:10px}}.c{{background:#fff;border:1px solid #dbe1e8;border-radius:12px;padding:12px 14px;margin:10px 0}}
+.h{{font-size:16px}}.px{{float:right;color:#c0392b;font-weight:700}}.m{{font-size:13px;color:#54626f;margin:5px 0}}.r{{font-size:12px;margin-top:4px}}
+.disc{{font-size:12px;color:#8a3b34;background:#fff6f6;border-radius:10px;padding:10px 12px;margin-top:14px}}</style></head><body><div class="wrap">
+<div class="hd">📉 暴跌抄反弹 · 每日买点信号</div>
+<div class="sub">截至 {as_of} ｜ 规则：近{n_win}日≥{x_down}天跌 + 末日涨 → 持{y_hold}日 ｜ 命中 <b>{len(hits)}</b> 只</div>
+{cards}
+<div class="disc">⚠ 命中=最新K符合该机械规则，<b>≠推荐买入</b>；风险提示(ST/亏损/异动等)仅供参考、非全面尽调。历史回测有正期望但约4成会亏、样本偏差会高估。<b>研究用途，非投资建议，不荐股，盈亏自负。</b></div>
+</div></body></html>'''
+    if out_html:
+        try:
+            open(out_html, "w", encoding="utf-8").write(html); log(f"HTML 已写: {out_html}")
+        except Exception as e:
+            log(f"写 HTML 失败: {e}")
+    push_result = None
+    if push:
+        push_result = _push_message(push, f"暴跌抄反弹信号 {as_of}·命中{len(hits)}只", text)
+        log(f"推送结果: {push_result}")
+    return {"as_of": as_of, "hits": hits, "text": text, "out_html": out_html,
+            "push_result": push_result, "params": {"n_win": n_win, "x_down": x_down, "y_hold": y_hold,
+            "drop_pct": drop_pct, "monthly": monthly}, "disclaimer": scan["disclaimer"]}
 
 
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
@@ -15974,12 +16161,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="『暴跌抄反弹』回测：近N日≥X跌+末日涨(+可选回撤/月线)→持Y日卖，报胜率/净收益。配 --dip-* 参数")
     p.add_argument("--dip-scan", action="store_true",
                    help="『暴跌抄反弹』今日买点扫描：哪些股票最新一根K符合该买点规则(命中≠推荐)")
-    p.add_argument("--dip-n", type=int, default=15, help="窗口天数 N(默认15)")
-    p.add_argument("--dip-x", type=int, default=10, help="窗口内至少下跌天数 X(默认10)")
+    p.add_argument("--dip-n", type=int, default=10, help="窗口天数 N(默认10，样本外验证最稳)")
+    p.add_argument("--dip-x", type=int, default=8, help="窗口内至少下跌天数 X(默认8，即近10天≥8天跌=极度超卖)")
     p.add_argument("--dip-y", type=int, default=5, help="持有天数 Y(默认5)")
     p.add_argument("--dip-drop", type=float, default=0.0, help="回撤过滤%(如 -15 表示需回撤≥15%%；0=不过滤)")
     p.add_argument("--dip-monthly", choices=["off", "below", "above"], default="off",
                    help="月均线过滤：off不看/below价在月均线下方(超卖,推荐)/above价在上方")
+    p.add_argument("--dip-daily", action="store_true",
+                   help="每日信号：扫今日买点 + 附公司/交易风险 → 生成手机友好 HTML，可选推送到手机")
+    p.add_argument("--dip-html", type=str, default="", help="每日信号 HTML 输出路径(配 --dip-daily)")
+    p.add_argument("--push", type=str, default="",
+                   help="推送到手机(自备免费服务)：'pushplus:你的TOKEN' / 'serverchan:你的SENDKEY' / 'https://群机器人webhook'")
     p.add_argument("--vote", action="store_true",
                    help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
     p.add_argument("--vote-backtest", action="store_true",
@@ -16286,6 +16478,21 @@ def main():
             print(f"{x['code']:>9}{str(x.get('name',''))[:6]:>9}{str(sc):>8}   {x['level']}｜" + "；".join(x["reasons"][:3]))
         print("=" * 70)
         print("⚠ " + r["disclaimer"])
+        return
+
+    # --dip-daily：每日信号(买点+风险) → 手机HTML + 可选推送
+    if args.dip_daily:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        dp = args.dip_drop / 100.0 if args.dip_drop else 0.0
+        out = args.dip_html or os.path.join(BASE_DIR, f"每日信号_{time.strftime('%Y%m%d')}.html")
+        r = dip_daily_report(codes=codes, n_win=args.dip_n, x_down=args.dip_x, y_hold=args.dip_y,
+                             drop_pct=dp, monthly=args.dip_monthly, out_html=out,
+                             push=(args.push or None), progress_cb=lambda m: None)
+        print(r["text"])
+        print(f"\n手机友好HTML: {out}" + (f" | 推送: {r['push_result']}" if r.get("push_result") else ""))
         return
 
     # --dip-backtest / --dip-scan：『暴跌抄反弹』规则策略
