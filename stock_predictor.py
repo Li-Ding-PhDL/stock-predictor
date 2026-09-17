@@ -12173,10 +12173,10 @@ if HAS_PYSIDE6:
             try:
                 r = dip_daily_report(codes=codes, n_win=N, x_down=X, y_hold=Y, drop_pct=drop, monthly=monthly,
                                      out_html=os.path.join(BASE_DIR, f"每日信号_{time.strftime('%Y%m%d')}.html"),
-                                     progress_cb=self._log)
+                                     with_news=True, progress_cb=self._log)
             finally:
                 QApplication.restoreOverrideCursor(); self._prog_close(); self.dip_scan_btn.setEnabled(True)
-            hits = r["hits"]
+            hits = r["sections"][0]["hits"] if r.get("sections") else []
             self.dip_bt_view.setText(f"<b>今日买点（截至 {r['as_of']}）：命中 {len(hits)} 只</b>　"
                                      f"<span style='color:#555'>手机友好HTML已存：{os.path.basename(r['out_html'])}（可发到手机看）。命中≠推荐买入。</span>")
             cols = ["代码", "名称", "收盘", "近N日跌", "回撤%", "当日%", "风险等级", "风险提示"]
@@ -12184,7 +12184,7 @@ if HAS_PYSIDE6:
             for i, h in enumerate(hits):
                 rs = h.get("risk_score"); rc = QColor("#fdecea") if (isinstance(rs, (int, float)) and rs >= 60) else (QColor("#fcf3e2") if (isinstance(rs, (int, float)) and rs >= 35) else QColor("#eef7f0"))
                 vals = [h["code"], h["name"], h["close"], h["down_days"], f"{h['drawdown_pct']:+.0f}", f"{h['last_ret_pct']:+.1f}",
-                        h.get("risk_level", "?"), "；".join(h.get("risk_reasons", [])[:3]) or "无明显异动"]
+                        h.get("risk_level", "?"), "；".join(h.get("risk_tags", [])[:4]) or "无明显异动"]
                 for j, v in enumerate(vals):
                     it = QTableWidgetItem(str(v)); it.setBackground(rc); t.setItem(i, j, it)
             t.resizeColumnsToContents(); t.horizontalHeader().setStretchLastSection(True)
@@ -15720,57 +15720,133 @@ def _push_message(spec: str, title: str, text: str) -> str:
         return f"推送失败: {str(e)[:100]}"
 
 
+_NEWS_RISK_WORDS = ["立案", "退市", "终止上市", "财务造假", "资不抵债", "债务违约", "爆雷", "违约",
+                    "减持", "质押", "冻结", "预亏", "巨亏", "亏损", "商誉", "问询", "关注函",
+                    "处罚", "被查", "违规", "诉讼", "停牌", "破产", "重整", "暴雷"]
+
+
+def _stock_risk_brief(df, code: str, name: str = "", with_news: bool = False) -> Dict[str, Any]:
+    """给一只股票的『公司/交易风险』摘要：异动/避雷(ST/亏损/异动/闪崩) + 财务红旗(亏损/高估/高负债代理)
+    + 尽力抓的近期新闻风险词(立案/退市/减持/商誉…；联网、失败自动跳过)。研究提示、非尽调、非投资建议。"""
+    tags = []; level = "?"; score = None
+    try:
+        rr = _anomaly_risk_one(df, name)
+        level = rr.get("level", "?"); score = rr.get("score")
+        tags += list(rr.get("reasons", []))
+    except Exception:
+        pass
+    # 财务红旗(本地 CSV 即有，云端可靠)
+    try:
+        last = df.iloc[-1]
+        pe = float(last.get("pe_ttm")) if pd.notna(last.get("pe_ttm")) else None
+        pb = float(last.get("pb")) if pd.notna(last.get("pb")) else None
+        if pe is not None and pe <= 0 and "亏损" not in "".join(tags) and "市盈率为负" not in "".join(tags):
+            tags.append("亏损(PE<0)")
+        elif pe is not None and pe >= 150:
+            tags.append(f"估值高(PE={pe:.0f})")
+        if pb is not None and pb >= 10:
+            tags.append(f"市净率高(PB={pb:.0f})")
+    except Exception:
+        pass
+    # 近期新闻风险词(尽力而为：联网抓标题→匹配关键词；境外/限流失败就跳过)
+    news_hits = []
+    if with_news:
+        try:
+            nd = StockDataFetcher.fetch_news(code, limit=12)
+            if nd is not None and "title" in nd.columns and len(nd):
+                blob = " ".join(str(t) for t in nd["title"].head(12).tolist())
+                for w in _NEWS_RISK_WORDS:
+                    if w in blob and w not in news_hits:
+                        news_hits.append(w)
+        except Exception:
+            pass
+    if news_hits:
+        tags.append("新闻:" + "/".join(news_hits[:4]))
+    # 去重保序
+    seen = set(); uniq = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t); uniq.append(t)
+    return {"level": level, "score": score, "tags": uniq, "news_hits": news_hits}
+
+
 def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
                      y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
                      out_html: Optional[str] = None, push: Optional[str] = None,
+                     with_news: bool = False, presets: Optional[List[Dict[str, Any]]] = None,
                      root: Optional[str] = None, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """每日信号：扫出符合『暴跌抄反弹』买点的股票 + 给每只附上**公司/交易风险提示**(ST/亏损/异动等)，
     产出**手机友好 HTML**，并可选推送到手机(push=用户自备的 pushplus/serverchan/webhook)。研究用途、非投资建议。"""
     log = progress_cb or (lambda m: None)
     root = root or StockDataFetcher._resolve_local_root()
-    scan = dip_bounce_scan(codes=codes, n_win=n_win, x_down=x_down, drop_pct=drop_pct,
-                           monthly=monthly, root=root, progress_cb=log)
-    # 给每个命中附风险(复用异动/避雷诊断：ST/亏损/异动分/闪崩等)
-    for h in scan["hits"]:
+    # 默认单套；presets 给多套则一条消息里分区推(省推送额度)
+    if not presets:
+        presets = [{"label": "默认", "n_win": n_win, "x_down": x_down, "y_hold": y_hold,
+                    "drop_pct": drop_pct, "monthly": monthly}]
+    _rcache = {}   # 同一股票的风险只算一次(多套策略共用)
+
+    def _risk_of(code, name):
+        if code in _rcache:
+            return _rcache[code]
         try:
-            df, _ = _mh_load_local_rich(h["code"], root)
-            rr = _anomaly_risk_one(df, h.get("name", "")) if df is not None else {"score": None, "level": "?", "reasons": []}
+            df, _ = _mh_load_local_rich(code, root)
+            rr = _stock_risk_brief(df, code, name, with_news=with_news) if df is not None else {"level": "?", "score": None, "tags": []}
         except Exception:
-            rr = {"score": None, "level": "?", "reasons": []}
-        h["risk_score"] = rr.get("score"); h["risk_level"] = rr.get("level")
-        h["risk_reasons"] = rr.get("reasons", [])
-    hits = scan["hits"]; as_of = scan["as_of"]
+            rr = {"level": "?", "score": None, "tags": []}
+        _rcache[code] = rr
+        return rr
+
+    as_of = None; sections = []; total_hits = 0
+    _mon_lab = {"off": "", "below": "+月线下方", "above": "+月线上方"}
+    for ps in presets:
+        pn, px, py = ps["n_win"], ps["x_down"], ps["y_hold"]
+        pdrop = ps.get("drop_pct", 0.0); pmon = ps.get("monthly", "off")
+        scan = dip_bounce_scan(codes=codes, n_win=pn, x_down=px, drop_pct=pdrop, monthly=pmon, root=root, progress_cb=log)
+        if scan["as_of"]:
+            as_of = scan["as_of"]
+        for h in scan["hits"]:
+            rr = _risk_of(h["code"], h.get("name", ""))
+            h["risk_level"] = rr.get("level"); h["risk_score"] = rr.get("score"); h["risk_tags"] = rr.get("tags", [])
+        total_hits += len(scan["hits"])
+        rule = f"近{pn}日≥{px}跌{('+回撤≥%d%%' % int(-pdrop*100)) if pdrop < 0 else ''}{_mon_lab.get(pmon,'')}+末日涨→持{py}日"
+        sections.append({"label": ps.get("label", "策略"), "rule": rule, "hits": scan["hits"]})
+
     # 文本(推送用)
-    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}",
-             f"规则: 近{n_win}日≥{x_down}天跌+末日涨→持{y_hold}日 | 命中 {len(hits)} 只"]
-    for h in hits:
-        lines.append(f"· {h['code']} {h['name']} 收{h['close']} 近{n_win}日跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
-                     f" | 风险:{h.get('risk_level','?')}({'；'.join(h.get('risk_reasons',[])[:2]) or '无明显异动'})")
-    if not hits:
-        lines.append("· 今日无股票触发该买点。")
-    lines.append("⚠ 命中≠推荐买入；风险提示仅供参考。研究用途、非投资建议、盈亏自负。")
+    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}"]
+    for sec in sections:
+        lines.append(f"— [{sec['label']}] {sec['rule']} | 命中 {len(sec['hits'])} 只")
+        for h in sec["hits"]:
+            lines.append(f"· {h['code']} {h['name']} 收{h['close']} 跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
+                         f" | 风险:{h.get('risk_level','?')}({'；'.join(h.get('risk_tags', [])[:3]) or '无明显异动'})")
+        if not sec["hits"]:
+            lines.append("· 今日无触发。")
+    lines.append("⚠ 命中≠推荐买入；风险提示(异动/财务/新闻)仅供参考、非尽调。研究用途、非投资建议、盈亏自负。")
     text = "\n".join(lines)
     # 手机友好 HTML(窄屏自适应)
-    cards = ""
-    for h in hits:
-        rl = h.get("risk_level", "?"); rc = "#c0392b" if (isinstance(h.get("risk_score"), (int, float)) and h["risk_score"] >= 60) else ("#b9720d" if (isinstance(h.get("risk_score"), (int, float)) and h["risk_score"] >= 35) else "#1a7f37")
-        cards += (f'<div class="c"><div class="h"><b>{h["code"]} {h["name"]}</b> <span class="px">收 {h["close"]}</span></div>'
-                  f'<div class="m">近{n_win}日跌 <b>{h["down_days"]}</b> 天 · 回撤 <b>{h["drawdown_pct"]:+.0f}%</b> · 当日 <b style="color:#c0392b">{h["last_ret_pct"]:+.1f}%</b></div>'
-                  f'<div class="r" style="color:{rc}">风险：{rl}｜{("；".join(h.get("risk_reasons", [])[:3]) or "无明显异动")}</div></div>')
-    if not hits:
-        cards = '<div class="c" style="text-align:center;color:#888">今日无股票触发该买点。</div>'
+    sec_html = ""
+    for sec in sections:
+        cards = ""
+        for h in sec["hits"]:
+            sc = h.get("risk_score"); rc = "#c0392b" if (isinstance(sc, (int, float)) and sc >= 60) else ("#b9720d" if (isinstance(sc, (int, float)) and sc >= 35) else "#1a7f37")
+            cards += (f'<div class="c"><div class="h"><b>{h["code"]} {h["name"]}</b> <span class="px">收 {h["close"]}</span></div>'
+                      f'<div class="m">近{sec["rule"]}｜跌 <b>{h["down_days"]}</b> 天 · 回撤 <b>{h["drawdown_pct"]:+.0f}%</b> · 当日 <b style="color:#c0392b">{h["last_ret_pct"]:+.1f}%</b></div>'
+                      f'<div class="r" style="color:{rc}">风险：{h.get("risk_level","?")}｜{("；".join(h.get("risk_tags", [])[:4]) or "无明显异动")}</div></div>')
+        if not sec["hits"]:
+            cards = '<div class="c" style="text-align:center;color:#888">今日无触发。</div>'
+        sec_html += f'<div class="sech">【{sec["label"]}】{sec["rule"]}｜命中 {len(sec["hits"])} 只</div>{cards}'
     html = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>每日信号 {as_of}</title>
 <style>:root{{color-scheme:light dark}}body{{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#17212b}}
 @media(prefers-color-scheme:dark){{body{{background:#10161d;color:#e7edf3}}.c{{background:#182029!important;border-color:#2b3946!important}}}}
 .wrap{{max-width:560px;margin:0 auto;padding:16px}}.hd{{font-size:18px;font-weight:800;margin:4px 0}}
-.sub{{font-size:13px;color:#54626f;margin-bottom:10px}}.c{{background:#fff;border:1px solid #dbe1e8;border-radius:12px;padding:12px 14px;margin:10px 0}}
-.h{{font-size:16px}}.px{{float:right;color:#c0392b;font-weight:700}}.m{{font-size:13px;color:#54626f;margin:5px 0}}.r{{font-size:12px;margin-top:4px}}
+.sub{{font-size:13px;color:#54626f;margin-bottom:10px}}.sech{{font-size:14px;font-weight:700;margin:14px 0 4px;color:#2c6fbb}}
+.c{{background:#fff;border:1px solid #dbe1e8;border-radius:12px;padding:12px 14px;margin:8px 0}}
+.h{{font-size:16px}}.px{{float:right;color:#c0392b;font-weight:700}}.m{{font-size:12px;color:#54626f;margin:5px 0}}.r{{font-size:12px;margin-top:4px}}
 .disc{{font-size:12px;color:#8a3b34;background:#fff6f6;border-radius:10px;padding:10px 12px;margin-top:14px}}</style></head><body><div class="wrap">
 <div class="hd">📉 暴跌抄反弹 · 每日买点信号</div>
-<div class="sub">截至 {as_of} ｜ 规则：近{n_win}日≥{x_down}天跌 + 末日涨 → 持{y_hold}日 ｜ 命中 <b>{len(hits)}</b> 只</div>
-{cards}
-<div class="disc">⚠ 命中=最新K符合该机械规则，<b>≠推荐买入</b>；风险提示(ST/亏损/异动等)仅供参考、非全面尽调。历史回测有正期望但约4成会亏、样本偏差会高估。<b>研究用途，非投资建议，不荐股，盈亏自负。</b></div>
+<div class="sub">截至 {as_of} ｜ {len(sections)} 套策略 ｜ 合计命中 <b>{total_hits}</b> 次</div>
+{sec_html}
+<div class="disc">⚠ 命中=最新K符合该机械规则，<b>≠推荐买入</b>；风险提示(异动/财务/新闻)仅供参考、非全面尽调。历史回测有正期望但约4成会亏、样本偏差会高估。<b>研究用途，非投资建议，不荐股，盈亏自负。</b></div>
 </div></body></html>'''
     if out_html:
         try:
@@ -15779,11 +15855,11 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
             log(f"写 HTML 失败: {e}")
     push_result = None
     if push:
-        push_result = _push_message(push, f"暴跌抄反弹信号 {as_of}·命中{len(hits)}只", text)
+        push_result = _push_message(push, f"暴跌抄反弹信号 {as_of}·合计命中{total_hits}次", text)
         log(f"推送结果: {push_result}")
-    return {"as_of": as_of, "hits": hits, "text": text, "out_html": out_html,
-            "push_result": push_result, "params": {"n_win": n_win, "x_down": x_down, "y_hold": y_hold,
-            "drop_pct": drop_pct, "monthly": monthly}, "disclaimer": scan["disclaimer"]}
+    return {"as_of": as_of, "sections": sections, "total_hits": total_hits, "text": text,
+            "out_html": out_html, "push_result": push_result,
+            "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
 
 
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
@@ -16172,6 +16248,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dip-html", type=str, default="", help="每日信号 HTML 输出路径(配 --dip-daily)")
     p.add_argument("--push", type=str, default="",
                    help="推送到手机(自备免费服务)：'pushplus:你的TOKEN' / 'serverchan:你的SENDKEY' / 'https://群机器人webhook'")
+    p.add_argument("--dip-news", action="store_true",
+                   help="每日信号里附『近期新闻风险词』(立案/退市/减持/商誉…；联网尽力抓,失败自动跳过)")
+    p.add_argument("--dip-multi", action="store_true",
+                   help="每日信号跑多套策略(稳健10/8/5 + 深跌15/10/5+回撤15%%+月线下方)，一条消息分区推")
     p.add_argument("--vote", action="store_true",
                    help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
     p.add_argument("--vote-backtest", action="store_true",
@@ -16488,9 +16568,14 @@ def main():
                   else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         dp = args.dip_drop / 100.0 if args.dip_drop else 0.0
         out = args.dip_html or os.path.join(BASE_DIR, f"每日信号_{time.strftime('%Y%m%d')}.html")
+        presets = None
+        if args.dip_multi:
+            presets = [{"label": "稳健", "n_win": 10, "x_down": 8, "y_hold": 5, "drop_pct": 0.0, "monthly": "off"},
+                       {"label": "深跌超卖", "n_win": 15, "x_down": 10, "y_hold": 5, "drop_pct": -0.15, "monthly": "below"}]
         r = dip_daily_report(codes=codes, n_win=args.dip_n, x_down=args.dip_x, y_hold=args.dip_y,
                              drop_pct=dp, monthly=args.dip_monthly, out_html=out,
-                             push=(args.push or None), progress_cb=lambda m: None)
+                             push=(args.push or None), with_news=args.dip_news, presets=presets,
+                             progress_cb=lambda m: None)
         print(r["text"])
         print(f"\n手机友好HTML: {out}" + (f" | 推送: {r['push_result']}" if r.get("push_result") else ""))
         return

@@ -44,9 +44,9 @@ jobs:
           if [ -z "$PUSH" ] && [ -n "$PUSHPLUS_TOKEN" ]; then PUSH="pushplus:${PUSHPLUS_TOKEN}"; fi
           if [ -z "$PUSH" ]; then
             echo "未配置推送 Secret(PUSH_SPEC 或 PUSHPLUS_TOKEN)，仅生成HTML不推送。"
-            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5
+            python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine
           else
-            python stock_predictor.py --cli --dip-daily --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5 --push "$PUSH"
+            python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine --push "$PUSH"
           fi
       - name: 保存信号HTML为构件(Actions页可下载)
         uses: actions/upload-artifact@v4
