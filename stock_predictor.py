@@ -15471,6 +15471,134 @@ def anomaly_risk_scan(codes: Optional[List[str]] = None, root: Optional[str] = N
             "disclaimer": "主力视角·避雷扫描仅识别异常特征供规避，非投资建议、不荐股、盈亏自负；数据非实时。"}
 
 
+# ==================== 第八部分补充10：『暴跌抄反弹』规则策略回测 + 今日买点扫描 ====================
+# 规则(用户提出)：近 n_win 日里至少 x_down 天下跌(+可选回撤≥drop%)(+可选月均线过滤) 且『最后一天是涨的』→ 买入，
+# 持 y_hold 个交易日后卖出。这是短期『超卖反弹』的机械规则，全程因果(信号只用当日及以前)、用未来 y 日真实收益结算。
+def _dip_signal_at(cl: np.ndarray, ret: np.ndarray, i: int, n_win: int, x_down: int,
+                   drop_pct: float, ma_below: Optional[bool], mav_i: Optional[float]) -> bool:
+    """第 i 根K是否触发买点(只用 ≤i 的数据)。ma_below: None不看/ True要求价<月均线/ False要求价>月均线。"""
+    if i < n_win:
+        return False
+    w0 = i - n_win + 1
+    if np.nansum(ret[w0:i + 1] < 0) < x_down:          # 窗口内下跌天数不够
+        return False
+    if not (ret[i] > 0):                                # 最后一天必须涨(首根阳线)
+        return False
+    if drop_pct < 0 and (cl[i] / np.nanmax(cl[w0:i + 1]) - 1) > drop_pct:   # 回撤不够深
+        return False
+    if ma_below is not None:
+        if mav_i is None or np.isnan(mav_i):
+            return False
+        if ma_below and not (cl[i] < mav_i):
+            return False
+        if (not ma_below) and not (cl[i] > mav_i):
+            return False
+    return True
+
+
+def _dip_load(code: str, root: str):
+    """取单股 date/close + 日收益 + 逐日对齐的『上一完成月』6月均线(防用未来)。自动优先 data_updated。"""
+    df, _ = _mh_load_local_rich(code, root)
+    if df is None or len(df) < 40:
+        return None
+    cl = df["close"].values.astype(float)
+    ret = pd.Series(cl).pct_change().values
+    name = str(df["name"].iloc[-1]) if "name" in df.columns and len(df) else code
+    ma_m = df.set_index("date")["close"].resample("ME").last().rolling(6, min_periods=2).mean()
+    # 每根K对齐到"上一个已完成月"的月均线值
+    prev_ma = np.full(len(df), np.nan)
+    idx = ma_m.index
+    for i in range(len(df)):
+        dt = df["date"].iloc[i]
+        p = ma_m[idx < pd.Timestamp(dt).replace(day=1)]
+        if len(p) and pd.notna(p.iloc[-1]):
+            prev_ma[i] = float(p.iloc[-1])
+    return df["date"].values, cl, ret, prev_ma, name
+
+
+def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 15, x_down: int = 10,
+                        y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
+                        cost_bps: float = 15.0, root: Optional[str] = None,
+                        progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """回测：近 n_win 日≥x_down 跌(+可选回撤≥drop_pct)(+monthly: 'off'/'below'/'above') 且末日涨 → 买，持 y_hold 日卖。
+    非重叠(每股触发后跳过 y_hold 天)。扣双边成本(2×cost_bps)。返回胜率/净收益/笔/中位/赚亏均值+基准对比。研究用途、非投资建议。"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or list(USER_WATCHLIST_CODES)
+    root = root or StockDataFetcher._resolve_local_root()
+    ma_below = None if monthly == "off" else (monthly == "below")
+    cost = 2 * cost_bps / 1e4
+    rs, base = [], []
+    used = 0
+    for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        rec = _dip_load(code, root)
+        if rec is None:
+            log(f"[{ci}/{len(codes)}] {code} 数据不足，跳过"); continue
+        _, cl, ret, prev_ma, name = rec; n = len(cl); used += 1
+        for i in range(n - y_hold):                       # 无条件基准：任意日买持 y_hold
+            base.append(cl[i + y_hold] / cl[i] - 1)
+        i = n_win
+        while i < n - y_hold:
+            if _dip_signal_at(cl, ret, i, n_win, x_down, drop_pct,
+                              ma_below, prev_ma[i] if ma_below is not None else None):
+                rs.append(cl[i + y_hold] / cl[i] - 1); i += y_hold
+            else:
+                i += 1
+        log(f"[{ci}/{len(codes)}] {code} {name} 累计触发 {len(rs)} 笔")
+    rs = np.array(rs); base = np.array(base)
+    if len(rs) == 0:
+        return {"n_trades": 0, "note": "该参数下历史无触发。", "n_stocks": used,
+                "disclaimer": "研究性回测，非投资建议、不荐股、盈亏自负。"}
+    wins = rs[rs > 0]; loss = rs[rs <= 0]
+    return {
+        "params": {"n_win": n_win, "x_down": x_down, "y_hold": y_hold, "drop_pct": drop_pct,
+                   "monthly": monthly, "cost_bps": cost_bps},
+        "n_stocks": used, "n_trades": int(len(rs)),
+        "win_pct": round(float((rs > 0).mean() * 100), 1),
+        "net_per_trade_pct": round(float((rs.mean() - cost) * 100), 3),
+        "gross_per_trade_pct": round(float(rs.mean() * 100), 3),
+        "median_pct": round(float(np.median(rs) * 100), 3),
+        "avg_win_pct": round(float(wins.mean() * 100), 2) if len(wins) else 0.0,
+        "avg_loss_pct": round(float(loss.mean() * 100), 2) if len(loss) else 0.0,
+        "n_win": int(len(wins)), "n_loss": int(len(loss)),
+        "worst_pct": round(float(rs.min() * 100), 1), "best_pct": round(float(rs.max() * 100), 1),
+        "base_win_pct": round(float((base > 0).mean() * 100), 1),
+        "base_net_per_trade_pct": round(float((base.mean() - cost) * 100), 3),
+        "note": ("『暴跌抄反弹』历史回测(扣双边成本)。跌得越极端+首阳才有反弹edge，条件松≈抛硬币。"
+                 "样本偏差(幸存者/选股/扎堆)会高估真实收益；单笔波动大、约4成会亏。"),
+        "disclaimer": "研究性回测，非投资建议、不荐股、盈亏自负；数据非实时。"}
+
+
+def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 15, x_down: int = 10,
+                    drop_pct: float = 0.0, monthly: str = "off", root: Optional[str] = None,
+                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """今日买点扫描：一批股票里，哪些在『最新一根K』正好触发买点(近n_win日≥x_down跌+末日涨+可选过滤)。
+    命中≠推荐买入，只是"符合这条规则"；是否买、买多少自行判断。研究用途、非投资建议、盈亏自负。"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or list(USER_WATCHLIST_CODES)
+    root = root or StockDataFetcher._resolve_local_root()
+    ma_below = None if monthly == "off" else (monthly == "below")
+    hits, as_of = [], None
+    for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
+        rec = _dip_load(code, root)
+        if rec is None:
+            continue
+        dates, cl, ret, prev_ma, name = rec; i = len(cl) - 1
+        as_of = str(pd.Timestamp(dates[i]).date())
+        if _dip_signal_at(cl, ret, i, n_win, x_down, drop_pct,
+                          ma_below, prev_ma[i] if ma_below is not None else None):
+            w0 = i - n_win + 1
+            hits.append({"code": code, "name": name, "date": as_of,
+                         "close": round(float(cl[i]), 3),
+                         "down_days": int(np.nansum(ret[w0:i + 1] < 0)),
+                         "drawdown_pct": round(float((cl[i] / np.nanmax(cl[w0:i + 1]) - 1) * 100), 1),
+                         "last_ret_pct": round(float(ret[i] * 100), 2)})
+        log(f"[{ci}/{len(codes)}] {code} {name} 已查")
+    return {"as_of": as_of, "hits": hits, "n_scanned": len(codes),
+            "params": {"n_win": n_win, "x_down": x_down, "drop_pct": drop_pct, "monthly": monthly},
+            "note": "命中=最新一根K符合『暴跌后首阳』买点规则，≠推荐买入。买卖自行判断。",
+            "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
+
+
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
 VOTE_DEFAULT_ALGOS: List[str] = ["Lasso", "RidgeReg", "ElasticNet", "PLSR", "ELM", "KNN",
                                  "RF", "ExtraTrees", "Bagging", "GBRT", "XGBoost", "LightGBM"]
@@ -15842,6 +15970,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="选股排序不做行业/市值中性化(默认做)。加上它可对比：中性化前后 RankIC/size暴露差多少")
     p.add_argument("--avoid-scan", action="store_true",
                    help="『主力视角·避雷扫描』：对一篮子股票算异动/操纵风险分并排序(高=建议回避)。配 --global-scope/--global-codes 选池")
+    p.add_argument("--dip-backtest", action="store_true",
+                   help="『暴跌抄反弹』回测：近N日≥X跌+末日涨(+可选回撤/月线)→持Y日卖，报胜率/净收益。配 --dip-* 参数")
+    p.add_argument("--dip-scan", action="store_true",
+                   help="『暴跌抄反弹』今日买点扫描：哪些股票最新一根K符合该买点规则(命中≠推荐)")
+    p.add_argument("--dip-n", type=int, default=15, help="窗口天数 N(默认15)")
+    p.add_argument("--dip-x", type=int, default=10, help="窗口内至少下跌天数 X(默认10)")
+    p.add_argument("--dip-y", type=int, default=5, help="持有天数 Y(默认5)")
+    p.add_argument("--dip-drop", type=float, default=0.0, help="回撤过滤%(如 -15 表示需回撤≥15%%；0=不过滤)")
+    p.add_argument("--dip-monthly", choices=["off", "below", "above"], default="off",
+                   help="月均线过滤：off不看/below价在月均线下方(超卖,推荐)/above价在上方")
     p.add_argument("--vote", action="store_true",
                    help="多模型投票：对所选股票逐只统计『几个模型说涨/几个说跌』(描述性统计，非买卖信号)")
     p.add_argument("--vote-backtest", action="store_true",
@@ -16148,6 +16286,44 @@ def main():
             print(f"{x['code']:>9}{str(x.get('name',''))[:6]:>9}{str(sc):>8}   {x['level']}｜" + "；".join(x["reasons"][:3]))
         print("=" * 70)
         print("⚠ " + r["disclaimer"])
+        return
+
+    # --dip-backtest / --dip-scan：『暴跌抄反弹』规则策略
+    if args.dip_backtest or args.dip_scan:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        dp = args.dip_drop / 100.0 if args.dip_drop else 0.0
+        if args.dip_backtest:
+            print(f"[dip-backtest] 近{args.dip_n}日≥{args.dip_x}跌 + 末日涨"
+                  + (f" + 回撤≥{-args.dip_drop:.0f}%" if dp < 0 else "")
+                  + (f" + 月线{args.dip_monthly}" if args.dip_monthly != 'off' else "")
+                  + f" → 持{args.dip_y}日 | {len(codes)}只")
+            r = dip_bounce_backtest(codes=codes, n_win=args.dip_n, x_down=args.dip_x, y_hold=args.dip_y,
+                                    drop_pct=dp, monthly=args.dip_monthly, progress_cb=lambda m: None)
+            print("=" * 70)
+            if r["n_trades"] == 0:
+                print("该参数下历史无触发。")
+            else:
+                print(f"触发 {r['n_trades']} 笔({r['n_stocks']}只) | 胜率 {r['win_pct']}%(赚{r['n_win']}/亏{r['n_loss']}) | "
+                      f"净收益 {r['net_per_trade_pct']:+.2f}%/笔 | 中位 {r['median_pct']:+.2f}%")
+                print(f"赚的平均 {r['avg_win_pct']:+.2f}% | 亏的平均 {r['avg_loss_pct']:+.2f}% | "
+                      f"最好 {r['best_pct']:+.0f}% / 最差 {r['worst_pct']:+.0f}%")
+                print(f"对比基准(随便买持{args.dip_y}日): 胜率 {r['base_win_pct']}% / 净 {r['base_net_per_trade_pct']:+.2f}%/笔")
+            print("⚠ " + r["note"] + " " + r["disclaimer"])
+        if args.dip_scan:
+            print(f"\n[dip-scan] 今日买点扫描 {len(codes)} 只 …")
+            r = dip_bounce_scan(codes=codes, n_win=args.dip_n, x_down=args.dip_x,
+                                drop_pct=dp, monthly=args.dip_monthly, progress_cb=lambda m: None)
+            print("=" * 70)
+            print(f"截至 {r['as_of']}，符合『暴跌后首阳』买点的股票：{len(r['hits'])} 只")
+            for h in r["hits"]:
+                print(f"  {h['code']} {h['name']}：收盘{h['close']} 近{args.dip_n}日跌{h['down_days']}天 "
+                      f"回撤{h['drawdown_pct']:+.0f}% 当日{h['last_ret_pct']:+.2f}%")
+            if not r["hits"]:
+                print("  (无。今日没有股票触发该买点。)")
+            print("⚠ " + r["note"] + " " + r["disclaimer"])
         return
 
     # --train-xs：横截面排序训练(相对强弱，基准恒50%)

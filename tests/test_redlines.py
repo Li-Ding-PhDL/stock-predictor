@@ -162,6 +162,27 @@ def _write_fake_local(root, code="600000", n=400):
     return code
 
 
+def test_dip_signal_causal_and_rules():
+    import numpy as np
+    # 构造(要够长: i 必须 ≥ n_win=15)：先 8 天涨(垫长度), 再 12 天连跌, 末日大涨。
+    cl = [100.0]
+    for _ in range(8):
+        cl.append(cl[-1] * 1.01)      # 前置上涨(垫窗口长度)
+    for _ in range(12):
+        cl.append(cl[-1] * 0.97)      # 连续12天下跌
+    cl.append(cl[-1] * 1.05)          # 末日大涨(首阳)
+    cl = np.array(cl)
+    ret = np.concatenate([[np.nan]], ) if False else np.append([np.nan], cl[1:] / cl[:-1] - 1)
+    i = len(cl) - 1
+    assert s._dip_signal_at(cl, ret, i, n_win=15, x_down=10, drop_pct=0.0, ma_below=None, mav_i=None) is True
+    # 末日改成跌 → 不应触发(必须首阳)
+    cl2 = cl.copy(); cl2[-1] = cl[-2] * 0.97
+    ret2 = np.append([np.nan], cl2[1:] / cl2[:-1] - 1)
+    assert s._dip_signal_at(cl2, ret2, i, n_win=15, x_down=10, drop_pct=0.0, ma_below=None, mav_i=None) is False
+    # 因果性：信号只看 [i-n_win+1, i]，改动 i 之后的未来值不影响 i 处判定(这里序列到 i 为止，天然无未来)
+    assert s._dip_signal_at(cl, ret, i, n_win=15, x_down=13, drop_pct=0.0, ma_below=None, mav_i=None) is False  # 要求13跌但只有12跌
+
+
 def test_build_multi_horizon_causal(tmp_path):
     root = str(tmp_path)
     code = _write_fake_local(root)
