@@ -15774,6 +15774,7 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
                      y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
                      out_html: Optional[str] = None, push: Optional[str] = None,
                      with_news: bool = False, presets: Optional[List[Dict[str, Any]]] = None,
+                     with_backtest: bool = False,
                      root: Optional[str] = None, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """每日信号：扫出符合『暴跌抄反弹』买点的股票 + 给每只附上**公司/交易风险提示**(ST/亏损/异动等)，
     产出**手机友好 HTML**，并可选推送到手机(push=用户自备的 pushplus/serverchan/webhook)。研究用途、非投资建议。"""
@@ -15809,12 +15810,26 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
             h["risk_level"] = rr.get("level"); h["risk_score"] = rr.get("score"); h["risk_tags"] = rr.get("tags", [])
         total_hits += len(scan["hits"])
         rule = f"近{pn}日≥{px}跌{('+回撤≥%d%%' % int(-pdrop*100)) if pdrop < 0 else ''}{_mon_lab.get(pmon,'')}+末日涨→持{py}日"
-        sections.append({"label": ps.get("label", "策略"), "rule": rule, "hits": scan["hits"]})
+        bt = None
+        if with_backtest:      # 每档附历史回测(本地全历史,快)——让用户看清哪档是真信号、哪档≈抛硬币
+            try:
+                b = dip_bounce_backtest(codes=codes, n_win=pn, x_down=px, y_hold=py, drop_pct=pdrop,
+                                        monthly=pmon, root=root, progress_cb=lambda m: None)
+                if b.get("n_trades"):
+                    edge = b["net_per_trade_pct"]
+                    verdict = "有优势" if (b["win_pct"] >= 55 and edge >= 1.0) else ("≈抛硬币/白玩" if edge < 0.3 else "偏弱")
+                    bt = {"win": b["win_pct"], "net": edge, "n": b["n_trades"], "verdict": verdict}
+            except Exception:
+                pass
+        sections.append({"label": ps.get("label", "策略"), "rule": rule, "hits": scan["hits"], "bt": bt})
 
     # 文本(推送用)
+    def _btlab(sec):
+        b = sec.get("bt")
+        return (f" [历史{b['win']:.0f}%胜/净{b['net']:+.1f}%·{b['verdict']}]" if b else "")
     lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}"]
     for sec in sections:
-        lines.append(f"— [{sec['label']}] {sec['rule']} | 命中 {len(sec['hits'])} 只")
+        lines.append(f"— [{sec['label']}]{_btlab(sec)} {sec['rule']} | 命中 {len(sec['hits'])} 只")
         for h in sec["hits"]:
             lines.append(f"· {h['code']} {h['name']} 收{h['close']} 跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
                          f" | 风险:{h.get('risk_level','?')}({'；'.join(h.get('risk_tags', [])[:3]) or '无明显异动'})")
@@ -15833,7 +15848,9 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
                       f'<div class="r" style="color:{rc}">风险：{h.get("risk_level","?")}｜{("；".join(h.get("risk_tags", [])[:4]) or "无明显异动")}</div></div>')
         if not sec["hits"]:
             cards = '<div class="c" style="text-align:center;color:#888">今日无触发。</div>'
-        sec_html += f'<div class="sech">【{sec["label"]}】{sec["rule"]}｜命中 {len(sec["hits"])} 只</div>{cards}'
+        _bt = sec.get("bt")
+        _bth = (f'<span style="font-weight:400;color:#8a5b0d">　历史 {_bt["win"]:.0f}%胜/净{_bt["net"]:+.1f}%·{_bt["verdict"]}</span>' if _bt else "")
+        sec_html += f'<div class="sech">【{sec["label"]}】{_bth}<div style="font-weight:400;font-size:12px;color:#54626f">{sec["rule"]}｜命中 {len(sec["hits"])} 只</div></div>{cards}'
     html = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>每日信号 {as_of}</title>
 <style>:root{{color-scheme:light dark}}body{{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#17212b}}
@@ -16570,12 +16587,18 @@ def main():
         out = args.dip_html or os.path.join(BASE_DIR, f"每日信号_{time.strftime('%Y%m%d')}.html")
         presets = None
         if args.dip_multi:
-            presets = [{"label": "稳健", "n_win": 10, "x_down": 8, "y_hold": 5, "drop_pct": 0.0, "monthly": "off"},
-                       {"label": "深跌超卖", "n_win": 15, "x_down": 10, "y_hold": 5, "drop_pct": -0.15, "monthly": "below"}]
+            presets = [
+                {"label": "宽松·近10日≥5跌", "n_win": 10, "x_down": 5, "y_hold": 5},
+                {"label": "中性·近10日≥6跌", "n_win": 10, "x_down": 6, "y_hold": 5},
+                {"label": "稳健·近10日≥8跌", "n_win": 10, "x_down": 8, "y_hold": 5},
+                {"label": "深跌·近15日≥10跌", "n_win": 15, "x_down": 10, "y_hold": 5},
+                {"label": "深跌超卖·15日≥10跌+回撤15%+月线下方", "n_win": 15, "x_down": 10, "y_hold": 5, "drop_pct": -0.15, "monthly": "below"},
+                {"label": "极端·近20日≥14跌", "n_win": 20, "x_down": 14, "y_hold": 5},
+            ]
         r = dip_daily_report(codes=codes, n_win=args.dip_n, x_down=args.dip_x, y_hold=args.dip_y,
                              drop_pct=dp, monthly=args.dip_monthly, out_html=out,
                              push=(args.push or None), with_news=args.dip_news, presets=presets,
-                             progress_cb=lambda m: None)
+                             with_backtest=args.dip_multi, progress_cb=lambda m: None)
         print(r["text"])
         print(f"\n手机友好HTML: {out}" + (f" | 推送: {r['push_result']}" if r.get("push_result") else ""))
         return
