@@ -15689,6 +15689,43 @@ def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 10, x_down: 
             "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
 
 
+def dip_recent_review(codes: Optional[List[str]] = None, presets: Optional[List[Dict[str, Any]]] = None,
+                      lookback: int = 5, root: Optional[str] = None,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """近期信号复盘：找出近 lookback 个交易日里触发过买点的股票，算它们**从触发日收盘到最新收盘的实际涨跌%**
+    (含"昨天触发→今天怎样")。让每天的信号能回看兑现情况。研究用途、非投资建议、盈亏自负。"""
+    log = progress_cb or (lambda m: None)
+    codes = codes or list(USER_WATCHLIST_CODES)
+    root = root or StockDataFetcher._resolve_local_root()
+    presets = presets or [{"label": "默认", "n_win": 10, "x_down": 8, "y_hold": 5}]
+    rows = []; as_of = None
+    for code in [c.strip() for c in codes if c.strip()]:
+        rec = _dip_load(code, root)
+        if rec is None:
+            continue
+        dates, cl, ret, prev_ma, name = rec; n = len(cl)
+        as_of = str(pd.Timestamp(dates[n - 1]).date())
+        last_close = float(cl[n - 1])
+        for i in range(max(0, n - 1 - lookback), n - 1):     # 已过去、能测到之后涨跌的锚点
+            matched = []
+            for ps in presets:
+                mb = None if ps.get("monthly", "off") == "off" else (ps["monthly"] == "below")
+                if _dip_signal_at(cl, ret, i, ps["n_win"], ps["x_down"], ps.get("drop_pct", 0.0),
+                                  mb, prev_ma[i] if mb is not None else None):
+                    matched.append(str(ps.get("label", "策略")).split("·")[0])
+            if matched:
+                rows.append({"code": code, "name": name,
+                             "signal_date": str(pd.Timestamp(dates[i]).date()),
+                             "tiers": list(dict.fromkeys(matched)),
+                             "buy_close": round(float(cl[i]), 3), "last_close": round(last_close, 3),
+                             "days_since": int(n - 1 - i),
+                             "ret_pct": round((last_close / float(cl[i]) - 1) * 100, 2)})
+        log(f"{code} {name} 复盘完")
+    rows.sort(key=lambda r: (r["signal_date"], r["ret_pct"]), reverse=True)
+    return {"as_of": as_of, "rows": rows, "lookback": lookback,
+            "disclaimer": "近期信号的实际涨跌回看，研究用途、非投资建议、盈亏自负；数据取决于本地更新到的最新交易日。"}
+
+
 def _push_message(spec: str, title: str, text: str) -> str:
     """把一段文本推到手机(用户自备的免费推送服务)。spec 形如:
       'pushplus:TOKEN'  → 微信(pushplus.plus)  ; 'serverchan:SENDKEY' → 微信(方糖 sct.ftqq.com)
@@ -15774,7 +15811,7 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
                      y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
                      out_html: Optional[str] = None, push: Optional[str] = None,
                      with_news: bool = False, presets: Optional[List[Dict[str, Any]]] = None,
-                     with_backtest: bool = False,
+                     with_backtest: bool = False, with_review: bool = False, review_days: int = 5,
                      root: Optional[str] = None, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """每日信号：扫出符合『暴跌抄反弹』买点的股票 + 给每只附上**公司/交易风险提示**(ST/亏损/异动等)，
     产出**手机友好 HTML**，并可选推送到手机(push=用户自备的 pushplus/serverchan/webhook)。研究用途、非投资建议。"""
@@ -15823,6 +15860,15 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
                 pass
         sections.append({"label": ps.get("label", "策略"), "rule": rule, "hits": scan["hits"], "bt": bt})
 
+    # 近期信号复盘(可选)：前几天触发过的股票，实际涨跌了多少
+    review_rows = []
+    if with_review:
+        try:
+            review_rows = dip_recent_review(codes=codes, presets=presets, lookback=review_days,
+                                            root=root, progress_cb=lambda m: None)["rows"]
+        except Exception:
+            review_rows = []
+
     # 文本(推送用)：按股票去重——每只只列一次，标注命中了哪几档、用它『最严档』的统计，最严的排前面
     def _tier(sec):
         return str(sec["label"]).split("·")[0]
@@ -15840,44 +15886,74 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
     # 图例：各档历史胜率(✓有优势/~偏弱/✗白玩)
     _mk = {"有优势": "✓", "偏弱": "~", "≈抛硬币/白玩": "✗"}
     leg = " / ".join(f"{_tier(s)}{('%.0f%%%s' % (s['bt']['win'], _mk.get(s['bt']['verdict'], ''))) if s.get('bt') else ''}" for s in sections)
-    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}",
-             f"各档历史胜率: {leg}",
-             f"去重命中 {len(uniq)} 只(按最严档排序)："]
+    def _rk(h):     # 风险简写：等级 emoji + 首个标签
+        lv = str(h.get("risk_level", "?")); em = lv[:1] if (lv and lv[0] in "🟢🟠🔴") else ""
+        tg = (h.get("risk_tags") or [""])[0] or "无明显异动"
+        return f"{em}{tg}"
+    # ---- 推送文本：Markdown 表格(Server酱渲染成网页,手机整齐) ----
+    md = [f"## 📉 暴跌抄反弹信号 · {as_of}", "",
+          f"**各档历史胜率**：{leg}　（✓占优/✗≈抛硬币）", ""]
+    md.append(f"**今日买点（去重 {len(uniq)} 只）**")
+    if uniq:
+        md += ["| 代码/名称 | 收盘 | 跌/回撤/当日 | 命中档 | 风险 |", "|---|---|---|---|---|"]
+        for b in uniq:
+            h = b["hit"]; tiers = "/".join(dict.fromkeys(b["tiers"]))
+            md.append(f"| {h['code']} {h['name']} | {h['close']} | {h['down_days']}天/{h['drawdown_pct']:+.0f}%/{h['last_ret_pct']:+.1f}% | {tiers} | {_rk(h)} |")
+    else:
+        md.append("今日无任何档触发。")
+    md.append("")
+    if with_review:
+        md.append(f"**近期复盘（近{review_days}日触发 → 至今涨跌）**")
+        if review_rows:
+            md += ["| 触发日 | 代码/名称 | 档 | 买入→至今 | 涨跌 |", "|---|---|---|---|---|"]
+            for r in review_rows[:20]:
+                md.append(f"| {r['signal_date'][5:]} | {r['code']} {r['name']} | {'/'.join(r['tiers'])} | {r['buy_close']}→{r['last_close']} | {r['ret_pct']:+.2f}% |")
+        else:
+            md.append(f"近{review_days}日无触发可复盘。")
+        md.append("")
+    md.append("> ⚠ 命中≠推荐买入；✗档≈抛硬币；历史约4成会亏、样本偏差高估。研究用途、非投资建议、不荐股、盈亏自负。")
+    text = "\n".join(md)
+    # ---- 手机友好 HTML：两张整齐表格(今日买点 + 近期复盘) ----
+    def _retc(v):
+        return "#c0392b" if v > 0 else ("#1f8f52" if v < 0 else "#54626f")
+    today_rows = ""
     for b in uniq:
         h = b["hit"]; tiers = "/".join(dict.fromkeys(b["tiers"]))
-        lines.append(f"· {h['code']} {h['name']} 收{h['close']} 跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
-                     f" ｜命中:{tiers} ｜风险{h.get('risk_level','?')}({'；'.join(h.get('risk_tags', [])[:2]) or '无明显异动'})")
+        sc = h.get("risk_score"); rc = "#c0392b" if (isinstance(sc, (int, float)) and sc >= 60) else ("#b9720d" if (isinstance(sc, (int, float)) and sc >= 35) else "#1a7f37")
+        today_rows += (f'<tr><td class="l"><b>{h["code"]}</b> {h["name"]}</td><td>{h["close"]}</td>'
+                       f'<td>{h["down_days"]}天/{h["drawdown_pct"]:+.0f}%/<span style="color:#c0392b">{h["last_ret_pct"]:+.1f}%</span></td>'
+                       f'<td>{tiers}</td><td class="l" style="color:{rc}">{_rk(h)}</td></tr>')
     if not uniq:
-        lines.append("· 今日无任何档触发。")
-    lines.append("⚠ 命中≠推荐买入；只有标 ✓ 的档历史占优、✗ 档≈抛硬币。风险提示非尽调。研究用途、非投资建议、盈亏自负。")
-    text = "\n".join(lines)
-    # 手机友好 HTML(窄屏自适应)
-    sec_html = ""
-    for sec in sections:
-        cards = ""
-        for h in sec["hits"]:
-            sc = h.get("risk_score"); rc = "#c0392b" if (isinstance(sc, (int, float)) and sc >= 60) else ("#b9720d" if (isinstance(sc, (int, float)) and sc >= 35) else "#1a7f37")
-            cards += (f'<div class="c"><div class="h"><b>{h["code"]} {h["name"]}</b> <span class="px">收 {h["close"]}</span></div>'
-                      f'<div class="m">近{sec["rule"]}｜跌 <b>{h["down_days"]}</b> 天 · 回撤 <b>{h["drawdown_pct"]:+.0f}%</b> · 当日 <b style="color:#c0392b">{h["last_ret_pct"]:+.1f}%</b></div>'
-                      f'<div class="r" style="color:{rc}">风险：{h.get("risk_level","?")}｜{("；".join(h.get("risk_tags", [])[:4]) or "无明显异动")}</div></div>')
-        if not sec["hits"]:
-            cards = '<div class="c" style="text-align:center;color:#888">今日无触发。</div>'
-        _bt = sec.get("bt")
-        _bth = (f'<span style="font-weight:400;color:#8a5b0d">　历史 {_bt["win"]:.0f}%胜/净{_bt["net"]:+.1f}%·{_bt["verdict"]}</span>' if _bt else "")
-        sec_html += f'<div class="sech">【{sec["label"]}】{_bth}<div style="font-weight:400;font-size:12px;color:#54626f">{sec["rule"]}｜命中 {len(sec["hits"])} 只</div></div>{cards}'
+        today_rows = '<tr><td colspan="5" style="text-align:center;color:#888">今日无任何档触发。</td></tr>'
+    review_html = ""
+    if with_review:
+        rr = ""
+        for r in review_rows[:20]:
+            rr += (f'<tr><td>{r["signal_date"][5:]}</td><td class="l"><b>{r["code"]}</b> {r["name"]}</td>'
+                   f'<td>{"/".join(r["tiers"])}</td><td>{r["buy_close"]}→{r["last_close"]}</td>'
+                   f'<td style="color:{_retc(r["ret_pct"])};font-weight:700">{r["ret_pct"]:+.2f}%</td></tr>')
+        if not review_rows:
+            rr = f'<tr><td colspan="5" style="text-align:center;color:#888">近{review_days}日无触发可复盘。</td></tr>'
+        review_html = (f'<div class="sech">📈 近期复盘（近{review_days}日触发 → 至今涨跌）</div>'
+                       f'<table class="t"><tr><th>触发日</th><th class="l">代码/名称</th><th>档</th><th>买入→至今</th><th>涨跌</th></tr>{rr}</table>')
     html = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>每日信号 {as_of}</title>
 <style>:root{{color-scheme:light dark}}body{{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#17212b}}
-@media(prefers-color-scheme:dark){{body{{background:#10161d;color:#e7edf3}}.c{{background:#182029!important;border-color:#2b3946!important}}}}
-.wrap{{max-width:560px;margin:0 auto;padding:16px}}.hd{{font-size:18px;font-weight:800;margin:4px 0}}
-.sub{{font-size:13px;color:#54626f;margin-bottom:10px}}.sech{{font-size:14px;font-weight:700;margin:14px 0 4px;color:#2c6fbb}}
-.c{{background:#fff;border:1px solid #dbe1e8;border-radius:12px;padding:12px 14px;margin:8px 0}}
-.h{{font-size:16px}}.px{{float:right;color:#c0392b;font-weight:700}}.m{{font-size:12px;color:#54626f;margin:5px 0}}.r{{font-size:12px;margin-top:4px}}
+@media(prefers-color-scheme:dark){{body{{background:#10161d;color:#e7edf3}}.card,.t{{background:#182029!important}}.t th{{background:#1f2a35!important}}.t td,.t th{{border-color:#2b3946!important}}}}
+.wrap{{max-width:600px;margin:0 auto;padding:16px}}.hd{{font-size:18px;font-weight:800;margin:4px 0}}
+.sub{{font-size:13px;color:#54626f;margin-bottom:6px}}.leg{{font-size:12px;color:#54626f;background:#eef1f5;border-radius:8px;padding:6px 10px;margin:8px 0}}
+.sech{{font-size:14px;font-weight:700;margin:16px 0 4px;color:#2c6fbb}}
+.t{{width:100%;border-collapse:collapse;font-size:12px;background:#fff;border:1px solid #dbe1e8;border-radius:10px;overflow:hidden}}
+.t th{{background:#eef1f5;color:#54626f;font-weight:700;font-size:11px;padding:6px 6px}}.t td{{border-top:1px solid #eef1f5;padding:6px 6px;text-align:center}}
+.t td.l,.t th.l{{text-align:left}}
 .disc{{font-size:12px;color:#8a3b34;background:#fff6f6;border-radius:10px;padding:10px 12px;margin-top:14px}}</style></head><body><div class="wrap">
-<div class="hd">📉 暴跌抄反弹 · 每日买点信号</div>
-<div class="sub">截至 {as_of} ｜ {len(sections)} 套策略 ｜ 合计命中 <b>{total_hits}</b> 次</div>
-{sec_html}
-<div class="disc">⚠ 命中=最新K符合该机械规则，<b>≠推荐买入</b>；风险提示(异动/财务/新闻)仅供参考、非全面尽调。历史回测有正期望但约4成会亏、样本偏差会高估。<b>研究用途，非投资建议，不荐股，盈亏自负。</b></div>
+<div class="hd">📉 暴跌抄反弹 · 每日信号</div>
+<div class="sub">截至 {as_of} ｜ {len(sections)} 套策略</div>
+<div class="leg"><b>各档历史胜率：</b>{leg}　（✓占优 / ~偏弱 / ✗≈抛硬币）</div>
+<div class="sech">🎯 今日买点（去重 {len(uniq)} 只）</div>
+<table class="t"><tr><th class="l">代码/名称</th><th>收盘</th><th>跌/回撤/当日</th><th>命中档</th><th class="l">风险</th></tr>{today_rows}</table>
+{review_html}
+<div class="disc">⚠ 命中=最新K符合该机械规则，<b>≠推荐买入</b>；风险提示(异动/财务/新闻)仅供参考、非尽调。历史回测有正期望但约4成会亏、样本偏差会高估。<b>研究用途，非投资建议，不荐股，盈亏自负。</b></div>
 </div></body></html>'''
     if out_html:
         try:
@@ -16616,7 +16692,8 @@ def main():
         r = dip_daily_report(codes=codes, n_win=args.dip_n, x_down=args.dip_x, y_hold=args.dip_y,
                              drop_pct=dp, monthly=args.dip_monthly, out_html=out,
                              push=(args.push or None), with_news=args.dip_news, presets=presets,
-                             with_backtest=args.dip_multi, progress_cb=lambda m: None)
+                             with_backtest=args.dip_multi, with_review=True, review_days=args.dip_y + 2,
+                             progress_cb=lambda m: None)
         print(r["text"])
         print(f"\n手机友好HTML: {out}" + (f" | 推送: {r['push_result']}" if r.get("push_result") else ""))
         return
