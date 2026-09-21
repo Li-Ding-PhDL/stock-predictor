@@ -15823,19 +15823,33 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
                 pass
         sections.append({"label": ps.get("label", "策略"), "rule": rule, "hits": scan["hits"], "bt": bt})
 
-    # 文本(推送用)
-    def _btlab(sec):
-        b = sec.get("bt")
-        return (f" [历史{b['win']:.0f}%胜/净{b['net']:+.1f}%·{b['verdict']}]" if b else "")
-    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}"]
-    for sec in sections:
-        lines.append(f"— [{sec['label']}]{_btlab(sec)} {sec['rule']} | 命中 {len(sec['hits'])} 只")
+    # 文本(推送用)：按股票去重——每只只列一次，标注命中了哪几档、用它『最严档』的统计，最严的排前面
+    def _tier(sec):
+        return str(sec["label"]).split("·")[0]
+    best = {}
+    for si, sec in enumerate(sections):
         for h in sec["hits"]:
-            lines.append(f"· {h['code']} {h['name']} 收{h['close']} 跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
-                         f" | 风险:{h.get('risk_level','?')}({'；'.join(h.get('risk_tags', [])[:3]) or '无明显异动'})")
-        if not sec["hits"]:
-            lines.append("· 今日无触发。")
-    lines.append("⚠ 命中≠推荐买入；风险提示(异动/财务/新闻)仅供参考、非尽调。研究用途、非投资建议、盈亏自负。")
+            c = h["code"]
+            if c not in best:
+                best[c] = {"si": si, "hit": h, "tiers": [_tier(sec)]}
+            else:
+                best[c]["tiers"].append(_tier(sec))
+                if si > best[c]["si"]:      # 更严的档：改用它的统计(更大窗口更能看清整段跌幅)
+                    best[c]["si"] = si; best[c]["hit"] = h
+    uniq = sorted(best.values(), key=lambda b: -b["si"])
+    # 图例：各档历史胜率(✓有优势/~偏弱/✗白玩)
+    _mk = {"有优势": "✓", "偏弱": "~", "≈抛硬币/白玩": "✗"}
+    leg = " / ".join(f"{_tier(s)}{('%.0f%%%s' % (s['bt']['win'], _mk.get(s['bt']['verdict'], ''))) if s.get('bt') else ''}" for s in sections)
+    lines = [f"【暴跌抄反弹·每日信号】截至 {as_of}",
+             f"各档历史胜率: {leg}",
+             f"去重命中 {len(uniq)} 只(按最严档排序)："]
+    for b in uniq:
+        h = b["hit"]; tiers = "/".join(dict.fromkeys(b["tiers"]))
+        lines.append(f"· {h['code']} {h['name']} 收{h['close']} 跌{h['down_days']}天/回撤{h['drawdown_pct']:+.0f}%/当日{h['last_ret_pct']:+.1f}%"
+                     f" ｜命中:{tiers} ｜风险{h.get('risk_level','?')}({'；'.join(h.get('risk_tags', [])[:2]) or '无明显异动'})")
+    if not uniq:
+        lines.append("· 今日无任何档触发。")
+    lines.append("⚠ 命中≠推荐买入；只有标 ✓ 的档历史占优、✗ 档≈抛硬币。风险提示非尽调。研究用途、非投资建议、盈亏自负。")
     text = "\n".join(lines)
     # 手机友好 HTML(窄屏自适应)
     sec_html = ""
