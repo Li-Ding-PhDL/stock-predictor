@@ -214,6 +214,37 @@ python stock_predictor.py --cli --code 600519 --week --backtest
 
 ---
 
+## 📉 『暴跌抄反弹』策略 + 每日信号推送手机（含云端定时）
+
+一套**可回测的规则策略**：`近 N 日里至少 X 天下跌（+可选回撤/月线过滤）且最后一天是涨的（首根阳线）→ 买入，持 Y 日卖出`。
+样本外验证（训练≤2023 / 测试2024+）最稳的是 **N=10 / X=8 / Y=5**（近10天≥8天跌＝极度超卖）。**跌得越极端才有反弹优势，条件一松≈抛硬币。**
+
+```bash
+# 回测这套参数（全历史，扣双边成本，报胜率/净收益/中位/赚亏均值+基准对比）
+python stock_predictor.py --cli --dip-backtest --global-scope mine --dip-n 10 --dip-x 8 --dip-y 5
+
+# 今天哪些股票触发买点（命中≠推荐买入）
+python stock_predictor.py --cli --dip-scan --global-scope mine
+
+# 每日信号：多档策略(宽松→极端,各附历史胜率标注) + 每只公司/交易风险 → 手机友好HTML，可推微信
+python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine \
+    --push "serverchan:你的SENDKEY"
+```
+
+**推送到手机（自备免费服务，程序只 POST 到你显式给的地址、绝不内置任何 token）**：
+- `serverchan:SENDKEY`（[方糖 Server酱](https://sct.ftqq.com)，微信登录即用、免费 5 条/天，**推荐**）
+- `https://企业微信群机器人webhook`（企业微信内部群 → 群机器人）
+- `pushplus:TOKEN`（[PushPlus](https://www.pushplus.plus)，2024-08 起需实名收费，不推荐）
+- **给多个人推**：用 `;` 分隔多个方式，如 `--push "serverchan:你的KEY;serverchan:朋友的KEY"`（每人各自注册、给你自己的 SENDKEY）。
+
+**云端定时（不用本机开机）**：`.github/workflows/daily_signal.yml` 每天 **北京 08:00（上一交易日）+ 15:35（当天最新）** 自动跑 `update-data(baostock) → dip-daily → 推微信`。
+- 推送方式放仓库 **Settings → Secrets → Actions** 的 `PUSH_SPEC`（多人用 `;` 分隔）。
+- 本机稳妥版：`scripts/每日信号推送.bat` + Windows 任务计划程序。
+
+> ⚠ **命中 ≠ 推荐买入**；历史回测有正期望但受**幸存者/选股/扎堆偏差**高估、约 4 成会亏。**研究用途、非投资建议、不荐股、盈亏自负。**
+
+---
+
 ## 📁 目录结构
 ```
 stock-predictor/

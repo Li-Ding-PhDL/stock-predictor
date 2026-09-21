@@ -15872,8 +15872,11 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
             log(f"写 HTML 失败: {e}")
     push_result = None
     if push:
-        push_result = _push_message(push, f"暴跌抄反弹信号 {as_of}·合计命中{total_hits}次", text)
-        log(f"推送结果: {push_result}")
+        # 支持多个收件人：用 ; 或换行分隔多个推送方式(如给自己+朋友各推一份，各自用自己的 SENDKEY)
+        targets = [t.strip() for t in str(push).replace("\n", ";").split(";") if t.strip()]
+        results = [(_push_message(t, f"暴跌抄反弹信号 {as_of}·合计命中{total_hits}次", text)) for t in targets]
+        push_result = " | ".join(f"[{i+1}/{len(targets)}]{r}" for i, r in enumerate(results))
+        log(f"推送 {len(targets)} 个目标：{push_result}")
     return {"as_of": as_of, "sections": sections, "total_hits": total_hits, "text": text,
             "out_html": out_html, "push_result": push_result,
             "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
@@ -16264,7 +16267,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="每日信号：扫今日买点 + 附公司/交易风险 → 生成手机友好 HTML，可选推送到手机")
     p.add_argument("--dip-html", type=str, default="", help="每日信号 HTML 输出路径(配 --dip-daily)")
     p.add_argument("--push", type=str, default="",
-                   help="推送到手机(自备免费服务)：'pushplus:你的TOKEN' / 'serverchan:你的SENDKEY' / 'https://群机器人webhook'")
+                   help="推送到手机(自备免费服务)：'serverchan:SENDKEY' / 'https://群机器人webhook' / 'pushplus:TOKEN'。"
+                        "给多个人用 ; 分隔，如 'serverchan:你的KEY;serverchan:朋友的KEY'")
     p.add_argument("--dip-news", action="store_true",
                    help="每日信号里附『近期新闻风险词』(立案/退市/减持/商誉…；联网尽力抓,失败自动跳过)")
     p.add_argument("--dip-multi", action="store_true",

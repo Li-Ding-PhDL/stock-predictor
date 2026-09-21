@@ -38,6 +38,7 @@ jobs:
         env:
           STOCK_LOCAL_DATA_ROOT: ${{ github.workspace }}/data_updated
           # PUSH_SPEC(推荐)=完整推送方式, 可填: 'serverchan:你的SENDKEY' / 'https://企业微信群机器人webhook' / 'pushplus:token'
+          # 给多个人推：用 ; 分隔多个，如 'serverchan:你的KEY;serverchan:朋友的KEY'(每人各自注册、给自己的SENDKEY)。
           # 兼容旧的 PUSHPLUS_TOKEN(仅pushplus, 需实名)。二者都没配则只生成HTML不推送。
           PUSH_SPEC: ${{ secrets.PUSH_SPEC }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
