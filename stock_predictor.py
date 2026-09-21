@@ -12112,6 +12112,11 @@ if HAS_PYSIDE6:
                 "<br><span style='color:#c0392b'>⚠ 历史回测有正期望但约4成会亏、样本偏差会高估；命中≠推荐买入，非投资建议、盈亏自负。</span>")
             intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#fef6f6;padding:6px;border-radius:4px")
             layout.addWidget(intro)
+            self.dip_legal_btn = QPushButton("⚖️ 合规与法律须知（分享/推送前必读）")
+            self.dip_legal_btn.setStyleSheet("text-align:left;color:#8a3b34;")
+            self.dip_legal_btn.clicked.connect(
+                lambda: QMessageBox.information(self, "⚖️ 合规与法律须知", LEGAL_COMPLIANCE_NOTICE))
+            layout.addWidget(self.dip_legal_btn)
             box = QGroupBox("参数"); g = QGridLayout(box)
             g.addWidget(QLabel("股票篮子:"), 0, 0)
             self.dip_codes = QLineEdit(",".join(list(USER_WATCHLIST_CODES)))
@@ -14501,6 +14506,27 @@ USER_WATCHLIST_CODES: List[str] = [
     "601212", "000950", "002651", "002746", "600664", "601678", "002131", "000908",
     "600207", "002560", "002692", "000523", "002377",   # 新增：安彩高科/通达股份/远程股份/红棉股份/国创高新
 ]
+
+# ⚖️ 合规与法律须知（软件内展示；非法律意见，条文以官方最新文本为准）
+LEGAL_COMPLIANCE_NOTICE = (
+    "⚖️ 合规与法律须知（务必阅读）\n\n"
+    "本软件为个人研究/学习工具；所有信号、评分、预测均为机械计算结果，"
+    "命中≠推荐买入，不构成任何投资建议、不荐股、盈亏自负。\n\n"
+    "—— 涉及的主要法律（一般信息，非法律意见，以官方文本为准）——\n\n"
+    "① 刑法第225条 非法经营罪：未经证监会批准、【有偿】提供证券投资咨询/荐股即可能构成，"
+    "情节严重处5年以下有期徒刑+违法所得1–5倍罚金。\n"
+    "   → 切勿收费荐股；也不要用引流/卖课/打赏/广告等【变相收费】。\n\n"
+    "② 刑法第182条 操纵证券市场（“抢帽子交易”）：【持有某股 + 公开推荐 + 反向交易】即可能构成；"
+    "2019两高司法解释已扩大到一般主体（网络大V/公众人物荐股也算），【免费也可能犯】。\n"
+    "   → 切勿推荐你自己持有的股票诱导他人接盘。\n\n"
+    "③ 证券法(2019)第160条：证券投资咨询属特许业务，须经证监会核准资质；第55条禁止操纵市场。\n\n"
+    "④ 民法典第506条：因【故意或重大过失】造成对方财产损失的免责条款无效——“盈亏自负”挡得住一般过失、"
+    "挡不住故意/重大过失；第153条：违反强制性规定的合同（如无牌照收费咨询）无效；第1165条：过错侵权担责。\n\n"
+    "—— 安全使用姿势 ——\n"
+    "仅个人研究/学习；免费、不牟利；不推自己持仓；不公开大规模喊单；始终保留免责声明。"
+    "如需规模化/商业化，请咨询执业律师或与持牌机构合作，切勿自行收费开展。"
+)
+
 
 # 股票名称覆盖表：本地数据集/baostock 不带名或名字过期时，用同花顺现名顶替(纯显示、不影响任何计算)。
 STOCK_NAME_OVERRIDES: Dict[str, str] = {
