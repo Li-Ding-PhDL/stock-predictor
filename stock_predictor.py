@@ -285,7 +285,12 @@ def _no_proxy():
     "ProxyError: Unable to connect to proxy"。
     进入本上下文时清空这些代理变量并把 NO_PROXY 设为通配 "*"，退出时原样恢复，
     这样拉行情时自动直连、绕过代理，用户开着 VPN 也不受影响。
+    例外：若网络**必须经代理**才能出网(公司/校园网)，直连会失败——此时设环境变量
+    STOCK_KEEP_PROXY=1，本上下文变为『不动代理』，保留系统代理去连。
     """
+    if str(os.environ.get("STOCK_KEEP_PROXY", "")).strip().lower() in ("1", "true", "yes", "on"):
+        yield                                    # 保留系统代理(必须走代理才能出网的网络)
+        return
     proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                   "http_proxy", "https_proxy", "all_proxy"]
     saved = {k: os.environ.pop(k, None) for k in proxy_keys}
