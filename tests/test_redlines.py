@@ -204,3 +204,72 @@ def test_build_multi_horizon_causal(tmp_path):
         max_anchor_h = sub["date"].max()
         room = int((df_raw["date"] > max_anchor_h).sum())
         assert room >= h, f"h={h} 的锚定日越界取了不存在的未来({room}<{h}) → 泄露风险"
+
+
+# ============ 价值·周期体检(格雷厄姆+马克斯)：因果性 + 行为 ============
+def _synth_val_df(n=1500, seed=0, pe_trend=0.0):
+    rng = np.random.default_rng(seed)
+    cl = 10 * np.exp(np.cumsum(rng.normal(0.0003, 0.015, n)))
+    pe = np.clip(15 + pe_trend * np.arange(n) + rng.normal(0, 1.0, n).cumsum() * 0.2, 3, None)
+    return pd.DataFrame({"date": pd.date_range("2018-01-01", periods=n, freq="B"), "close": cl,
+                         "pe_ttm": pe, "pb": pe / 8, "total_mv": 2e10, "name": "合成"})
+
+
+def test_value_pct_rank_is_causal():
+    df = _synth_val_df()
+    a = s._causal_pct_rank(df["pe_ttm"], window=500, min_valid=100)
+    df2 = df.copy(); df2.loc[1200:, "pe_ttm"] = 999.0      # 篡改未来
+    b = s._causal_pct_rank(df2["pe_ttm"], window=500, min_valid=100)
+    assert np.allclose(a.iloc[:1200].fillna(-1), b.iloc[:1200].fillna(-1))   # 过去的分位不受未来影响
+
+
+def test_value_temperature_hot_vs_cold():
+    n = 1500
+    up = np.linspace(0, 1, n)
+    mk = lambda path: pd.DataFrame({"date": pd.date_range("2018-01-01", periods=n, freq="B"),
+                                    "close": 10 + 10 * path, "pe_ttm": 8 + 20 * path, "pb": 1 + 3 * path,
+                                    "total_mv": 2e10, "name": "合成"})
+    hot, cold = s.valuation_cycle_check(mk(up)), s.valuation_cycle_check(mk(up[::-1]))   # 一路抬升(今天在高位) vs 一路下跌(今天在低位)
+    assert hot["temperature"] >= 75 and cold["temperature"] <= 20
+    assert 0.5 <= hot["risk_scale"] <= 1.0 and cold["risk_scale"] == 1.0
+
+
+def test_value_graham_flags_and_missing_not_passed():
+    df = _synth_val_df(n=300)
+    df.loc[df.index[-1], ["pe_ttm", "pb"]] = [10.0, 1.0]
+    g = s.valuation_cycle_check(df)["graham"]
+    assert g["checks"]["PE<15"] and g["checks"]["PE×PB<22.5"]
+    assert g["unchecked"]                                    # 拿不到的项列为未检查，不当作通过
+    short = s.valuation_cycle_check(df.iloc[:100])           # 历史太短 → 不硬算温度
+    assert short["temperature"] is None
+
+
+def test_value_forward_study_and_market_temperature():
+    dfs = {f"{i:06d}": _synth_val_df(seed=i) for i in range(4)}
+    r = s.valuation_forward_returns(dfs, horizon=60, window=500, min_valid=100)
+    assert r["n"] > 0 and len(r["bins"]) == 5 and "verdict" in r and "非投资建议" in r["disclaimer"]
+    m = s.market_temperature(dfs=dfs)
+    assert m["summary"]["n_scored"] == 4 and "非投资建议" in m["disclaimer"]
+
+
+# ============ 方向可信度闸门：常数预测/多数类基准 ============
+def _mk_result(name, prev, true, pred, dates):
+    return s.ModelResult(algo_name=name, metrics={}, y_test_true=true, y_test_pred=pred,
+                         test_dates=pd.Series(dates), prev_close=prev)
+
+
+def test_trust_gate_rejects_constant_down_on_falling_test():
+    rng = np.random.default_rng(1)
+    n = 400
+    prev = np.full(n, 10.0)
+    up = rng.random(n) < 0.45                         # 测试段只有 45% 上涨 → 永远猜跌能拿 55%
+    true = np.where(up, 10.2, 9.8)
+    dates = pd.date_range("2023-01-01", periods=n, freq="B")
+    const_dn = _mk_result("退化跌", prev, true, np.full(n, 9.9), dates)
+    oracle = _mk_result("有本事", prev, true, np.where(up, 10.1, 9.9), dates)
+    g = s.directional_trust_gate([const_dn, oracle])
+    rows = {x["algo"]: x for x in g["rows"]}
+    assert rows["退化跌"]["degenerate"] and not rows["退化跌"]["passed"]
+    assert rows["退化跌"]["majority_baseline"] > 50 and rows["退化跌"]["excess"] <= 0.5
+    assert rows["有本事"]["passed"]
+    assert "非投资建议" in g["disclaimer"]

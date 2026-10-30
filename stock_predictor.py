@@ -273,6 +273,12 @@ class TrainConfig:
     #  50%，才说明它真的学到了东西。开启本项后，结果表里会自动出现一行 "Naive(前值)" 作参照。
 
 
+# 诚实基准行名：Naive(价格) + 总是涨/总是跌(方向)。模型 DA 须同时胜过后两者(多数类基准)才算有判别力。
+ALWAYS_UP_NAME = "总是涨(方向基准)"
+ALWAYS_DOWN_NAME = "总是跌(方向基准)"
+BASELINE_NAMES = ("Naive(前值)", ALWAYS_UP_NAME, ALWAYS_DOWN_NAME)
+
+
 # ==================== 第三部分：数据获取层 ====================
 @contextlib.contextmanager
 def _no_proxy():
@@ -291,7 +297,7 @@ def _no_proxy():
     if str(os.environ.get("STOCK_KEEP_PROXY", "")).strip().lower() in ("1", "true", "yes", "on"):
         yield                                    # 保留系统代理(必须走代理才能出网的网络)
         return
-    proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    proxy_keys =["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                   "http_proxy", "https_proxy", "all_proxy"]
     saved = {k: os.environ.pop(k, None) for k in proxy_keys}
     saved_no = {k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
@@ -3477,6 +3483,27 @@ class TrainingPipeline:
                            metrics_train=_up_m(pdata.prev_close_train, pdata.close_train),
                            metrics_val=_up_m(pdata.prev_close_val, pdata.close_val))
 
+    def _alwaysdown_baseline(self, pdata: PreparedData) -> ModelResult:
+        """
+        "总是猜跌"方向基准：每天都预测下跌。其 DA 等于测试集里"非上涨日占比"。
+        测试段跌多于涨时(如熊市/大跌日)，永远猜跌的退化模型就能拿到 >50% 的 DA——这不是本事。
+        模型的 DA 必须同时明显超过『总是涨』与『总是跌』(即 max 的多数类基准)才算有判别力。
+        （价格类指标对本行无意义，请只看 DA。）
+        """
+        def _dn_m(prev, close):
+            if prev is None or len(prev) == 0:
+                return {}
+            p = prev.astype(float) * 0.999
+            m = Metrics.calc_all(close, p, self.config.metrics)
+            self._apply_dir(m, close, p, prev)
+            return m
+        dn_price = pdata.prev_close_test.astype(float) * 0.999
+        return ModelResult(algo_name=ALWAYS_DOWN_NAME, metrics=_dn_m(pdata.prev_close_test, pdata.close_test),
+                           y_test_true=pdata.close_test, y_test_pred=dn_price,
+                           test_dates=pdata.d_test, prev_close=pdata.prev_close_test,
+                           metrics_train=_dn_m(pdata.prev_close_train, pdata.close_train),
+                           metrics_val=_dn_m(pdata.prev_close_val, pdata.close_val))
+
     # ---------- 8.5 批量运行多个算法 ----------
     def run_batch(self, algo_names: List[str], raw_df: pd.DataFrame,
                   progress_cb: Optional[Callable[[str], None]] = None) -> List[ModelResult]:
@@ -3496,9 +3523,11 @@ class TrainingPipeline:
         if self.config.add_naive_baseline and len(pdata.close_test) >= 2:
             results.append(self._naive_baseline(pdata))
             results.append(self._alwaysup_baseline(pdata))
+            results.append(self._alwaysdown_baseline(pdata))
             up_rate = float(np.mean(pdata.close_test > pdata.prev_close_test) * 100)
             log(f"[诚实性提示] 预测周期={self.config.horizon}个交易日；测试集共 {len(pdata.close_test)} 段，"
-                f"其中上涨占比 {up_rate:.1f}%。模型方向准确率(DA) 必须明显 > {up_rate:.1f}% 才算真有判别力。")
+                f"其中上涨占比 {up_rate:.1f}%。模型方向准确率(DA) 必须明显 > 多数类基准 {max(up_rate, 100 - up_rate):.1f}%"
+                f"(=max(总是涨 {up_rate:.1f}%, 总是跌 {100 - up_rate:.1f}%)) 才算真有判别力。")
         for algo_name in algo_names:
             results.append(self.run_single(algo_name, pdata, progress_cb))
         return results
@@ -6362,6 +6391,65 @@ def multiple_comparison_correct(pvals: List[Optional[float]], alpha: float = 0.0
     return {"n": m, "bonferroni_alpha": round(bonf_alpha, 5), "bh_qvals": q}
 
 
+def directional_trust_gate(results: List["ModelResult"], horizon: int = 1, alpha: float = 0.05) -> Dict[str, Any]:
+    """『方向可信度闸门』：把 54%~60% 这类 DA 数字还原成"到底有没有真本事"。逐模型给出：
+      · 多数类基准 = max(总是涨, 总是跌)，及模型 DA 的『超额』(DA−多数类基准)；
+      · 是否退化(几乎从不/总是预测上涨 = 常数预测)；
+      · 对『多数类基准』的单侧检验 p 值(horizon>1 时样本窗口重叠，有效样本按 n/horizon 折算) + BH(FDR) 多重比较校正；
+      · 按自然年拆测试段，超额>0 的年数占比(稳定性；单一年份撑起来的 DA 不可信)。
+    判定 passed = 超额≥3 且 非退化 且 BH 校正后 q<alpha 且 (多于1年时) 超额>0 的年份占比≥50%。
+    只用已有测试段预测，不改变任何训练流程；研究用途、非投资建议。"""
+    import math
+    rows: List[Dict[str, Any]] = []
+    for r in results:
+        if r.error or r.algo_name in BASELINE_NAMES or r.prev_close is None or r.y_test_true is None:
+            continue
+        true = np.asarray(r.y_test_true, dtype=float); pred = np.asarray(r.y_test_pred, dtype=float)
+        prev = np.asarray(r.prev_close, dtype=float)
+        m = np.isfinite(true) & np.isfinite(pred) & np.isfinite(prev)
+        if m.sum() < 10:
+            continue
+        up = true[m] > prev[m]; pu = pred[m] > prev[m]
+        n = int(m.sum()); n_eff = max(1.0, n / max(1, int(horizon)))
+        da = float((up == pu).mean()); up_rate = float(up.mean()); major = max(up_rate, 1 - up_rate)
+        pred_up_rate = float(pu.mean())
+        degenerate = pred_up_rate <= 0.02 or pred_up_rate >= 0.98
+        se = math.sqrt(max(major * (1 - major), 1e-9) / n_eff)
+        p = 0.5 * math.erfc(((da - major) / se) / math.sqrt(2))      # 单侧：DA 是否显著>多数类基准
+        yrs_pos, yrs_n = 0, 0
+        if r.test_dates is not None:
+            yr = pd.to_datetime(pd.Series(np.asarray(r.test_dates))).dt.year.values[m]
+            for y in np.unique(yr):
+                k = yr == y
+                if k.sum() >= 20:
+                    yrs_n += 1
+                    u = up[k].mean()
+                    yrs_pos += int((up[k] == pu[k]).mean() > max(u, 1 - u))
+        rows.append({"algo": r.algo_name, "n": n, "n_eff": round(n_eff, 1), "da": round(da * 100, 2),
+                     "up_rate": round(up_rate * 100, 2), "majority_baseline": round(major * 100, 2),
+                     "excess": round((da - major) * 100, 2), "pred_up_rate": round(pred_up_rate * 100, 1),
+                     "degenerate": bool(degenerate), "p_vs_majority": round(p, 4),
+                     "years_beating": yrs_pos, "years_total": yrs_n})
+    mc = multiple_comparison_correct([x["p_vs_majority"] for x in rows])
+    for x, q in zip(rows, mc["bh_qvals"]):
+        x["q_bh"] = q
+        why = []
+        if x["excess"] < 3.0:
+            why.append(f"超额仅 {x['excess']:+.1f}%(<3)")
+        if x["degenerate"]:
+            why.append("几乎从不/总是预测上涨(常数预测)")
+        if q is None or q >= alpha:
+            why.append(f"BH校正后不显著(q={q})")
+        if x["years_total"] >= 2 and x["years_beating"] / x["years_total"] < 0.5:
+            why.append(f"仅 {x['years_beating']}/{x['years_total']} 个年份胜过基准")
+        x["passed"] = not why
+        x["why"] = "；".join(why) if why else "通过：超额≥3、非退化、FDR校正后显著、逐年稳定"
+    rows.sort(key=lambda x: -x["excess"])
+    return {"rows": rows, "n_models": len(rows), "n_passed": sum(1 for x in rows if x["passed"]),
+            "note": "多数类基准=max(总是涨,总是跌)；54%~60% 若不超过多数类基准就不算本事。horizon>1 时有效样本≈n/horizon。",
+            "disclaimer": "可信度闸门仅供研究，非投资建议、不荐股、盈亏自负；通过≠未来有效，仍需样本外跟踪。"}
+
+
 def research_card(code: str, start: str = "20200101", end: Optional[str] = None,
                   target_mode: str = "return", horizon: int = 5,
                   models=("SVR", "Lasso"),
@@ -8257,6 +8345,7 @@ if HAS_PYSIDE6:
             self.tabs.addTab(self._build_school_tab(), "投资流派视角")
             self.tabs.addTab(self._build_portfolio_tab(), "组合与仓位")
             self.tabs.addTab(self._build_avoid_tab(), "异动避雷")
+            self.tabs.addTab(self._build_value_tab(), "价值周期体检")
             self.tabs.addTab(self._build_dip_tab(), "暴跌抄反弹")
             self.tabs.addTab(self._build_tail_scan_tab(), "尾盘选股")
             self.tabs.addTab(self._build_regulatory_tab(), "监管披露观察")
@@ -8270,7 +8359,7 @@ if HAS_PYSIDE6:
                 ("预测板块", ["预测结果对比图", "未来预测图", "策略回测"]),
                 ("机器学习板块", ["机器学习内部", "全局模型(多期限)"]),
                 ("精度评估板块", ["指标结果表格", "预测跟踪", "综合报告"]),
-                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位", "异动避雷", "暴跌抄反弹"]),
+                ("实盘操作板块", ["实时监控", "尾盘选股", "监管披露观察", "模拟交易", "批量扫描", "自选股票", "强化学习交易", "投资流派视角", "组合与仓位", "异动避雷", "价值周期体检", "暴跌抄反弹"]),
                 ("日志板块", ["运行日志", "操作日志"]),
             ]
             self._tab_name_to_index = {self.tabs.tabText(i): i for i in range(self.tabs.count())}
@@ -8773,7 +8862,7 @@ if HAS_PYSIDE6:
             """返回当前『DA 方向准确率最高』的模型名：优先用已训练结果的测试DA；
             没训练则退回预测跟踪里已验证记录的真实DA(prediction_postmortem)；都没有返回 None。"""
             cand = [(r.algo_name, r.metrics.get("DA")) for r in getattr(self, "results", [])
-                    if not r.error and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)")
+                    if not r.error and r.algo_name not in BASELINE_NAMES
                     and r.metrics.get("DA") is not None]
             if cand:
                 return max(cand, key=lambda x: x[1])
@@ -9477,7 +9566,7 @@ if HAS_PYSIDE6:
             """研判卡要评估的模型：优先用『已训练成功的模型』(排除基准)，否则用左侧勾选的算法，
             都没有就退回 SVR/Lasso。这样研判卡覆盖『所有运行过的模型』。"""
             got = [r.algo_name for r in getattr(self, "results", [])
-                   if not r.error and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)")]
+                   if not r.error and r.algo_name not in BASELINE_NAMES]
             if got:
                 return tuple(got)
             sel = [n for n, cb in self.algo_checkboxes.items() if cb.isChecked() and cb.isEnabled()]
@@ -12108,6 +12197,113 @@ if HAS_PYSIDE6:
             t.horizontalHeader().setStretchLastSection(True)
             self._oplog(f"异动避雷扫描完成：{len(rows)}只，最高分 {rows[0].get('score') if rows else '-'}。")
 
+        # ---- 9.2.1h3b 价值·周期体检标签页(格雷厄姆 + 马克斯『钟摆』)----
+        def _build_value_tab(self) -> QWidget:
+            panel = QWidget(); layout = QVBoxLayout(panel)
+            intro = QLabel(
+                "💡 <b>价值·周期体检</b>（《聪明的投资者》《证券分析》《周期》《投资最重要的事》）：看估值与价格相对"
+                "<b>自身历史</b>的位置，合成<b>温度(0冷~100热)</b>，并列出格雷厄姆防御型可量化项(PE&lt;15/PB&lt;1.5/PE×PB&lt;22.5…，"
+                "拿不到的项标『未检查』、不算通过)。分位只用当日及以前数据。"
+                "<br><span style='color:#c0392b'>⚠ 温度是位置刻度、不预测拐点、不是买卖信号；冷≠马上涨，热≠马上跌。"
+                "无风险收益率为假设值，请按当下修改。非投资建议、盈亏自负。</span>")
+            intro.setWordWrap(True); intro.setStyleSheet("color:#555;background:#fef6f6;padding:6px;border-radius:4px")
+            layout.addWidget(intro)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("股票篮子(逗号分隔，留空=我的自选):"))
+            self.value_codes = QLineEdit(",".join(list(USER_WATCHLIST_CODES)))
+            row.addWidget(self.value_codes, stretch=1)
+            row.addWidget(QLabel("无风险收益率%:"))
+            self.value_rf = QDoubleSpinBox(); self.value_rf.setRange(0.0, 10.0); self.value_rf.setSingleStep(0.1)
+            self.value_rf.setValue(2.5); row.addWidget(self.value_rf)
+            self.value_btn = QPushButton("▶ 体检(温度+格雷厄姆)")
+            self.value_btn.setStyleSheet("font-weight:bold;padding:5px;background:#2e7d5b;color:white;")
+            self.value_btn.clicked.connect(self._on_value_check)
+            row.addWidget(self.value_btn)
+            row.addWidget(QLabel("前向(交易日):"))
+            self.value_h = QSpinBox(); self.value_h.setRange(20, 500); self.value_h.setValue(120); row.addWidget(self.value_h)
+            self.value_study_btn = QPushButton("检验『越便宜越赚吗』")
+            self.value_study_btn.clicked.connect(self._on_value_study)
+            row.addWidget(self.value_study_btn)
+            layout.addLayout(row)
+            self.value_summary = QLabel("尚未体检。需本地数据集(STOCK_LOCAL_DATA_ROOT)或已『更新数据到最新』。")
+            self.value_summary.setWordWrap(True); layout.addWidget(self.value_summary)
+            self.value_table = QTableWidget(); self.value_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            layout.addWidget(self.value_table, stretch=1)
+            self.value_study_box = QTextEdit(); self.value_study_box.setReadOnly(True)
+            self.value_study_box.setMaximumHeight(170); layout.addWidget(self.value_study_box)
+            return panel
+
+        def _value_load_dfs(self) -> Dict[str, pd.DataFrame]:
+            codes = [c.strip() for c in self.value_codes.text().split(",") if c.strip()] or list(USER_WATCHLIST_CODES)
+            root = StockDataFetcher._resolve_local_root()
+            dfs: Dict[str, pd.DataFrame] = {}
+            if not root:
+                return dfs
+            for c in codes:
+                try:
+                    d, _ = _mh_load_local_rich(c, root)
+                    if d is not None and len(d) >= 30:
+                        dfs[c] = d
+                except Exception as e:
+                    self._log(f"[价值体检] {c} 读取失败: {str(e)[:60]}")
+            return dfs
+
+        def _on_value_check(self):
+            self.value_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open("⏳ 价值·周期体检(本地真实数据)…"); QApplication.processEvents()
+            try:
+                dfs = self._value_load_dfs()
+                if not dfs:
+                    raise RuntimeError("没有可用的本地数据：请配置 STOCK_LOCAL_DATA_ROOT，或先到『全局模型』页点『更新数据到最新』。")
+                r = market_temperature(dfs=dfs, rf_yield_pct=self.value_rf.value(), progress_cb=self._log)
+            except Exception as e:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.value_btn.setEnabled(True)
+                QMessageBox.critical(self, "体检失败", str(e)); return
+            QApplication.restoreOverrideCursor(); self._prog_close(); self.value_btn.setEnabled(True)
+            sm = r["summary"]
+            self.value_summary.setText(
+                f"池子 {sm['n_scored']}/{sm['n_total']} 只可算 ｜ 中位温度 <b>{sm.get('median_temp','-')}</b>({sm.get('label','-')}) ｜ "
+                f"过热(≥80)占比 {sm.get('hot_share','-')} ｜ 偏冷(≤20)占比 {sm.get('cold_share','-')}<br>"
+                f"<span style='color:#888'>{r['note']}　{r['disclaimer']}</span>")
+            rows = r["rows"]; t = self.value_table
+            heads = ["代码", "名称", "温度", "位置", "PE", "PB", "PE分位", "PB分位", "格雷厄姆通过", "风险预算系数"]
+            t.setColumnCount(len(heads)); t.setHorizontalHeaderLabels(heads); t.setRowCount(len(rows))
+            fmt = lambda v, p=1: "-" if v is None else f"{v:.{p}f}"
+            for i, x in enumerate(rows):
+                tp = x.get("temperature")
+                bg = (QColor("#fdecea") if isinstance(tp, (int, float)) and tp >= 80 else
+                      QColor("#fcf3e2") if isinstance(tp, (int, float)) and tp >= 60 else
+                      QColor("#e8f1fb") if isinstance(tp, (int, float)) and tp <= 20 else QColor("#ffffff"))
+                vals = [x["code"], str(x.get("name", "")), fmt(tp), x.get("label", ""), fmt(x.get("pe")), fmt(x.get("pb")),
+                        fmt(x.get("pe_pct"), 2), fmt(x.get("pb_pct"), 2), str(x.get("graham", "-")), fmt(x.get("risk_scale"), 2)]
+                for j, v in enumerate(vals):
+                    it = QTableWidgetItem(v); it.setBackground(bg); t.setItem(i, j, it)
+            t.resizeColumnsToContents(); t.horizontalHeader().setStretchLastSection(True)
+            self._oplog(f"价值·周期体检完成：{len(rows)}只，池子中位温度 {sm.get('median_temp','-')}。")
+
+        def _on_value_study(self):
+            self.value_study_btn.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor); self._prog_open("⏳ 检验估值分位→前向收益…"); QApplication.processEvents()
+            try:
+                dfs = self._value_load_dfs()
+                if not dfs:
+                    raise RuntimeError("没有可用的本地数据：请配置 STOCK_LOCAL_DATA_ROOT，或先更新数据。")
+                r = valuation_forward_returns(dfs, horizon=self.value_h.value())
+            except Exception as e:
+                QApplication.restoreOverrideCursor(); self._prog_close(); self.value_study_btn.setEnabled(True)
+                QMessageBox.critical(self, "检验失败", str(e)); return
+            QApplication.restoreOverrideCursor(); self._prog_close(); self.value_study_btn.setEnabled(True)
+            lines = [f"估值分位→前向{r.get('horizon', self.value_h.value())}日收益：{r.get('n_stocks', 0)} 只 / {r['n']} 个观测"]
+            for b in r["bins"]:
+                lines.append(f"  档{b['bin']} {b['range']}  n={b['n']}(有效≈{b['n_eff']})  平均前向 {b['mean_fwd_pct']}%  胜率 {b['win_rate']}")
+            if r["bins"]:
+                lines.append(f"基准 {r['baseline_mean_fwd_pct']}% ｜ 便宜档−昂贵档 {r['cheap_minus_dear_pct']}% ｜ 近似t {r['t_stat_indicative']}")
+            lines.append("➤ " + r["verdict"])
+            if r.get("caveat"):
+                lines.append("ℹ " + r["caveat"])
+            lines.append("⚠ " + r["disclaimer"])
+            self.value_study_box.setPlainText("\n".join(lines))
+
         # ---- 9.2.1h4 暴跌抄反弹标签页（用户规则策略：回测 + 今日买点+风险）----
         def _build_dip_tab(self) -> QWidget:
             panel = QWidget(); layout = QVBoxLayout(panel)
@@ -14210,7 +14406,7 @@ if HAS_PYSIDE6:
             base = next((r for r in results if r.algo_name == "总是涨(方向基准)"), None)
             up_rate = base.metrics.get("DA") if (base and base.metrics) else None
             models = [r for r in results if not r.error
-                      and r.algo_name not in ("Naive(前值)", "总是涨(方向基准)") and r.metrics]
+                      and r.algo_name not in BASELINE_NAMES and r.metrics]
             if not models:
                 return "<p>没有成功训练的模型。</p>"
             best = max(models, key=lambda r: (r.metrics.get("DA") or 0))
@@ -14231,7 +14427,10 @@ if HAS_PYSIDE6:
             bh_q = mc["bh_qvals"][best_pos]
             bh_sig = bh_q is not None and bh_q < 0.05
             # 判定：DA 要①明显高于"总是涨"基准(+3%且>52%) ②单模型统计显著 ③多重比较校验(FDR)后仍显著，才推荐
-            good = (up_rate is not None and da is not None and da >= up_rate + 3.0
+            # 『多数类基准』=max(总是涨, 总是跌)：测试段跌多时，永远猜跌的退化模型 DA 就≥50%(UP_P=0)，不是本事。
+            major = max(up_rate, 100.0 - up_rate) if up_rate is not None else None
+            degenerate = (up_p is not None and float(up_p) == 0.0)      # 从不预测上涨 = 常数/退化预测
+            good = (major is not None and da is not None and da >= major + 3.0 and not degenerate
                     and da >= 52.0 and sig["sig"] and (mc["n"] < 2 or bh_sig))
             mc_note = ""
             if mc["n"] >= 2:
@@ -14254,8 +14453,10 @@ if HAS_PYSIDE6:
                     corr_note = (f"——原始 p={sig['p']} 单独看显著，但对 {mc['n']} 个模型做"
                                  f"多重比较校验(FDR)后 q={bh_q} 不再显著，这正是「矮子里选将军」式虚高的例子")
                 why_bad = (f"最高的 {best.algo_name} DA={da}%" +
-                           (f"，虽高于基准但{sig['text']}{corr_note}" if (up_rate and da and da >= up_rate + 3)
-                            else f"，未明显超基准 {up_rate}%"))
+                           (f"，但它从不预测上涨(UP_P=0)，只是在重复测试段占多数的『跌』，等同常数预测，不算本事"
+                            if degenerate else
+                            f"，虽高于基准但{sig['text']}{corr_note}" if (major and da and da >= major + 3)
+                            else f"，未明显超『多数类基准』{major}%(=max(总是涨{up_rate}%, 总是跌{None if up_rate is None else round(100-up_rate,1)}%))"))
                 verdict = (f"<div style='background:#fff4f4;border:2px solid #c0392b;padding:8px'>"
                            f"<b style='color:#c0392b'>⚠️ 本次没有模型可靠地优于「总是涨」基准</b>"
                            f"（{why_bad}）——<b>不建议据此预测，别信任何单一预测。</b>"
@@ -15592,6 +15793,223 @@ def anomaly_risk_scan(codes: Optional[List[str]] = None, root: Optional[str] = N
             "disclaimer": "主力视角·避雷扫描仅识别异常特征供规避，非投资建议、不荐股、盈亏自负；数据非实时。"}
 
 
+# ==================== 第八部分补充11：价值·周期体检(借鉴《聪明的投资者》《证券分析》《周期》《投资最重要的事》) ====================
+# 书里可落地、又不违背『诚实优先』的部分：
+#   · 格雷厄姆：防御型投资者可量化子集(PE<15 / PB<1.5 / PE×PB<22.5 / 盈利为正 / 规模)，盈利收益率 vs 无风险收益率；
+#   · 马克斯(《周期》《投资最重要的事》)：钟摆——市场/个股在『便宜恐慌 ↔ 昂贵贪婪』间摆动，用估值自身历史分位 +
+#     价格区间位置 + 偏离年线 合成『温度』，温度越高越该收紧风险预算(不预测拐点、不择时)；
+#   · 证券分析：不看单期盈利，看估值相对自身长期历史的位置(安全边际是相对的)。
+# 铁律：所有分位只用 ≤t 数据(因果)；『估值分位→前向收益』用数据检验书里的观点，没效应就如实报没效应。
+def _causal_pct_rank(x: pd.Series, window: int = 2500, min_valid: int = 250) -> pd.Series:
+    """逐日『当日值在过去 window 日(含当日)里的百分位』(0~1)。只用 ≤t 的数据 → 因果、无未来函数。
+    当日非有限值、或窗口内有效样本 < min_valid → NaN(历史太短不硬算)。"""
+    a = pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    def _f(w):
+        cur = w[-1]
+        if not np.isfinite(cur):
+            return np.nan
+        v = w[np.isfinite(w)]
+        if len(v) < min_valid:
+            return np.nan
+        prev = v[:-1]
+        return float(((prev < cur).sum() + 0.5 * (prev == cur).sum()) / len(prev))
+    return a.rolling(window, min_periods=min_valid).apply(_f, raw=True)
+
+
+def _last_pct_rank(x: pd.Series, window: int = 2500, min_valid: int = 250) -> Optional[float]:
+    """只算最后一天的因果百分位(0~1)；样本不足返回 None。"""
+    a = pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).iloc[-window:]
+    if len(a) == 0 or not np.isfinite(a.iloc[-1]):
+        return None
+    v = a.dropna().values
+    if len(v) < min_valid:
+        return None
+    prev, cur = v[:-1], v[-1]
+    return float(((prev < cur).sum() + 0.5 * (prev == cur).sum()) / len(prev))
+
+
+VALUE_TEMP_LABELS = [(20, "偏冷(便宜/恐慌区)"), (40, "偏凉"), (60, "中性"), (80, "偏热"), (101, "过热(昂贵/贪婪区)")]
+
+
+def valuation_cycle_check(df: pd.DataFrame, rf_yield_pct: float = 2.5, window: int = 2500,
+                          min_size_yuan: float = 5e9) -> Dict[str, Any]:
+    """单只股票『价值·周期体检』。输入含 date/close 的升序 df(可选 pe_ttm/pb/ma250/total_mv)。
+    输出：格雷厄姆防御型可量化子集 + 盈利收益率/无风险比 + 估值自身历史分位 + 价格区间位置 + 温度(0冷~100热) + 风险预算系数。
+    rf_yield_pct 是**假设值**(默认 2.5%≈十年期国债量级)，请按当下自行改；温度只是位置刻度，不预测拐点。"""
+    cl = pd.to_numeric(df["close"], errors="coerce")
+    out: Dict[str, Any] = {"as_of": str(pd.Timestamp(df["date"].iloc[-1]).date()) if "date" in df.columns and len(df) else None,
+                           "close": float(cl.iloc[-1]) if len(cl) else None}
+
+    def _last(col):
+        if col not in df.columns:
+            return None
+        v = pd.to_numeric(df[col], errors="coerce").iloc[-1]
+        return float(v) if np.isfinite(v) else None
+    pe, pb, mv = _last("pe_ttm"), _last("pb"), _last("total_mv")
+    out.update({"pe": pe, "pb": pb, "total_mv": mv})
+
+    # ---- 格雷厄姆防御型(只含本地数据能算的；稳定分红/20年盈利/10年增长拿不到→列入 unchecked，不当作通过) ----
+    g: Dict[str, bool] = {}
+    if pe is not None:
+        g["盈利为正(PE>0)"] = pe > 0
+        if pe > 0:
+            g["PE<15"] = pe < 15
+    if pb is not None and pb > 0:
+        g["PB<1.5"] = pb < 1.5
+    if pe is not None and pe > 0 and pb is not None and pb > 0:
+        g["PE×PB<22.5"] = pe * pb < 22.5
+    if mv is not None:
+        g[f"规模≥{min_size_yuan / 1e8:.0f}亿"] = mv >= min_size_yuan
+    out["graham"] = {"checks": g, "passed": int(sum(g.values())), "n": len(g),
+                     "unchecked": ["连续20年分红", "10年盈利无亏损", "10年盈利增长≥1/3", "流动比率≥2(需财报)"]}
+    if pe is not None and pe > 0:
+        ey = 100.0 / pe
+        out["earnings_yield_pct"] = round(ey, 2)
+        out["ey_over_rf"] = round(ey / rf_yield_pct, 2) if rf_yield_pct > 0 else None   # 格雷厄姆：盈利收益率应≥2×债券收益率
+    out["rf_yield_pct_assumed"] = rf_yield_pct
+
+    # ---- 周期温度：四个『相对自身历史』的刻度，有几个算几个 ----
+    comps: Dict[str, float] = {}
+    pe_s = pd.to_numeric(df["pe_ttm"], errors="coerce").where(lambda s: s > 0) if "pe_ttm" in df.columns else None
+    pb_s = pd.to_numeric(df["pb"], errors="coerce").where(lambda s: s > 0) if "pb" in df.columns else None
+    pe_pct = _last_pct_rank(pe_s, window) if pe_s is not None else None
+    pb_pct = _last_pct_rank(pb_s, window) if pb_s is not None else None
+    out["pe_pct"], out["pb_pct"] = pe_pct, pb_pct
+    if pe_pct is not None:
+        comps["PE历史分位"] = pe_pct * 100
+    if pb_pct is not None:
+        comps["PB历史分位"] = pb_pct * 100
+    if len(cl) >= 250:
+        tail = cl.iloc[-1250:]
+        lo, hi = float(tail.min()), float(tail.max())
+        if hi > lo:
+            out["pos_5y"] = round((float(cl.iloc[-1]) - lo) / (hi - lo), 3)
+            comps["5年价格区间位置"] = out["pos_5y"] * 100
+        out["drawdown_5y_high_pct"] = round((float(cl.iloc[-1]) / hi - 1) * 100, 1)
+        ma250 = pd.to_numeric(df["ma250"], errors="coerce") if "ma250" in df.columns else cl.rolling(250).mean()
+        dist = (cl / ma250 - 1) * 100
+        dist_pct = _last_pct_rank(dist, window)
+        out["dist_ma250_pct_now"] = round(float(dist.iloc[-1]), 1) if np.isfinite(dist.iloc[-1]) else None
+        if dist_pct is not None:
+            comps["偏离年线分位"] = dist_pct * 100
+    out["components"] = {k: round(v, 1) for k, v in comps.items()}
+    if comps:
+        w = {"PE历史分位": 0.30, "PB历史分位": 0.25, "5年价格区间位置": 0.25, "偏离年线分位": 0.20}
+        tw = sum(w[k] for k in comps)
+        temp = sum(w[k] * v for k, v in comps.items()) / tw
+        out["temperature"] = round(float(temp), 1)
+        out["label"] = next(lbl for th, lbl in VALUE_TEMP_LABELS if temp < th)
+        # 风险预算系数(启发式、非拟合)：温度≤50 不动；50→100 线性收紧到 0.5。『贵时少冒险』的通用纪律，非个股建议
+        out["risk_scale"] = round(float(1.0 - 0.5 * max(0.0, temp - 50.0) / 50.0), 2)
+    else:
+        out["temperature"], out["label"], out["risk_scale"] = None, "历史数据不足(温度未算)", None
+    out["note"] = ("温度=估值与价格相对『自身历史』的位置(0冷~100热)，是刻度不是择时信号：冷不等于马上涨(可能便宜还更便宜)，"
+                   "热不等于马上跌。书里的核心是『价格相对价值的位置决定风险』，而非预测拐点。")
+    out["disclaimer"] = "价值·周期体检仅供研究，非投资建议、不荐股、盈亏自负；估值字段来自本地/联网数据，可能滞后或缺失。"
+    return out
+
+
+def market_temperature(codes: Optional[List[str]] = None, root: Optional[str] = None,
+                       dfs: Optional[Dict[str, pd.DataFrame]] = None, rf_yield_pct: float = 2.5,
+                       progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """一篮子股票的『市场温度计』(马克斯的钟摆)：逐只算温度，汇总中位温度 + 过热/偏冷占比。
+    dfs 可直接传 {code: DataFrame}(测试/外部数据)；否则按 codes 从本地读(自动优先 data_updated)。"""
+    log = progress_cb or (lambda m: None)
+    rows: List[Dict[str, Any]] = []
+    if dfs is None:
+        codes = codes or list(USER_WATCHLIST_CODES)
+        root = root or StockDataFetcher._resolve_local_root()
+        dfs = {}
+        for c in [x.strip() for x in codes if x.strip()]:
+            try:
+                d, _ = (_mh_load_local_rich(c, root) if root else (None, False))
+                if d is not None and len(d) >= 30:
+                    dfs[c] = d
+                else:
+                    rows.append({"code": c, "name": "", "temperature": None, "label": "数据不足"})
+            except Exception as e:
+                rows.append({"code": c, "name": "", "temperature": None, "label": f"出错:{str(e)[:40]}"})
+    for i, (c, d) in enumerate(dfs.items(), 1):
+        try:
+            r = valuation_cycle_check(d, rf_yield_pct=rf_yield_pct)
+            nm = str(d["name"].iloc[-1]) if "name" in d.columns and len(d) else c
+            rows.append({"code": c, "name": nm, "temperature": r["temperature"], "label": r["label"],
+                         "pe": r["pe"], "pb": r["pb"], "pe_pct": r["pe_pct"], "pb_pct": r["pb_pct"],
+                         "risk_scale": r["risk_scale"], "graham": f"{r['graham']['passed']}/{r['graham']['n']}",
+                         "as_of": r["as_of"]})
+            log(f"[{i}/{len(dfs)}] {c} {nm}: 温度 {r['temperature']} {r['label']}")
+        except Exception as e:
+            rows.append({"code": c, "name": "", "temperature": None, "label": f"出错:{str(e)[:40]}"})
+    scored = sorted([x for x in rows if isinstance(x.get("temperature"), (int, float))], key=lambda x: -x["temperature"])
+    other = [x for x in rows if not isinstance(x.get("temperature"), (int, float))]
+    temps = np.array([x["temperature"] for x in scored], dtype=float)
+    summ: Dict[str, Any] = {"n_scored": int(len(temps)), "n_total": len(rows)}
+    if len(temps):
+        med = float(np.median(temps))
+        summ.update({"median_temp": round(med, 1), "mean_temp": round(float(temps.mean()), 1),
+                     "hot_share": round(float((temps >= 80).mean()), 3), "cold_share": round(float((temps <= 20).mean()), 3),
+                     "label": next(lbl for th, lbl in VALUE_TEMP_LABELS if med < th)})
+    return {"summary": summ, "rows": scored + other,
+            "note": "池子的温度只反映『这篮子股票』相对各自历史的估值位置，不等于大盘；样本小、含选股偏差时仅作参考。",
+            "disclaimer": "市场温度计仅供研究，非投资建议、不荐股、盈亏自负。"}
+
+
+def valuation_forward_returns(dfs: Dict[str, pd.DataFrame], horizon: int = 120, metric: str = "pe_ttm",
+                              n_bins: int = 5, window: int = 2500, min_valid: int = 250) -> Dict[str, Any]:
+    """用数据检验书里的观点：『相对自身历史越便宜(估值分位低)，随后 horizon 个交易日收益越高吗？』
+    分位逐日因果(只用 ≤t)，前向收益(t→t+h)仅作结果、绝不进特征。池化各股，按分位分 n_bins 档报：样本数/有效样本
+    (≈n/h，因窗口重叠)/平均前向收益/胜率，并给『最便宜档−最贵档』价差 + 隔 h 日抽样的近似 t 值。
+    没效应就如实说没效应。幸存者偏差(本地库只含仍可取数的股票)与同期相关会高估显著性，结论只作线索。"""
+    if metric not in ("pe_ttm", "pb"):
+        raise ValueError("metric 只支持 pe_ttm / pb")
+    bins_l, fwd_l, samp_l = [], [], []
+    for d in dfs.values():
+        if d is None or metric not in d.columns or "close" not in d.columns or len(d) < min_valid + horizon + 5:
+            continue
+        x = pd.to_numeric(d[metric], errors="coerce").where(lambda s: s > 0)
+        pct = _causal_pct_rank(x, window, min_valid)
+        cl = pd.to_numeric(d["close"], errors="coerce")
+        fwd = cl.shift(-horizon) / cl - 1
+        ok = pct.notna() & fwd.notna()
+        if not ok.any():
+            continue
+        idx = np.arange(len(d))[ok.values]
+        b = np.minimum((pct[ok].values * n_bins).astype(int), n_bins - 1)
+        bins_l.append(b); fwd_l.append(fwd[ok].values.astype(float)); samp_l.append((idx % horizon) == 0)
+    if not bins_l:
+        return {"bins": [], "n": 0, "verdict": "数据不足：没有足够历史(>=%d日+前向%d日)的股票可检验。" % (min_valid, horizon),
+                "disclaimer": "仅供研究，非投资建议。"}
+    B, F, S = np.concatenate(bins_l), np.concatenate(fwd_l), np.concatenate(samp_l)
+    base = float(F.mean())
+    rows = []
+    for k in range(n_bins):
+        m = B == k
+        n = int(m.sum())
+        rows.append({"bin": k + 1, "range": f"{k / n_bins:.0%}-{(k + 1) / n_bins:.0%}分位", "n": n,
+                     "n_eff": round(n / horizon, 1),
+                     "mean_fwd_pct": round(float(F[m].mean() * 100), 2) if n else None,
+                     "win_rate": round(float((F[m] > 0).mean()), 3) if n else None})
+    spread = None; t = None
+    lo, hi = F[(B == 0) & S], F[(B == n_bins - 1) & S]
+    if (B == 0).any() and (B == n_bins - 1).any():
+        spread = round(float(F[B == 0].mean() - F[B == n_bins - 1].mean()) * 100, 2)
+    if len(lo) > 5 and len(hi) > 5:
+        se = float(np.sqrt(lo.var(ddof=1) / len(lo) + hi.var(ddof=1) / len(hi)))
+        t = round(float((lo.mean() - hi.mean()) / se), 2) if se > 0 else None
+    if t is None or abs(t) < 2:
+        verdict = "未检出『便宜档显著优于昂贵档』——估值分位在本样本里不足以当作择时依据(这本身就是诚实的结论)。"
+    elif t > 0:
+        verdict = "样本内便宜档前向收益高于昂贵档(t≈%.1f)；但受幸存者偏差/同期相关/估值中枢漂移影响，须样本外再验证，且≠买卖信号。" % t
+    else:
+        verdict = "样本内昂贵档反而更好(t≈%.1f)：多半是动量/成长溢价掩盖了估值效应，估值分位不宜单独使用。" % t
+    return {"metric": metric, "horizon": horizon, "n": int(len(F)), "n_stocks": len(bins_l),
+            "baseline_mean_fwd_pct": round(base * 100, 2), "bins": rows,
+            "cheap_minus_dear_pct": spread, "t_stat_indicative": t, "verdict": verdict,
+            "caveat": "前向窗口重叠→有效样本≈n/h；本地库有幸存者偏差；t 值仅隔 h 日抽样、未处理跨股同期相关，偏乐观。",
+            "disclaimer": "估值分位→前向收益的检验仅供研究，非投资建议、不荐股、盈亏自负。"}
+
+
 # ==================== 第八部分补充10：『暴跌抄反弹』规则策略回测 + 今日买点扫描 ====================
 # 规则(用户提出)：近 n_win 日里至少 x_down 天下跌(+可选回撤≥drop%)(+可选月均线过滤) 且『最后一天是涨的』→ 买入，
 # 持 y_hold 个交易日后卖出。这是短期『超卖反弹』的机械规则，全程因果(信号只用当日及以前)、用未来 y 日真实收益结算。
@@ -16078,7 +16496,7 @@ def vote_strategy_backtest(codes: List[str], algos: Optional[List[str]] = None,
             res = TrainingPipeline(cfg).run_batch(algos, df)
             good = [r for r in res if (not r.error) and r.y_test_pred is not None
                     and r.prev_close is not None and len(r.y_test_pred) == len(r.prev_close)]
-            good = [r for r in good if not r.algo_name.startswith(("Naive", "总是涨"))]
+            good = [r for r in good if not r.algo_name.startswith(("Naive", "总是涨", "总是跌"))]
             if len(good) < 3:
                 log(f"[{i}/{len(codes)}] {code} 有效模型不足，跳过"); continue
             prev = np.asarray(good[0].prev_close, float)
@@ -16324,6 +16742,7 @@ def run_experiment(code: str = "600519",
             for r in results
         ],
         "forecast": forecasts,
+        "trust_gate": directional_trust_gate(results, horizon=horizon),
     }
 
 
@@ -16374,6 +16793,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="选股排序不做行业/市值中性化(默认做)。加上它可对比：中性化前后 RankIC/size暴露差多少")
     p.add_argument("--avoid-scan", action="store_true",
                    help="『主力视角·避雷扫描』：对一篮子股票算异动/操纵风险分并排序(高=建议回避)。配 --global-scope/--global-codes 选池")
+    p.add_argument("--value-check", action="store_true",
+                   help="『价值·周期体检』(格雷厄姆+马克斯)：逐只算估值/价格相对自身历史的温度 + 格雷厄姆可量化项 + 市场温度计。配 --global-scope/--global-codes 选池")
+    p.add_argument("--value-study", action="store_true",
+                   help="检验『估值越便宜、随后收益越高吗』：估值历史分位(因果)分档 vs 前向收益，没效应如实报。配 --value-horizon/--value-metric")
+    p.add_argument("--value-horizon", type=int, default=120, help="--value-study 的前向期限(交易日，默认120≈半年)")
+    p.add_argument("--value-metric", choices=["pe_ttm", "pb"], default="pe_ttm", help="--value-study 用的估值口径")
+    p.add_argument("--value-rf", type=float, default=2.5, help="假设的无风险收益率%%(默认2.5，请按当下自行修改)")
     p.add_argument("--dip-backtest", action="store_true",
                    help="『暴跌抄反弹』回测：近N日≥X跌+末日涨(+可选回撤/月线)→持Y日卖，报胜率/净收益。配 --dip-* 参数")
     p.add_argument("--dip-scan", action="store_true",
@@ -16453,6 +16879,15 @@ def run_cli(args: argparse.Namespace) -> Dict[str, Any]:
         print(row)
     print("=" * 78)
     print("提示：任何模型都应明显优于 Naive(前值) 才算真的有用；DA(方向准确率) 需显著 > 50%。")
+    tg = out.get("trust_gate") or {}
+    if tg.get("rows"):
+        print("\n【方向可信度闸门】DA 须同时超过『多数类基准』=max(总是涨,总是跌)，且非常数预测、FDR校正后显著、逐年稳定")
+        print(f"{'算法':<14}{'DA%':>7}{'多数基准%':>10}{'超额':>7}{'预测涨占比':>10}{'q(BH)':>8}{'年份':>7}  判定")
+        for x in tg["rows"]:
+            print(f"{x['algo']:<14}{x['da']:>7}{x['majority_baseline']:>10}{x['excess']:>+7.1f}{x['pred_up_rate']:>10}"
+                  f"{str(x['q_bh']):>8}{str(x['years_beating'])+'/'+str(x['years_total']):>7}  "
+                  f"{'✅通过' if x['passed'] else '❌未过'} {x['why']}")
+        print(f"→ {tg['n_passed']}/{tg['n_models']} 个模型通过。⚠ {tg['disclaimer']}")
 
     if out["forecast"]:
         print("\n【向前预测：最新窗口 -> 下一交易日收盘价】")
@@ -16700,6 +17135,52 @@ def main():
             print(f"{x['code']:>9}{str(x.get('name',''))[:6]:>9}{str(sc):>8}   {x['level']}｜" + "；".join(x["reasons"][:3]))
         print("=" * 70)
         print("⚠ " + r["disclaimer"])
+        return
+
+    # --value-check / --value-study：价值·周期体检(格雷厄姆 + 马克斯『钟摆』)
+    if args.value_check or args.value_study:
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
+        root = StockDataFetcher._resolve_local_root()
+        dfs: Dict[str, pd.DataFrame] = {}
+        for c in codes:
+            try:
+                d, _ = (_mh_load_local_rich(c, root) if root else (None, False))
+                if d is not None and len(d) >= 30:
+                    dfs[c] = d
+            except Exception as e:
+                print(f"[value] {c} 读取失败: {str(e)[:60]}")
+        if not dfs:
+            print("[value] 没有可用的本地数据(需配置 STOCK_LOCAL_DATA_ROOT 或先 --update-data)，已退出。")
+            return
+        if args.value_check:
+            r = market_temperature(dfs=dfs, rf_yield_pct=args.value_rf)
+            sm = r["summary"]
+            print("\n" + "=" * 78)
+            print(f"价值·周期体检：{sm['n_scored']}/{sm['n_total']} 只可算 | 池子中位温度 {sm.get('median_temp','-')}"
+                  f"({sm.get('label','-')}) | 过热(≥80)占比 {sm.get('hot_share','-')} | 偏冷(≤20)占比 {sm.get('cold_share','-')}")
+            print("-" * 78)
+            print(f"{'代码':>8}{'名称':>8}{'温度':>7}  {'PE':>7}{'PB':>6}{'PE分位':>8}{'PB分位':>8}{'格雷厄姆':>9}  风险预算系数/位置")
+            for x in r["rows"]:
+                f = lambda v, p=1: "-" if v is None else f"{v:.{p}f}"
+                print(f"{x['code']:>8}{str(x.get('name',''))[:5]:>8}{f(x.get('temperature')):>7}  {f(x.get('pe')):>7}{f(x.get('pb')):>6}"
+                      f"{f(x.get('pe_pct'),2):>8}{f(x.get('pb_pct'),2):>8}{str(x.get('graham','-')):>9}  ×{f(x.get('risk_scale'),2)} {x['label']}")
+            print("=" * 78)
+            print("ℹ " + r["note"]); print("⚠ " + r["disclaimer"])
+        if args.value_study:
+            r = valuation_forward_returns(dfs, horizon=args.value_horizon, metric=args.value_metric)
+            print("\n" + "=" * 78)
+            print(f"估值分位→前向{args.value_horizon}日收益检验({args.value_metric})：{r.get('n_stocks',0)} 只/{r['n']} 个观测")
+            for b in r["bins"]:
+                print(f"  档{b['bin']} {b['range']:<14} n={b['n']:>7} (有效≈{b['n_eff']:>7}) 平均前向 {b['mean_fwd_pct']}%  胜率 {b['win_rate']}")
+            if r["bins"]:
+                print(f"  基准(全样本)平均 {r['baseline_mean_fwd_pct']}% | 便宜档−昂贵档 {r['cheap_minus_dear_pct']}% | 近似t {r['t_stat_indicative']}")
+            print("➤ " + r["verdict"])
+            if r.get("caveat"):
+                print("ℹ " + r["caveat"])
+            print("⚠ " + r["disclaimer"]); print("=" * 78)
         return
 
     # --dip-daily：每日信号(买点+风险) → 手机HTML + 可选推送
