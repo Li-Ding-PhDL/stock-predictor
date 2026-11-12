@@ -53,15 +53,18 @@ def test_r3_naive_baseline_and_da_present():
 # ============ 红线 R2：标准化只在训练集 fit ============
 def test_r2_scaler_fit_on_train_only():
     pytest.importorskip("sklearn")
-    from sklearn.preprocessing import StandardScaler
-    rng = np.random.default_rng(0)
-    # 训练段均值0方差1，测试段整体平移（若在全量 fit，测试段均值会被拉回0附近）
-    Xtr = rng.normal(0, 1, size=(200, 3))
-    Xte = rng.normal(5, 1, size=(80, 3))
-    sc = StandardScaler().fit(Xtr)           # 只在训练集 fit
-    zte = sc.transform(Xte)
-    # 正确做法下：测试集变换后均值应显著偏离 0（≈+5），证明没在测试集/全量上 fit
-    assert np.mean(zte) > 3.0
+    raw = s.StockDataFetcher.generate_synthetic_data(n_days=400)
+    pipe = s.TrainingPipeline(s.TrainConfig(horizon=5))
+    X, y, ends = pipe.fe.build_supervised_samples(raw)
+    anchors = pipe.fe.anchor_dates_.copy()
+    a = int(len(X) * pipe.config.train_ratio)
+    train_idx = np.flatnonzero((ends.iloc[:a] < anchors.iloc[a]).to_numpy())
+    data = pipe.prepare_data(raw)
+    # 检查项目实际管道拟合的统计量，不能只测试 sklearn 自己。
+    assert np.allclose(pipe.fe.scaler_x.mean_, X[train_idx].mean(axis=0))
+    assert np.allclose(pipe.fe.scaler_y.mean_, y[train_idx].mean())
+    assert pipe.fe.scaler_x.n_samples_seen_ == len(data.X_train) == len(train_idx)
+    assert data.d_train.max() < anchors.iloc[a]
 
 
 # ============ 冻结特征指纹 ============
@@ -197,6 +200,10 @@ def test_build_multi_horizon_causal(tmp_path):
     # 因果(逐期限)：期限 h 的每一行，其锚定日之后必须至少还有 h 个交易日(该行目标窗口真实存在、不越界取未来)。
     # 新构造允许最近日期贡献短周期样本，故按『每个 h 单独留 h 天』校验，而非一刀切留 max(h)。
     df_raw, _ = s._mh_load_local_rich(code, root)
+    positions = {pd.Timestamp(d): i for i, d in enumerate(df_raw["date"])}
+    for row in ds.itertuples():
+        expected_end = df_raw["date"].iloc[positions[pd.Timestamp(row.date)] + int(row.h)]
+        assert pd.Timestamp(row.label_end_date) == pd.Timestamp(expected_end)
     for h in [1, 5, 10]:
         sub = ds[ds["h"] == h]
         if len(sub) == 0:

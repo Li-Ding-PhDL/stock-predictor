@@ -1534,31 +1534,55 @@ class StockDataFetcher:
 
     @staticmethod
     def fetch_realtime(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
-        """实时盘口快照(用于盘中监控)：akshare stock_bid_ask_em，数据源=东方财富。
-        返回字典(现价/涨跌幅/今开最高最低/量比/换手/成交量额 + 买卖5档)。仅监控展示，不作历史训练。"""
+        """东方财富实时盘口；显式超时，五档量和累计成交量统一为手。
+
+        使用与本机AkShare相同的公开接口，直接读取其原始手数；避免AkShare将五档量乘100
+        转为股后被界面误标成手。仅作监控，不作历史训练；接收时间不是源行情时间。
+        """
+        code = str(code).strip()
+        if not re.fullmatch(r"[0-9]{6}", code):
+            raise ValueError("股票代码必须是六位数字。")
+        try:
+            import requests
+        except ImportError as exc:
+            raise RuntimeError("实时行情需要requests，请安装：pip install requests") from exc
+        fields = ("f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,"
+                  "f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,"
+                  "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f60,f71,f168,f169,f170,f530")
+        def request():
+            response = requests.get("https://push2.eastmoney.com/api/qt/stock/get",
+                                    params={"fltt": "2", "invt": "2", "fields": fields,
+                                            "secid": f"{1 if code.startswith('6') else 0}.{code}"},
+                                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+                                    timeout=8)
+            response.raise_for_status()
+            data = response.json().get("data")
+            if not isinstance(data, dict) or not data:
+                raise RuntimeError("实时行情接口返回空数据。")
+            if str(data.get("f57", code)) != code:
+                raise RuntimeError("实时行情返回的股票代码不匹配。")
+            return data
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            d = StockDataFetcher._retry(lambda: ak.stock_bid_ask_em(symbol=code), tries=2, delay=0.8)
-        # d 为两列(item/value)
-        m = {}
-        try:
-            m = d.set_index(d.columns[0])[d.columns[1]].to_dict()
-        except Exception:
-            pass
-        def g(*keys):
-            for k in keys:
-                if k in m and m[k] not in ("", "-", None):
-                    return m[k]
-            return None
-        # 买卖5档
-        bids = [(g(f"buy_{i}"), g(f"buy_{i}_vol")) for i in range(1, 6)]
-        asks = [(g(f"sell_{i}"), g(f"sell_{i}_vol")) for i in range(1, 6)]
+            m = StockDataFetcher._retry(request, tries=2, delay=0.8)
+        def g(key):
+            value = m.get(key)
+            if value in ("", "-", None):
+                return None
+            try:
+                value = float(value)
+                return value if np.isfinite(value) else None
+            except (TypeError, ValueError):
+                return None
+        bids = [(g(f"f{19 - 2*i}"), g(f"f{20 - 2*i}")) for i in range(5)]
+        asks = [(g(f"f{39 - 2*i}"), g(f"f{40 - 2*i}")) for i in range(5)]
         return {
-            "price": g("最新"), "pct": g("涨幅"), "chg": g("涨跌"),
-            "open": g("今开"), "high": g("最高"), "low": g("最低"), "prev": g("昨收"),
-            "avg": g("均价"), "vol": g("总手"), "amount": g("金额"),
-            "turnover": g("换手"), "vol_ratio": g("量比"),
-            "limit_up": g("涨停"), "limit_down": g("跌停"),
+            "price": g("f43"), "pct": g("f170"), "chg": g("f169"),
+            "open": g("f46"), "high": g("f44"), "low": g("f45"), "prev": g("f60"),
+            "avg": g("f71"), "vol": g("f47"), "amount": g("f48"),
+            "turnover": g("f168"), "vol_ratio": g("f50"),
+            "limit_up": g("f51"), "limit_down": g("f52"), "book_volume_unit": "手",
+            "received_at": dt.datetime.now().isoformat(timespec="seconds"),
             "bids": bids, "asks": asks, "raw": m,
         }
 
@@ -1853,6 +1877,7 @@ class FeatureEngineer:
         dates = df["date"]
 
         X, y, sample_dates, prev_close, close_target = [], [], [], [], []
+        anchor_dates = []
         # 回测真实化所需的逐样本日线细节：基准日(买入日)与目标日(卖出日)的当日涨跌、是否一字板、成交量
         base_ret, base_locked, base_vol = [], [], []
         exit_ret, exit_locked, exit_vol = [], [], []
@@ -1870,6 +1895,7 @@ class FeatureEngineer:
             else:
                 y.append(target)
             sample_dates.append(dates.iloc[i + self.horizon - 1])
+            anchor_dates.append(dates.iloc[i - 1])
             # --- 基准日(准备买入的那天，df 行 i-1) ---
             bi = i - 1
             base_ret.append(close[bi] / (close[bi - 1] + 1e-12) - 1.0 if bi >= 1 else 0.0)
@@ -1882,6 +1908,7 @@ class FeatureEngineer:
             exit_vol.append(volv[ti])
 
         self.prev_close_ = np.array(prev_close)
+        self.anchor_dates_ = pd.Series(anchor_dates).reset_index(drop=True)
         self.close_target_ = np.array(close_target)
         # 逐样本日线细节(供回测判断涨跌停买不进/卖不出、停牌)
         self.bar_info_ = {
@@ -3129,6 +3156,45 @@ HPO_REGISTRY: Dict[str, Callable] = {
 }
 
 
+def _purged_date_split(ds: pd.DataFrame, split_date):
+    """按锚定日期切分，移除标签在下一段开始时尚未结束的训练样本。
+
+    label_end_date 是真实交易日，不能用自然日/工作日估算多期限标签结束时间。
+    同日样本始终属于同一段；边界采用严格小于，保守隔离收盘时点。
+    """
+    split = pd.Timestamp(split_date)
+    dates = pd.to_datetime(ds["date"])
+    ends = pd.to_datetime(ds["label_end_date"])
+    if dates.isna().any() or ends.isna().any() or (ends < dates).any():
+        raise ValueError("样本日期或标签结束日期无效。")
+    return (ds[(dates < split) & (ends < split)].sort_values("date"),
+            ds[dates >= split].sort_values("date"))
+
+
+def _temporal_hpo_data(X, y, anchor_dates, label_end_dates, scale_y=False):
+    """内部调参按完整日期留出末20%，隔离跨界标签并仅在内部训练段拟合缩放器。"""
+    dates = pd.to_datetime(pd.Series(anchor_dates)).reset_index(drop=True)
+    ends = pd.to_datetime(pd.Series(label_end_dates)).reset_index(drop=True)
+    unique_dates = np.sort(dates.dropna().unique())
+    if len(unique_dates) < 3 or len(dates) != len(X) or len(ends) != len(X):
+        raise ValueError("调参需要至少三个有效锚定日期，且日期与样本长度一致。")
+    if dates.isna().any() or ends.isna().any() or (ends < dates).any():
+        raise ValueError("调参样本的日期或标签结束日期无效。")
+    cutoff = unique_dates[max(1, int(len(unique_dates) * 0.8))]
+    tr = np.flatnonzero(((dates < cutoff) & (ends < cutoff)).to_numpy())
+    va = np.flatnonzero((dates >= cutoff).to_numpy())
+    if len(tr) < 2 or not len(va):
+        raise ValueError("隔离跨界标签后，调参训练/验证样本不足。")
+    X, y = np.asarray(X), np.asarray(y)
+    sx = StandardScaler().fit(X[tr])
+    yt, yv = y[tr], y[va]
+    if scale_y:
+        sy = StandardScaler().fit(yt.reshape(-1, 1))
+        yt = sy.transform(yt.reshape(-1, 1)).ravel()
+        yv = sy.transform(yv.reshape(-1, 1)).ravel()
+    return sx.transform(X[tr]), yt, sx.transform(X[va]), yv
+
+
 def run_hpo(method: str, model_cls: Callable[..., BaseModel],
             X_train, y_train, X_val, y_val, n_trials: int = 20,
             model_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
@@ -3216,6 +3282,7 @@ class PreparedData:
     close_val: np.ndarray
     close_test: np.ndarray
     bar_info_test: Optional[Dict[str, np.ndarray]] = None  # 测试段逐样本日线细节(供真实化回测)
+    anchor_train: Optional[pd.Series] = None
 
 
 class TrainingPipeline:
@@ -3285,17 +3352,27 @@ class TrainingPipeline:
         n_val = int(n * self.config.val_ratio) if self.config.val_ratio > 0 else rest // 2
         n_val = max(0, min(n_val, rest))
         b = a + n_val
-        self.fe.fit_scale(X[:a], y[:a])                          # 只在训练集上 fit，防止数据泄漏
         d = dates.reset_index(drop=True)
+        anchors = self.fe.anchor_dates_
+        if not (0 < a < b < n):
+            raise ValueError("训练/验证/测试三段必须均非空，请调整比例或增加历史数据。")
+        # 按目标日期切段后，再要求上一段标签早于下一段首个预测锚定日。
+        tr = np.flatnonzero((d.iloc[:a] < anchors.iloc[a]).to_numpy())
+        va = np.flatnonzero((d.iloc[a:b] < anchors.iloc[b]).to_numpy()) + a
+        te = np.arange(b, n)
+        if len(tr) < 2 or not len(va):
+            raise ValueError("隔离多期限跨界标签后样本不足，请增加历史数据或调整比例。")
+        self.fe.fit_scale(X[tr], y[tr])
         return PreparedData(
-            X_train=self.fe.transform(X[:a]), X_val=self.fe.transform(X[a:b]),
-            X_test=self.fe.transform(X[b:]),
-            y_train=y[:a], y_val=y[a:b], y_test=y[b:],
-            d_train=d[:a].reset_index(drop=True), d_val=d[a:b].reset_index(drop=True),
-            d_test=d[b:].reset_index(drop=True),
-            prev_close_train=pc[:a], prev_close_val=pc[a:b], prev_close_test=pc[b:],
-            close_train=ct[:a], close_val=ct[a:b], close_test=ct[b:],
-            bar_info_test={k: v[b:] for k, v in getattr(self.fe, "bar_info_", {}).items()},
+            X_train=self.fe.transform(X[tr]), X_val=self.fe.transform(X[va]),
+            X_test=self.fe.transform(X[te]),
+            y_train=y[tr], y_val=y[va], y_test=y[te],
+            d_train=d.iloc[tr].reset_index(drop=True), d_val=d.iloc[va].reset_index(drop=True),
+            d_test=d.iloc[te].reset_index(drop=True),
+            prev_close_train=pc[tr], prev_close_val=pc[va], prev_close_test=pc[te],
+            close_train=ct[tr], close_val=ct[va], close_test=ct[te],
+            bar_info_test={k: v[te] for k, v in getattr(self.fe, "bar_info_", {}).items()},
+            anchor_train=anchors.iloc[tr].reset_index(drop=True),
         )
 
     def _feature_importance(self, model, topn: int = 8):
@@ -3347,9 +3424,9 @@ class TrainingPipeline:
             # ---- 8.2.2 超参数优化（若启用） ----
             if self.config.hpo_method and self.config.hpo_method != "关闭":
                 log(f"[{algo_name}] 正在用 {self.config.hpo_method} 方法做超参数寻优 ...")
-                n_val = max(1, int(len(X_train) * 0.2))
-                X_tr, X_val = X_train[:-n_val], X_train[-n_val:]
-                y_tr, y_val = y_train_s[:-n_val], y_train_s[-n_val:]
+                X_tr, y_tr, X_val, y_val = _temporal_hpo_data(
+                    self.fe.scaler_x.inverse_transform(X_train), y_train,
+                    pdata.anchor_train, pdata.d_train, scale_y=True)
                 best_params = run_hpo(self.config.hpo_method, model_cls, X_tr, y_tr, X_val, y_val,
                                        n_trials=self.config.hpo_trials, model_kwargs=mk)
 
@@ -3375,7 +3452,7 @@ class TrainingPipeline:
             if self.config.use_cv:
                 log(f"[{algo_name}] 正在做 {self.config.cv_folds} 折交叉验证 ...")
                 cv_metrics = self._cross_validate(model_cls, best_params, X_train, y_train_s,
-                                                  y_train, mk)
+                                                  y_train, mk, pdata.anchor_train, pdata.d_train)
 
             formula = model.get_formula() if hasattr(model, "get_formula") else None
 
@@ -3394,7 +3471,8 @@ class TrainingPipeline:
 
     # ---------- 8.3 K 折交叉验证（时间序列专用：前扩窗口 walk-forward，只用过去预测未来，绝不泄漏）----------
     def _cross_validate(self, model_cls, best_params, X, y_scaled, y_raw,
-                        model_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+                        model_kwargs: Optional[Dict[str, Any]] = None,
+                        anchor_dates=None, label_end_dates=None) -> Dict[str, float]:
         """时间序列交叉验证必须用『前扩窗口』：第 k 折只用它**之前**的数据训练、预测紧邻的下一折。
         绝不能像普通 K 折那样把验证折之后的『未来』也拿去训练——那是用未来预测过去的数据泄漏。
         (评估口径说明：DA/UP_P 需价格还原故此处略去；其余指标在目标空间 price/return 内计算，
@@ -3417,8 +3495,15 @@ class TrainingPipeline:
             start, end = k * block, (k + 1) * block if k < folds else n
             if start >= end - 1 or start < 1:
                 continue
-            X_tr_raw = X_raw[:start]          # 只用验证折之前的数据(前扩窗口)，杜绝未来泄漏
-            y_tr_raw = y_raw[:start]
+            # 兼容直接调用；缺少日期时按样本跨度保守隔离 horizon 个样本。
+            train_idx = np.arange(max(0, start - self.config.horizon))
+            if anchor_dates is not None and label_end_dates is not None:
+                train_idx = np.flatnonzero((pd.to_datetime(label_end_dates[:start]) <
+                                           pd.Timestamp(anchor_dates.iloc[start])).to_numpy())
+            if len(train_idx) < 2:
+                continue
+            X_tr_raw = X_raw[train_idx]
+            y_tr_raw = y_raw[train_idx]
             X_va_raw, y_va_raw = X_raw[start:end], y_raw[start:end]
             try:
                 # 每折独立 fit scaler：只看该折之前的数据，不引入后续折的均值/方差
@@ -3428,7 +3513,22 @@ class TrainingPipeline:
                 X_tr = sc_x.transform(X_tr_raw)
                 X_va = sc_x.transform(X_va_raw)
                 y_tr = sc_y.transform(y_tr_raw.reshape(-1, 1)).ravel()
-                m = model_cls(**{**model_kwargs, **best_params})
+                fold_params = best_params
+                if self.config.hpo_method and self.config.hpo_method != "关闭":
+                    # 不能把整段训练集挑出的参数倒灌早期CV折；每折仅在自己的过去段内调参。
+                    fold_params = {}
+                    if anchor_dates is not None and label_end_dates is not None:
+                        try:
+                            hx, hy, vx, vy = _temporal_hpo_data(
+                                X_tr_raw, y_tr_raw, anchor_dates.iloc[train_idx],
+                                label_end_dates.iloc[train_idx], scale_y=True)
+                        except ValueError:
+                            pass  # 小折无法再切分时使用默认参数，不借用未来折的选择结果。
+                        else:
+                            fold_params = run_hpo(self.config.hpo_method, model_cls,
+                                                  hx, hy, vx, vy, n_trials=self.config.hpo_trials,
+                                                  model_kwargs=model_kwargs)
+                m = model_cls(**{**model_kwargs, **fold_params})
                 m.fit(X_tr, y_tr)
                 pred_s = m.predict(X_va)
                 pred = sc_y.inverse_transform(pred_s.reshape(-1, 1)).ravel()
@@ -5546,11 +5646,14 @@ def walk_forward_eval(algo_name: str, raw_df: pd.DataFrame, target_mode: str = "
         te_end = (k + 1) * block if k < n_folds else n
         if tr_end < 30 or te_end <= tr_end:
             continue
-        fe.fit_scale(X[:tr_end], y[:tr_end])        # 只在该折之前的数据上 fit(无泄漏)
+        train_idx = np.flatnonzero((dates.iloc[:tr_end] < fe.anchor_dates_.iloc[tr_end]).to_numpy())
+        if len(train_idx) < 30:
+            continue
+        fe.fit_scale(X[train_idx], y[train_idx])
         try:
             m = ALGO_REGISTRY[algo_name](window_size=window)
-            m.fit(fe.transform(X[:tr_end]),
-                  fe.scaler_y.transform(y[:tr_end].reshape(-1, 1)).ravel())
+            m.fit(fe.transform(X[train_idx]),
+                  fe.scaler_y.transform(y[train_idx].reshape(-1, 1)).ravel())
             pp = pipe._to_price(fe.inverse_y(m.predict(fe.transform(X[tr_end:te_end]))), pc[tr_end:te_end])
         except Exception as e:
             log(f"[WF] 第{k}折失败：{e}"); continue
@@ -5960,31 +6063,213 @@ def calibration_check() -> Dict[str, Any]:
 
 
 # ==================== 第八部分补充6：盘口快照记录 + 挂单量变化分析 ====================
+def analyze_intraday_snapshot(q: Dict[str, Any]) -> Dict[str, Any]:
+    """描述当前行情和可见挂单，不推断成交方向、撤单、主力意图或预测胜率。
+
+    received_at 仅是本机收到行情的时间；源接口不提供可靠行情时间时，无法确认延迟。
+    五档挂单量不是成交量，缺档不能当成零挂单参与完整五档比较。
+    """
+    def number(v, positive=False):
+        try:
+            v = float(v)
+            return v if np.isfinite(v) and (v > 0 if positive else v >= 0) else None
+        except (TypeError, ValueError):
+            return None
+
+    price = number(q.get("price"), True)
+    avg = number(q.get("avg"), True)
+    high, low = number(q.get("high"), True), number(q.get("low"), True)
+    warnings_list = []
+    sides = []
+    for key in ("bids", "asks"):
+        levels = []
+        for row in (q.get(key) or [])[:5]:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                levels.append((None, None))
+            else:
+                levels.append((number(row[0], True), number(row[1])))
+        sides.append(levels)
+    bids, asks = sides
+    complete = all(len(side) == 5 and all(p is not None and v is not None for p, v in side)
+                   for side in sides)
+    bid = bids[0][0] if bids else None
+    ask = asks[0][0] if asks else None
+    spread = None
+    if bid is not None and ask is not None:
+        if ask >= bid:
+            spread = (ask - bid) / ((ask + bid) / 2) * 10000
+        else:
+            warnings_list.append("买一高于卖一：可能处于竞价阶段或行情异常，不计算价差。")
+    else:
+        warnings_list.append("买一或卖一缺失，价差不可用。")
+    imbalance = None
+    if complete:
+        buy = sum(v for _, v in bids)
+        sell = sum(v for _, v in asks)
+        if buy + sell > 0:
+            imbalance = (buy - sell) / (buy + sell) * 100
+        else:
+            warnings_list.append("五档挂单总量为零，挂单量差异不可用。")
+    else:
+        warnings_list.append("五档数据不完整，不计算完整五档挂单量差异。")
+    position = None
+    if price is not None and high is not None and low is not None:
+        if high > low and low <= price <= high:
+            position = (price - low) / (high - low) * 100
+        elif not low <= price <= high:
+            warnings_list.append("现价与日内高低范围不一致，区间位置不可用。")
+    if price is None:
+        warnings_list.append("现价缺失或无效。")
+    if avg is None:
+        warnings_list.append("源接口未提供有效日内均价，不用金额/成交量猜测单位。")
+    return {"price": price, "spread_bps": spread, "book_imbalance_pct": imbalance,
+            "book_complete": complete, "range_position_pct": position,
+            "vs_avg_pct": (price / avg - 1) * 100 if price is not None and avg is not None else None,
+            "received_at": q.get("received_at"), "source_time_verified": False,
+            "warnings": warnings_list,
+            "limitations": "仅描述快照；五档挂单可变化，不能区分成交与撤单。源行情时间未经核实，无法确认延迟。",
+            "disclaimer": "研究监控，非投资建议、盈亏自负。"}
+
+
+def intraday_snapshot_html(q: Dict[str, Any]) -> str:
+    result = analyze_intraday_snapshot(q)
+    def fmt(key, unit):
+        value = result[key]
+        return f"{value:.2f}{unit}" if value is not None else "未取得/不适用"
+    rows = [("买卖一价差", fmt("spread_bps", " bps")),
+            ("五档挂单量差异", fmt("book_imbalance_pct", "%")),
+            ("现价相对日内均价", fmt("vs_avg_pct", "%")),
+            ("现价在日内高低区间的位置", fmt("range_position_pct", "%"))]
+    return ("<h3>盘中状态摘要（描述性指标）</h3><table border=1 cellpadding=4>"
+            + "".join(f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows)
+            + "</table><p>挂单量差异=(买量−卖量)/(买量+卖量)，正值表示可见买方排队量较大；"
+              "区间位置0%为日内最低、100%为最高。这些数值不代表未来涨跌概率。</p>"
+            + "".join(f"<p>{warning}</p>" for warning in result["warnings"])
+            + f"<p>{result['limitations']} {result['disclaimer']}</p>")
+
+
+_SNAPSHOT_WRITE_LOCK = threading.Lock()
+
+
 def write_snapshot(code: str, q: Dict[str, Any]) -> str:
     """把一次实时盘口快照追加写入当天 CSV(GUI 定时与 CLI --snapshot 共用)。返回文件路径。"""
     import csv
     day = dt.datetime.now().strftime("%Y%m%d")
     path = os.path.join(MONITOR_DIR, f"monitor_{code}_{day}.csv")
-    is_new = not os.path.exists(path)
     row = {"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           "price": q.get("price"), "pct": q.get("pct"), "vol_ratio": q.get("vol_ratio"),
-           "turnover": q.get("turnover")}
-    for i, (p, v) in enumerate(q.get("bids", []), 1):
-        row[f"buy{i}_p"], row[f"buy{i}_v"] = p, v
-    for i, (p, v) in enumerate(q.get("asks", []), 1):
-        row[f"sell{i}_p"], row[f"sell{i}_v"] = p, v
-    with open(path, "a", newline="", encoding="utf-8-sig") as fh:
-        wr = csv.DictWriter(fh, fieldnames=list(row.keys()))
-        if is_new:
-            wr.writeheader()
-        wr.writerow(row)
+           **{key: q.get(key) for key in ("price", "pct", "vol_ratio", "turnover")}}
+    # 固定五档列，缺档留空，避免后续快照错列。
+    for side, prefix in (("bids", "buy"), ("asks", "sell")):
+        levels = q.get(side) or []
+        for i in range(1, 6):
+            level = levels[i - 1] if len(levels) >= i else (None, None)
+            p, v = level if isinstance(level, (list, tuple)) and len(level) == 2 else (None, None)
+            row[f"{prefix}{i}_p"], row[f"{prefix}{i}_v"] = p, v
+    row.update({key: q.get(key) for key in ("received_at", "open", "high", "low", "prev", "avg", "vol", "amount",
+                                         "main_net", "main_pct", "xl_net", "l_net", "m_net", "s_net",
+                                         "fundflow_received_at", "book_volume_unit")})
+    with _SNAPSHOT_WRITE_LOCK:
+        is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+        fields = list(row)
+        if not is_new:
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                old_fields = next(csv.reader(fh))
+            fields = old_fields + [key for key in row if key not in old_fields]
+            if fields != old_fields:
+                # 旧快照保留全部行与字段，原子替换后再追加新格式。
+                import tempfile
+                fd, temp_path = tempfile.mkstemp(dir=MONITOR_DIR, suffix=".csv")
+                try:
+                    with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as dst:
+                        writer = csv.DictWriter(dst, fieldnames=fields)
+                        writer.writeheader()
+                        with open(path, newline="", encoding="utf-8-sig") as src:
+                            writer.writerows(csv.DictReader(src))
+                    os.replace(temp_path, path)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+        with open(path, "a", newline="", encoding="utf-8-sig") as fh:
+            wr = csv.DictWriter(fh, fieldnames=fields)
+            if is_new:
+                wr.writeheader()
+            wr.writerow(row)
     return path
+
+
+def collect_intraday_snapshot(code: str, persist: bool = True) -> Dict[str, Any]:
+    """GUI/CLI共用的一次采集：真实行情必需，资金流可降级，分别记录本机接收时间。"""
+    code = str(code).strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("股票代码必须是六位数字。")
+    quote = dict(StockDataFetcher.fetch_realtime(code))
+    quote.setdefault("received_at", dt.datetime.now().isoformat(timespec="seconds"))
+    analysis = analyze_intraday_snapshot(quote)
+    if analysis["price"] is None:
+        raise RuntimeError("行情接口未返回有效现价，本次不记录有效快照。")
+    try:
+        ff = StockDataFetcher.fetch_realtime_fundflow(code) or {}
+    except Exception as exc:
+        ff = {"error": str(exc)}
+    # 资金流返回值可能含空字符串、NaN等，统一为有限数值或None。
+    for key in ("main_net", "main_pct", "xl_net", "l_net", "m_net", "s_net"):
+        try:
+            value = float(ff.get(key))
+            quote[key] = value if np.isfinite(value) else None
+        except (TypeError, ValueError):
+            quote[key] = None
+        ff[key] = quote[key]
+    quote["fundflow_received_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    if ff["main_net"] is None:
+        analysis["warnings"].append("本次资金流未取得有效主力净流入；行情记录保留，资金流留空。")
+    trading, status = is_trading_now()
+    path = write_snapshot(code, quote) if persist else None
+    return {"code": code, "quote": quote, "fundflow": ff, "analysis": analysis,
+            "trading": trading, "status": status, "snapshot_path": path}
+
+
+def monitor_intraday(code: str, interval: float = 10, max_updates: int = 0,
+                     on_update: Optional[Callable[[Dict[str, Any]], None]] = None,
+                     stop_event=None) -> Dict[str, Any]:
+    """连续监控，每次请求结束后等待interval秒；max_updates计尝试次数，0为持续运行。
+
+    网络失败不伪造行情、不覆盖上次成功结果；Ctrl+C或stop_event可停止等待。
+    单次采集串行执行，不因接口变慢堆积重叠请求。非交易时段仍可查看源接口返回的收盘快照。
+    """
+    if not re.fullmatch(r"\d{6}", str(code).strip()):
+        raise ValueError("股票代码必须是六位数字。")
+    if not np.isfinite(interval) or interval < 3:
+        raise ValueError("刷新间隔至少为3秒。")
+    if not isinstance(max_updates, int) or max_updates < 0:
+        raise ValueError("监控次数必须为非负整数，0表示持续运行。")
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    summary = {"attempts": 0, "succeeded": 0, "failed": 0, "stopped": False}
+    try:
+        while not stop_event.is_set() and (not max_updates or summary["attempts"] < max_updates):
+            summary["attempts"] += 1
+            try:
+                result = collect_intraday_snapshot(str(code).strip())
+                summary["succeeded"] += 1
+            except Exception as exc:
+                summary["failed"] += 1
+                result = {"code": str(code).strip(), "error": str(exc),
+                          "received_at": dt.datetime.now().isoformat(timespec="seconds")}
+            if on_update:
+                on_update(result)
+            if max_updates and summary["attempts"] >= max_updates:
+                break
+            if stop_event.wait(interval):
+                break
+    except KeyboardInterrupt:
+        summary["stopped"] = True
+    summary["stopped"] = summary["stopped"] or stop_event.is_set()
+    return summary
 
 
 def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, Any]:
     """
-    挂单量变化分析(诚意粗判)：读当天记录的多次盘口快照，**按价位**对比首末两次的挂单量变化。
-    大额挂单若显著减少→可能撤单/成交(免费数据无法区分)；变化不大→挂单意愿相对真实。
+    挂单量变化分析：读当天记录的快照，按价位对比首末两次聚合挂单量。
+    总量比不是同一笔订单的存活率，不能据此判断挂单意愿或交易者身份。
 
     诚实边界：只看得到"各价位聚合挂单量"，看不到逐笔委托，**无法区分撤单与成交**；要真正区分需付费
     Level-2 数据。故本分析仅是**粗略参考**，不是"主力真伪"的定论。
@@ -5994,8 +6279,13 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
     if not os.path.exists(path):
         return {"error": f"未找到当天快照文件 {os.path.basename(path)}；请先在交易时段记录几次盘口。"}
     df = pd.read_csv(path)
+    total_rows = len(df)
+    # 旧版AkShare快照可能以股记录却标作手，不猜测或混比单位。
+    if "book_volume_unit" not in df.columns:
+        return {"error": "旧快照未标注五档量单位，不能直接比较；请用新版重新采集至少两条。"}
+    df = df[df["book_volume_unit"].eq("手")].reset_index(drop=True)
     if len(df) < 2:
-        return {"error": f"当天只有 {len(df)} 条快照，至少需要 2 条才能作差对比。"}
+        return {"error": f"当天只有 {len(df)} 条单位明确为手的快照，至少需要2条；已排除 {total_rows-len(df)} 条旧记录。"}
     first, last = df.iloc[0], df.iloc[-1]
 
     def side_map(row, pref):
@@ -6004,7 +6294,7 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
             p, v = row.get(f"{pref}{i}_p"), row.get(f"{pref}{i}_v")
             try:
                 p = float(p); v = float(v)
-                if p > 0:
+                if np.isfinite(p) and np.isfinite(v) and p > 0 and v >= 0:
                     m[round(p, 3)] = m.get(round(p, 3), 0.0) + v
             except (TypeError, ValueError):
                 continue
@@ -6025,6 +6315,7 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
     sell_rows, s0, s1, sell_keep = compare("sell")
     return {
         "code": code, "day": day, "n_snap": int(len(df)),
+        "excluded_unverified_rows": total_rows - len(df), "book_volume_unit": "手",
         "t_first": str(first.get("time", "")), "t_last": str(last.get("time", "")),
         "buy": buy_rows, "sell": sell_rows,
         "buy_total0": b0, "buy_total1": b1, "buy_keep_pct": buy_keep,
@@ -7761,6 +8052,24 @@ def fetch_board_spot(board_type: str = "concept", retries: int = 4,
 #         + B-1.3 评价指标勾选 + B-1.4 训练测试比例选择
 #   右侧/下方：预测结果对比图 + 指标结果表格 + 运行日志
 if HAS_PYSIDE6:
+
+    class MonitorWorker(QThread):
+        """盘口、资金流和日历均在后台取数；令牌用于丢弃停止/重启后的旧响应。"""
+        result_signal = Signal(dict)
+        error_signal = Signal(dict)
+
+        def __init__(self, code, generation, parent=None):
+            super().__init__(parent)
+            self.code = code
+            self.generation = generation
+
+        def run(self):
+            try:
+                result = collect_intraday_snapshot(self.code, persist=False)
+                result["generation"] = self.generation
+                self.result_signal.emit(result)
+            except Exception as exc:
+                self.error_signal.emit({"code": self.code, "generation": self.generation, "error": str(exc)})
 
     # ---------- 9.1 后台训练线程：避免长时间训练把界面卡死 ----------
     class TrainingWorker(QThread):
@@ -9730,7 +10039,7 @@ if HAS_PYSIDE6:
             self.mon_view_snap_btn = QPushButton("📂 查看已记录快照")
             self.mon_view_snap_btn.clicked.connect(self._on_view_snapshots)
             top.addWidget(self.mon_view_snap_btn)
-            self.mon_sincerity_btn = QPushButton("🔍 挂单诚意分析")
+            self.mon_sincerity_btn = QPushButton("🔍 挂单量变化")
             self.mon_sincerity_btn.clicked.connect(self._on_order_sincerity)
             top.addWidget(self.mon_sincerity_btn)
             top.addStretch()
@@ -9740,17 +10049,29 @@ if HAS_PYSIDE6:
             self._mon_fc_html = ""
             self._monitor_timer = QTimer(self)
             self._monitor_timer.timeout.connect(self._refresh_monitor)
+            self._monitor_worker = None
+            self._monitor_generation = 0
+            self._monitor_code = ""
+            self._monitor_last_html = ""
             return panel
 
         def _on_start_monitor(self):
             if self.data_source_combo.currentIndex() == 1:
                 QMessageBox.information(self, "提示", "实时监控需真实数据源，请把数据源切换为「真实数据」。")
                 return
+            code = self.code_edit.text().strip()
+            if not re.fullmatch(r"\d{6}", code):
+                QMessageBox.warning(self, "代码无效", "请输入六位数字股票代码。"); return
+            self._monitor_generation += 1
+            self._monitor_code = code
+            self._monitor_last_html = ""
+            self._mon_record_error = ""
             sec = int(self.mon_interval.currentText().split()[0])
             self._mon_count = 0                      # 本次监控已记录的快照数
             self._mon_file = ""
             self._monitor_timer.start(sec * 1000)
             self.mon_start_btn.setEnabled(False); self.mon_stop_btn.setEnabled(True)
+            self.mon_interval.setEnabled(False)
             self._oplog(f"开始实时监控 {self.code_edit.text().strip()}，每 {sec} 秒刷新，快照将记录到 monitor_log/。")
             self._refresh_monitor()
 
@@ -9759,27 +10080,65 @@ if HAS_PYSIDE6:
             try:
                 self._mon_file = write_snapshot(code, q)
                 self._mon_count = getattr(self, "_mon_count", 0) + 1
-            except Exception:
-                pass
+                self._mon_record_error = ""
+            except Exception as exc:
+                self._mon_record_error = str(exc)
+                self._oplog(f"盘口快照写入失败：{exc}")
 
         def _on_stop_monitor(self):
             self._monitor_timer.stop()
+            self._monitor_generation += 1
             self.mon_start_btn.setEnabled(True); self.mon_stop_btn.setEnabled(False)
+            self.mon_interval.setEnabled(True)
             self._oplog("停止实时监控。")
 
         def _refresh_monitor(self):
-            code = self.code_edit.text().strip()
-            trading, status = is_trading_now()
-            try:
-                q = StockDataFetcher.fetch_realtime(code)
-            except Exception as e:
-                self.mon_view.setHtml(f"<p style='color:#c0392b'>实时行情获取失败：{e}</p>"
-                                      "<p>可能是网络/接口波动，会在下次刷新重试；或先确认代码正确。</p>"
-                                      f"<p style='color:#888'>已累计记录 {getattr(self,'_mon_count',0)} 条快照到 monitor_log/。</p>")
+            if not self._monitor_timer.isActive():
                 return
-            if self._monitor_timer.isActive():
-                self._record_snapshot(code, q)       # 记录本次真实盘口快照
+            if self._monitor_worker is not None and self._monitor_worker.isRunning():
+                return  # 网络慢时跳过本轮，禁止堆积并发取数。
+            worker = MonitorWorker(self._monitor_code, self._monitor_generation, self)
+            self._monitor_worker = worker
+            worker.result_signal.connect(self._on_monitor_result)
+            worker.error_signal.connect(self._on_monitor_error)
+            worker.finished.connect(self._on_monitor_worker_finished)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
 
+        def _on_monitor_worker_finished(self):
+            if self.sender() is self._monitor_worker:
+                self._monitor_worker = None
+
+        def _on_monitor_result(self, result):
+            if (not self._monitor_timer.isActive()
+                    or result["generation"] != self._monitor_generation
+                    or result["code"] != self._monitor_code):
+                return
+            code, q = result["code"], result["quote"]
+            self._record_snapshot(code, q)
+            self._render_monitor(code, q, result["fundflow"], result["trading"], result["status"])
+
+        def _on_monitor_error(self, result):
+            if result["generation"] != self._monitor_generation or not self._monitor_timer.isActive():
+                return
+            import html
+            message = html.escape(result["error"])
+            self.mon_view.setHtml(f"<p style='color:#c0392b'>本次行情获取失败：{message}</p>"
+                                  "<p>下方如有行情，为上一次成功快照，未更新；下次刷新重试。</p>"
+                                  + self._monitor_last_html)
+
+        def closeEvent(self, event):
+            worker = getattr(self, "_monitor_worker", None)
+            if worker is not None and worker.isRunning():
+                self._on_stop_monitor()
+                if not getattr(self, "_monitor_close_pending", False):
+                    self._monitor_close_pending = True
+                    worker.finished.connect(self.close)
+                event.ignore()  # 等本次网络请求退出后关闭，避免销毁仍运行的QThread。
+                return
+            super().closeEvent(event)
+
+        def _render_monitor(self, code, q, ff, trading, status):
             def num(v):
                 try:
                     return float(v)
@@ -9788,7 +10147,7 @@ if HAS_PYSIDE6:
             price, prev = num(q.get("price")), num(q.get("prev"))
             pct = num(q.get("pct"))
             col = "#c0392b" if (pct or 0) >= 0 else "#1a9d5a"
-            now = dt.datetime.now().strftime("%H:%M:%S")
+            now = q.get("received_at") or "接收时间未取得"
             st_col = "#1e8449" if trading else "#888"
             head = (f"<h2>{code} 实时监控　<span style='color:{st_col}'>[{status}]</span>"
                     f"　<span style='color:#888;font-size:12px'>更新 {now}</span></h2>"
@@ -9815,7 +10174,6 @@ if HAS_PYSIDE6:
             # 实时主力资金(今日累计，东财；有几秒延迟、可能被掐断，取不到就诚实标注)
             def _wan(v):
                 return f"{v/1e4:.0f}万" if isinstance(v, (int, float)) else "-"
-            ff = StockDataFetcher.fetch_realtime_fundflow(code)
             if ff.get("main_net") is not None:
                 mc = "#c0392b" if ff["main_net"] >= 0 else "#1a9d5a"
                 fundflow = (
@@ -9837,7 +10195,13 @@ if HAS_PYSIDE6:
                     "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。</p>"
                     f"<p style='color:#1e8449;font-size:12px'>📝 本次已记录 <b>{rec}</b> 条真实快照 → "
                     f"<b>{recfile}</b>（自采集的盘口/买卖手历史，长期积累后可供模型分析）。</p>")
-            self.mon_view.setHtml(head + info + pankou + fundflow + note + (self._mon_fc_html or ""))
+            import html
+            record_error = getattr(self, "_mon_record_error", "")
+            if record_error:
+                note += f"<p style='color:#c0392b'>快照写入失败：{html.escape(record_error)}；本次仅显示，未保存。</p>"
+            self._monitor_last_html = (head + info + intraday_snapshot_html(q) + pankou + fundflow
+                                       + note + (self._mon_fc_html or ""))
+            self.mon_view.setHtml(self._monitor_last_html)
 
         def _on_monitor_forecast(self):
             code = self.code_edit.text().strip()
@@ -9924,7 +10288,7 @@ if HAS_PYSIDE6:
             code = self.code_edit.text().strip()
             r = analyze_order_sincerity(code)
             if "error" in r:
-                self.mon_view.setHtml(f"<h3>挂单诚意分析</h3><p style='color:#c0392b'>{r['error']}</p>"
+                self.mon_view.setHtml(f"<h3>挂单量变化</h3><p style='color:#c0392b'>{r['error']}</p>"
                                       "<p style='color:#888'>做法：交易时段(尤其集合竞价9:15-9:25)多记录几次盘口，"
                                       "或用 <code>python stock_predictor.py --snapshot 代码</code> 定时抓取。</p>")
                 return
@@ -9942,22 +10306,20 @@ if HAS_PYSIDE6:
 
             def verdict(keep, side):
                 if keep is None:
-                    return ""
-                if keep < 60:
-                    return f"<b style='color:#c0392b'>{side}大单存活 {keep}%——大量挂单已消失(撤单或成交)，谨慎</b>"
-                if keep > 90:
-                    return f"<b style='color:#1e8449'>{side}大单存活 {keep}%——挂单稳定，意愿相对真实</b>"
-                return f"{side}大单存活 {keep}%"
+                    return f"{side}首次挂单量为零，量比不适用"
+                return f"{side}最新可见挂单总量/首次总量={keep}%"
 
-            html = (f"<h3>挂单诚意分析 · {code}（{r['day']}，{r['n_snap']} 次快照）</h3>"
+            html = (f"<h3>挂单量变化 · {code}（{r['day']}，{r['n_snap']} 次快照，单位：手）</h3>"
                     f"<p>对比时间：{r['t_first']} → {r['t_last']}</p>"
+                    f"<p>已排除 {r['excluded_unverified_rows']} 条未核实量单位的旧快照。</p>"
                     f"<p>{verdict(r['buy_keep_pct'],'买盘')}　|　{verdict(r['sell_keep_pct'],'卖盘')}</p>"
                     + tbl(r["buy"], "买盘(买手)各价位挂单变化", "#c0392b")
                     + tbl(r["sell"], "卖盘(卖手)各价位挂单变化", "#1a9d5a")
                     + "<p style='color:#c0392b;font-size:12px'>⚠️ 诚实边界：免费数据只看得到「各价位聚合挂单量」，"
-                    "<b>无法区分撤单与成交</b>；要真正判断主力真伪需付费 Level-2 逐笔委托。本分析仅粗略参考，非定论、非投资建议。</p>")
+                    "<b>无法区分撤单与成交</b>；总量比也不能识别同一笔订单是否仍存在，或判断交易者意愿与身份。"
+                    "仅供研究，非投资建议、盈亏自负。</p>")
             self.mon_view.setHtml(html)
-            self._oplog(f"挂单诚意分析：{code}。")
+            self._oplog(f"挂单量变化：{code}。")
 
         # ---- 9.2.1i2 监管披露观察名单标签页（策略四，见《机器学习输入输出设计报告》第七节）----
         def _build_regulatory_tab(self) -> QWidget:
@@ -15134,6 +15496,7 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
                 endp = float(close[i + h])
                 row = dict(base)
                 row["h"] = h
+                row["label_end_date"] = df["date"].iloc[i + h]
                 row["y1_dir"] = 1 if endp > c0 else -1
                 row["y2_min_pct"] = round((mn / c0 - 1) * 100, 4)
                 row["y3_med_pct"] = round((md / c0 - 1) * 100, 4)
@@ -15158,7 +15521,8 @@ def _mh_direction_da(y4_pred: np.ndarray, y4_true: np.ndarray) -> float:
     """方向准确率：以"未来均值涨跌"的符号为方向，比对预测与真实。"""
     if len(y4_true) == 0:
         return float("nan")
-    return float(np.mean(np.sign(y4_pred) == np.sign(y4_true)) * 100)
+    # 与单股管道一致：严格 >0 为上涨，零涨跌归入非上涨。
+    return float(np.mean((np.asarray(y4_pred) > 0) == (np.asarray(y4_true) > 0)) * 100)
 
 
 def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[str]] = None,
@@ -15204,16 +15568,15 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     # ② 按时间三分(红线#1：前段训练→中段验证→后段测试，绝不 shuffle)。
     #    训练 = split_date 之前；split_date 之后的样本按日期中位再对半分成 验证(前) / 测试(后)。
     split = pd.to_datetime(split_date)
-    tr = ds[ds["date"] < split]
-    hold = ds[ds["date"] >= split].sort_values("date")
+    tr, hold = _purged_date_split(ds, split)
     if len(tr) == 0 or len(hold) < 2:
         raise RuntimeError(f"按 split_date={split_date} 切分后训练/留出为空(训练{len(tr)}/留出{len(hold)})，请调整。")
-    mid = hold["date"].quantile(0.5)
-    va = hold[hold["date"] < mid]
-    te = hold[hold["date"] >= mid]
-    if len(va) == 0 or len(te) == 0:                # 留出段日期高度集中时退化，改用行数对半
-        half = len(hold) // 2
-        va, te = hold.iloc[:half], hold.iloc[half:]
+    hold_dates = np.sort(hold["date"].unique())
+    if len(hold_dates) < 2:
+        raise RuntimeError("留出段至少需要两个不同锚定日期，不能把同日股票拆入验证和测试。")
+    va, te = _purged_date_split(hold, hold_dates[len(hold_dates) // 2])
+    if len(va) == 0 or len(te) == 0:
+        raise RuntimeError("隔离跨界标签后验证/测试为空，请拉长历史或缩短预测期限。")
     log(f"② 时间三分：训练 {len(tr)} 行(< {split_date}) / 验证 {len(va)} 行 / 测试 {len(te)} 行(最后段，仅最终评估)。")
     # 训练样本上限(SVR/GPR 在大样本上很慢)：仅对**训练集**做有种子随机下采样，验证/测试全量评估
     if max_train_samples and len(tr) > max_train_samples:
@@ -15234,9 +15597,14 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
     results: List[Dict[str, Any]] = []
     # Naive 基准：涨跌预测恒为 0
     naive_rmse = {t: float(np.sqrt(np.mean((te[t].values.astype(float)) ** 2))) for t in MH_TARGET_COLS}
-    results.append({"algo": "Naive(前值,涨跌=0)", "DA_dir_pct": round(50.0, 2),
+    results.append({"algo": "Naive(前值,涨跌=0)",
+                    "DA_dir_pct": round(_mh_direction_da(np.zeros_like(y4_te_true), y4_te_true), 2),
                     "RMSE_y4": round(naive_rmse["y4_mean_pct"], 4),
                     "note": "朴素基准：预测未来涨跌为0"})
+    for name, prediction in (("总是涨(方向基准)", 1.0), (ALWAYS_DOWN_NAME, -1.0)):
+        results.append({"algo": name,
+                        "DA_dir_pct": round(_mh_direction_da(np.full_like(y4_te_true, prediction), y4_te_true), 2),
+                        "RMSE_y4": None, "note": "仅用于方向比较，价格误差不适用"})
 
     frozen_paths = {}
     for algo in algos:
@@ -15255,9 +15623,9 @@ def train_global_pooled(codes: Optional[List[str]] = None, algos: Optional[List[
                 y_tr = tr[t].values.astype(float)
                 best_params = {}
                 if hpo_method and hpo_method != "关闭":
-                    n_val = max(1, int(len(X_tr_s) * 0.2))
-                    best_params = run_hpo(hpo_method, model_cls, X_tr_s[:-n_val], y_tr[:-n_val],
-                                          X_tr_s[-n_val:], y_tr[-n_val:], n_trials=hpo_trials)
+                    hx, hy, vx, vy = _temporal_hpo_data(
+                        X_tr, y_tr, tr["date"], tr["label_end_date"])
+                    best_params = run_hpo(hpo_method, model_cls, hx, hy, vx, vy, n_trials=hpo_trials)
                 m = model_cls(**best_params)
                 m.fit(X_tr_s, y_tr)                          # ③ 训练(只用训练集)
                 per_target_models[t] = m
@@ -15379,7 +15747,7 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
                                  progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """横截面排序模型：目标 = 该股未来收益 − 当日同池中位数(超额)。预测"谁跑赢谁"，而非绝对涨跌。
     诚实优势：按中位数分"跑赢/跑输"，基准天生 50%，样本外 DA>50% 即真实相对强弱 edge(不吃普涨红利)。
-    评估(全部样本外)：横截面 DA(基准50%) + RankIC(每日截面 Spearman) + 多空分层价差(top档 − bottom档 未来真实收益)。
+    评估(全部样本外)：横截面 DA(实测多数类基准) + RankIC(每日截面 Spearman) + 多空分层价差。
     **研究性回测，非投资建议、盈亏自负。**"""
     log = progress_cb or (lambda m: None)
     codes = codes or GLOBAL_SUBSET_CODES
@@ -15402,6 +15770,8 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
     if len(ds) == 0:
         raise RuntimeError("可用横截面为空(每个交易日同池股票不足5只)。请多给些股票。")
     ds["y_excess"] = ds["y4_mean_pct"] - ds["xs_med"]
+    # 横截面目标依赖同组所有股票，须等组内最后一个标签窗口结束才可用于训练。
+    ds["label_end_date"] = ds.groupby(["date", "h"])["label_end_date"].transform("max")
     # 横截面 rank 特征(每个 date,h 组内把关键特征转成 0~1 分位)——对"相对强弱"往往更有效
     xs_rank_feats = ["mom20", "rsi14", "dist_hi120", "ret_10d", "vol20"]
     for f in xs_rank_feats:
@@ -15412,7 +15782,7 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
 
     # ③ 全局日期切分(红线#1)
     split = pd.to_datetime(split_date)
-    tr, te = ds[ds["date"] < split], ds[ds["date"] >= split]
+    tr, te = _purged_date_split(ds, split)
     if len(tr) == 0 or len(te) == 0:
         raise RuntimeError(f"按 split_date={split_date} 切分后训练/测试为空({len(tr)}/{len(te)})。")
     if max_train_samples and len(tr) > max_train_samples:
@@ -15432,15 +15802,22 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
         for (_, _), grp in te2.groupby(["date", "h"]):
             if len(grp) < 5:
                 continue
-            ics.append(grp["_pred"].corr(grp["_act"], method="spearman"))
+            if grp["_pred"].nunique() > 1 and grp["_act"].nunique() > 1:
+                ic = grp["_pred"].corr(grp["_act"], method="spearman")
+                if np.isfinite(ic):
+                    ics.append(ic)
             k = max(1, int(len(grp) * 0.33))
             top = grp.nlargest(k, "_pred")["y4_mean_pct"].mean()
             bot = grp.nsmallest(k, "_pred")["y4_mean_pct"].mean()
             spreads.append(top - bot)
-        return (float(np.nanmean(ics)) if ics else float("nan"),
+        return (float(np.mean(ics)) if ics else float("nan"),
                 float(np.nanmean(spreads)) if spreads else float("nan"))
 
     results = []
+    p_up = float(np.mean(y_te > 0))
+    base_rate = max(p_up, 1 - p_up) * 100
+    direction_baselines = {"Naive(涨跌=0)": _mh_direction_da(np.zeros_like(y_te), y_te),
+                           "总是涨": p_up * 100, "总是跌": (1 - p_up) * 100}
     hcol = te["h"].values.astype(int)
     for algo in algos:
         if algo not in ALGO_REGISTRY or not ALGO_AVAILABILITY.get(algo, True):
@@ -15449,19 +15826,20 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
         try:
             best = {}
             if hpo_method and hpo_method != "关闭":
-                nv = max(1, int(len(X_tr_s) * 0.2))
-                best = run_hpo(hpo_method, model_cls, X_tr_s[:-nv], y_tr[:-nv], X_tr_s[-nv:], y_tr[-nv:], n_trials=hpo_trials)
+                hx, hy, vx, vy = _temporal_hpo_data(
+                    X_tr, y_tr, tr["date"], tr["label_end_date"])
+                best = run_hpo(hpo_method, model_cls, hx, hy, vx, vy, n_trials=hpo_trials)
             m = model_cls(**best); m.fit(X_tr_s, y_tr)
             pred = m.predict(X_te_s)
-            xs_da = float(np.mean(np.sign(pred) == np.sign(y_te)) * 100)   # 基准恒 50%
+            xs_da = _mh_direction_da(pred, y_te)
             da_by_h = {}
             for hh in sorted(set(hcol)):
                 mk = hcol == hh
-                da_by_h[int(hh)] = round(float(np.mean(np.sign(pred[mk]) == np.sign(y_te[mk])) * 100), 1)
+                da_by_h[int(hh)] = round(_mh_direction_da(pred[mk], y_te[mk]), 1)
             ic, spread = _rank_ic_and_spread(pred)
             results.append({"algo": algo, "xs_da_pct": round(xs_da, 2), "rank_ic": round(ic, 4),
                             "ls_spread_pct": round(spread, 3), "da_by_h": da_by_h})
-            log(f"[{algo}] 横截面DA={xs_da:.1f}%(基准50%) / RankIC={ic:.3f} / 多空价差={spread:.2f}% ")
+            log(f"[{algo}] 横截面DA={xs_da:.1f}%(多数类基准{base_rate:.1f}%) / RankIC={ic:.3f} / 多空价差={spread:.2f}% ")
             log(f"[{algo}] DA@各期限: " + " ".join(f"h{k}={v}%" for k, v in da_by_h.items()))
         except Exception as ex:
             log(f"[{algo}] 失败：{ex}")
@@ -15469,7 +15847,8 @@ def train_global_cross_sectional(codes: Optional[List[str]] = None, algos: Optio
 
     return {"mode": "cross_sectional", "results": results, "n_train": int(len(tr)), "n_test": int(len(te)),
             "n_codes": ds["code"].nunique(), "split_date": split_date, "horizons": horizons,
-            "note": "横截面DA基准=50%(按中位数分跑赢/跑输)；DA>50%、RankIC>0、多空价差>0 才算真相对强弱edge。",
+            "base_rate_pct": round(base_rate, 2), "direction_baselines": direction_baselines,
+            "note": "横截面DA与实测多数类基准比较；零超额归入非上涨，RankIC和分层价差需结合样本外验证。",
             "disclaimer": "研究性回测，非投资建议、盈亏自负。"}
 
 
@@ -15512,7 +15891,7 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """『主力思维』选股排序：用公开历史数据给一篮子股票按**未来相对强弱**(超额=个股−同日中位)打分排序，
     并**样本外回测**"买打分最高的一档、避最低一档"到底有没有用(多空价差 + 累计净值 + RankIC)。
-    诚实口径：基准恒 50%/市场等权；非投资建议、盈亏自负；数据非实时(取决于本地数据集截止日)。"""
+    诚实口径：对比市场等权；非投资建议、盈亏自负；数据非实时(取决于本地数据集截止日)。"""
     log = progress_cb or (lambda m: None)
     codes = codes or GLOBAL_SUBSET_CODES
     root = root or StockDataFetcher._resolve_local_root()
@@ -15543,7 +15922,8 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     ds = ds.dropna(subset=feat + ["y_target"]).reset_index(drop=True)
 
     split = pd.to_datetime(split_date)
-    tr, te = ds[ds["date"] < split], ds[ds["date"] >= split]
+    ds["label_end_date"] = ds.groupby("date")["label_end_date"].transform("max")
+    tr, te = _purged_date_split(ds, split)
     if len(tr) == 0 or len(te) == 0:
         raise RuntimeError(f"切分后训练/测试为空({len(tr)}/{len(te)})。")
     scaler = StandardScaler().fit(tr[feat].values.astype(float))
@@ -16779,13 +17159,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", default=None, help="把结果 JSON 写入指定文件路径")
     p.add_argument("--snapshot", default=None,
                    help="无界面抓取一次实时盘口并记录到 monitor_log/(供 Windows 任务计划定时调用)，如 --snapshot 002418")
+    p.add_argument("--monitor", default=None, help="连续监控六位股票代码，Ctrl+C停止；例如 --monitor 600000")
+    p.add_argument("--monitor-interval", type=float, default=10, help="连续监控刷新间隔秒数(请求完成后等待，至少3秒)")
+    p.add_argument("--monitor-count", type=int, default=0, help="连续监控尝试次数，0表示持续运行")
     p.add_argument("--verify", action="store_true",
                    help="无界面自动验证到期预测(拉真实股价对比)，供定时任务每日调用")
     # ---- 全局池化训练 + 冻结/加载（第八部分补充8）----
     p.add_argument("--train-global", action="store_true",
                    help="用本地数据集对『一批股票』做多期限×多目标全局池化训练，并冻结模型(不必每次重训)")
     p.add_argument("--train-xs", action="store_true",
-                   help="横截面排序训练：预测『该股未来收益−同池中位数』(相对强弱)，基准恒50%%，报横截面DA/RankIC/多空价差")
+                   help="横截面排序训练：预测相对同池中位数的未来收益，报实测方向基准/DA/RankIC/多空价差")
     p.add_argument("--rank-stocks", action="store_true",
                    help="『主力思维』选股排序：用历史数据给一篮子股票按相对强弱打分排名 + 样本外回测 + 出图(PNG)")
     p.add_argument("--rank-horizon", type=int, default=21, help="选股排序的预测期限(交易日，默认21≈1个月)")
@@ -16961,14 +17344,43 @@ def main():
 
     args = _build_arg_parser().parse_args()
 
+    if args.monitor:
+        if args.snapshot:
+            raise SystemExit("--monitor和--snapshot不能同时使用。")
+        def show_update(result):
+            if result.get("error"):
+                print(f"[monitor] {result['received_at']} 获取失败：{result['error']}", flush=True)
+                return
+            out = {"code": result["code"], "status": result["status"],
+                   "snapshot_path": result["snapshot_path"], "analysis": result["analysis"],
+                   "fundflow": result["fundflow"]}
+            print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
+            if args.json:
+                # 仅成功快照更新文件；失败不会把旧行情伪装成新行情。
+                with open(args.json, "w", encoding="utf-8") as fh:
+                    json.dump(out, fh, ensure_ascii=False, indent=2)
+        print("[monitor] 真实快照连续监控；行情源时间未经核实。非投资建议、盈亏自负。", flush=True)
+        try:
+            summary = monitor_intraday(args.monitor, args.monitor_interval, args.monitor_count, show_update)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        print("[monitor] 已停止 " + json.dumps(summary, ensure_ascii=False), flush=True)
+        return summary
+
     # --snapshot：无界面抓一次盘口就退出（供 Windows 任务计划定时调用，不需开 GUI）
     if args.snapshot:
         code = args.snapshot.strip()
         try:
-            q = StockDataFetcher.fetch_realtime(code)
-            path = write_snapshot(code, q)
-            trading, status = is_trading_now()
+            result = collect_intraday_snapshot(code)
+            q, path = result["quote"], result["snapshot_path"]
+            trading, status = result["trading"], result["status"]
             print(f"[snapshot] {code} 现价={q.get('price')} 涨跌={q.get('pct')}% [{status}] -> {path}")
+            analysis = result["analysis"]
+            print(json.dumps(analysis, ensure_ascii=False, indent=2))
+            if args.json:
+                with open(args.json, "w", encoding="utf-8") as fh:
+                    json.dump({"code": code, "status": status, "snapshot_path": path,
+                               "analysis": analysis, "fundflow": result["fundflow"]}, fh, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[snapshot] {code} 抓取失败: {e}")
         return
@@ -17248,7 +17660,7 @@ def main():
             print("⚠ " + r["note"] + " " + r["disclaimer"])
         return
 
-    # --train-xs：横截面排序训练(相对强弱，基准恒50%)
+    # --train-xs：横截面排序训练(相对强弱，实测多数类基准)
     if args.train_xs:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
@@ -17263,7 +17675,7 @@ def main():
             max_train_samples=args.max_train_samples, progress_cb=print)
         print("\n" + "=" * 74)
         print(f"横截面排序结果  训练{summary['n_train']} / 测试{summary['n_test']} / 股票{summary['n_codes']}只  "
-              f"横截面DA基准=50%(按中位数)")
+              f"横截面DA多数类基准={summary['base_rate_pct']}%")
         print("-" * 74)
         print(f"{'模型':<16}{'横截面DA%':>10}{'RankIC':>9}{'多空价差%':>10}")
         for r in summary["results"]:
