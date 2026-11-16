@@ -1019,5 +1019,7 @@ def test_exchange_routing_watchlist_and_batch_scan(monkeypatch):
         assert scan_res["ok"] is True and scan_res["count"] == 2
         st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/api/state", timeout=3).read().decode("utf-8"))
         assert len(st["indices"]) == 3 and st["watchlist_summary"][0]["price"] == 0.630
+        w_html = urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/widget", timeout=3).read().decode("utf-8")
+        assert 'id="wsel"' in w_html and 'id="bookGrid"' in w_html and 'id="widx"' in w_html
     finally:
         srv.stop()

@@ -8996,7 +8996,7 @@ setInterval(refresh, 4000);
 
 
 def _render_mobile_widget_html(token_qs: str = "") -> str:
-    """极简高对比度悬浮窗页面（专为安卓小窗/分屏挂在同花顺屏幕上方设计）。"""
+    """极简高对比度悬浮窗页面（专为安卓小窗/分屏及 IDE 侧边栏挂靠设计，含42只自选快选与五档盘口速览）。"""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -9005,19 +9005,28 @@ def _render_mobile_widget_html(token_qs: str = "") -> str:
 <title>同花顺悬浮预测条</title>
 <style>
   body {{ margin:0; padding:6px; background:#090d16; color:#f8fafc; font-family:-apple-system,sans-serif; font-size:13px; }}
-  .box {{ border:1px solid #334155; border-radius:10px; padding:8px 10px; background:#111827; }}
-  .top {{ display:flex; justify-content:space-between; align-items:center; gap:6px; }}
+  .box {{ border:1px solid #334155; border-radius:10px; padding:8px 10px; background:#111827; margin-bottom:6px; }}
+  .top {{ display:flex; justify-content:space-between; align-items:center; gap:6px; flex-wrap:wrap; }}
   .up {{ color:#ff6b6b; font-weight:700; }} .dn {{ color:#2ecc71; font-weight:700; }} .mu {{ color:#94a3b8; font-size:11px; }}
-  input {{ width:72px; background:#020617; color:#fff; border:1px solid #475569; border-radius:6px; padding:2px 6px; font-size:12px; }}
-  button {{ background:#2563eb; color:#fff; border:none; border-radius:6px; padding:3px 8px; font-size:12px; }}
+  input, select {{ background:#020617; color:#fff; border:1px solid #475569; border-radius:6px; padding:3px 6px; font-size:12px; }}
+  input {{ width:62px; }} select {{ max-width:130px; }}
+  button {{ background:#2563eb; color:#fff; border:none; border-radius:6px; padding:3px 8px; font-size:12px; cursor:pointer; }}
   .bar {{ height:8px; border-radius:6px; overflow:hidden; display:flex; background:#334155; margin:5px 0; }}
+  .idxrow {{ display:grid; grid-template-columns:repeat(3,1fr); gap:4px; margin-bottom:6px; font-size:11px; text-align:center; }}
+  .idxcell {{ background:#0f172a; border-radius:6px; padding:3px 4px; border:1px solid #1e293b; }}
+  .book {{ display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:4px; font-size:11px; }}
+  .brow {{ display:flex; justify-content:space-between; padding:2px 4px; border-radius:4px; position:relative; overflow:hidden; margin-bottom:2px; background:#0f172a; }}
 </style>
 </head>
 <body>
+<div id="widx" class="idxrow"></div>
 <div class="box">
   <div class="top">
     <div id="hdr"><b>加载中...</b></div>
-    <div><input id="wc" maxlength="6" placeholder="代码"><button onclick="setC()">切</button></div>
+    <div style="display:flex;gap:4px;align-items:center">
+      <select id="wsel" onchange="pickSel()" title="同花顺自选快选"><option value="">自选快选</option></select>
+      <input id="wc" maxlength="6" placeholder="代码"><button onclick="setC()">切</button>
+    </div>
   </div>
   <div class="bar"><div id="bu" style="background:#d63031;width:50%"></div><div id="bd" style="background:#00b894;width:50%"></div></div>
   <div class="top" id="sub"><span class="mu">等待实时数据...</span></div>
@@ -9025,6 +9034,10 @@ def _render_mobile_widget_html(token_qs: str = "") -> str:
     <div class="mu" id="foot">仅供参考·非买卖信号</div>
     <div><a href="/{token_qs}" style="color:#60a5fa;font-size:11px;text-decoration:none;margin-right:6px">看板↗</a><a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:11px;text-decoration:none">实测↗</a></div>
   </div>
+</div>
+<div class="box" id="bookWrap" style="display:none">
+  <div class="top"><b style="font-size:12px">五档买手 / 卖手实时盘口（单位：手）</b><span class="mu" id="vwapInfo"></span></div>
+  <div class="book" id="bookGrid"></div>
 </div>
 <script>
 const TQ = {json.dumps(token_qs)};
@@ -9035,6 +9048,25 @@ async function tick() {{
     const r = await fetch(api('/api/state', wCode ? 'code='+encodeURIComponent(wCode) : ''));
     const d = await r.json();
     if (!wCode) wCode = d.active_code;
+    const widx = document.getElementById('widx');
+    if (widx && d.indices && d.indices.length) {{
+      widx.innerHTML = d.indices.map(ix => {{
+        const c = (ix.pct || 0) >= 0 ? 'up' : 'dn';
+        const ps = ix.pct != null ? `${{ix.pct>=0?'+':''}}${{Number(ix.pct).toFixed(2)}}%` : '--';
+        return `<div class="idxcell"><span class="mu">${{ix.name}}</span><br><span class="${{c}}">${{ix.price}} ${{ps}}</span></div>`;
+      }}).join('');
+    }}
+    const sel = document.getElementById('wsel');
+    if (sel && d.watchlist_summary && d.watchlist_summary.length && sel.options.length <= 1) {{
+      d.watchlist_summary.forEach(x => {{
+        const opt = document.createElement('option');
+        opt.value = x.code;
+        opt.textContent = x.name ? `${{x.code}} ${{x.name}}` : x.code;
+        sel.appendChild(opt);
+      }});
+    }}
+    if (sel && d.active_code) sel.value = d.active_code;
+
     const a = d.active;
     if (!a) {{
       if (d.active_error) {{
@@ -9057,14 +9089,36 @@ async function tick() {{
     const obi = p.weighted_obi_pct != null ? ` | 五档:${{p.weighted_obi_pct>=0?'+':''}}${{p.weighted_obi_pct}}%` : '';
     const hit = v.verified_n > 0 ? ` | 命中${{v.hit_rate_pct}}%` : '';
     document.getElementById('foot').textContent = `${{ml}}${{obi}} | 微价:${{p.micro_price ?? '-'}}${{hit}}`;
+
+    const bids = (q.bids || []).slice(0, 5), asks = (q.asks || []).slice(0, 5);
+    const maxV = Math.max(1, ...bids.map(x => Number(x[1])||0), ...asks.map(x => Number(x[1])||0));
+    if (bids.length || asks.length) {{
+      document.getElementById('bookWrap').style.display = 'block';
+      document.getElementById('vwapInfo').textContent = q.avg != null ? `均价 ${{Number(q.avg).toFixed(3)}}` : '';
+      const bCol = bids.map((r, idx) => {{
+        const w = Math.round(((Number(r[1])||0) / maxV) * 100);
+        return `<div class="brow" style="background:linear-gradient(90deg, rgba(214,48,49,0.22) ${{w}}%, #0f172a ${{w}}%)"><span class="up">买${{idx+1}} ${{r[0] ?? '-'}}</span><b>${{r[1] ?? 0}}</b></div>`;
+      }}).join('');
+      const aCol = asks.map((r, idx) => {{
+        const w = Math.round(((Number(r[1])||0) / maxV) * 100);
+        return `<div class="brow" style="background:linear-gradient(270deg, rgba(0,184,148,0.22) ${{w}}%, #0f172a ${{w}}%)"><span class="dn">卖${{idx+1}} ${{r[0] ?? '-'}}</span><b>${{r[1] ?? 0}}</b></div>`;
+      }}).join('');
+      document.getElementById('bookGrid').innerHTML = `<div>${{bCol}}</div><div>${{aCol}}</div>`;
+    }}
   }} catch (e) {{}}
 }}
-async function setC() {{
-  const c = document.getElementById('wc').value.trim();
-  if (!/^\\d{{6}}$/.test(c)) return;
+async function switchWatchCode(c) {{
   wCode = c;
   await fetch(api('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:c}})}});
   tick();
+}}
+function setC() {{
+  const c = document.getElementById('wc').value.trim();
+  if (/^\\d{{6}}$/.test(c)) switchWatchCode(c);
+}}
+function pickSel() {{
+  const c = document.getElementById('wsel').value;
+  if (/^\\d{{6}}$/.test(c)) switchWatchCode(c);
 }}
 tick();
 setInterval(tick, 3000);
@@ -17584,8 +17638,21 @@ if HAS_PYSIDE6:
             layout = QGridLayout(box)
 
             layout.addWidget(QLabel("股票代码:"), 0, 0)
-            self.code_edit = QLineEdit("600519")           # 默认贵州茅台，仅作占位示例
-            layout.addWidget(self.code_edit, 0, 1)
+            code_row = QHBoxLayout()
+            self.code_edit = QLineEdit(USER_WATCHLIST_CODES[0] if USER_WATCHLIST_CODES else "600519")
+            code_row.addWidget(self.code_edit, stretch=1)
+            self.watch_pick_combo = QComboBox()
+            self.watch_pick_combo.setToolTip("同花顺自选股/ETF 一键快选（选完自动填入代码框）")
+            self.watch_pick_combo.addItem("自选快选", "")
+            for wc in list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES):
+                wnm = STOCK_NAME_OVERRIDES.get(wc, "")
+                self.watch_pick_combo.addItem(f"{wc} {wnm}".strip(), wc)
+            self.watch_pick_combo.currentIndexChanged.connect(
+                lambda idx: self.code_edit.setText(self.watch_pick_combo.itemData(idx))
+                if self.watch_pick_combo.itemData(idx) else None
+            )
+            code_row.addWidget(self.watch_pick_combo)
+            layout.addLayout(code_row, 0, 1)
 
             layout.addWidget(QLabel("起始日期:"), 1, 0)
             self.start_date = QDateEdit(QDate(2020, 1, 1)); self.start_date.setCalendarPopup(True)
