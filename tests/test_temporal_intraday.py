@@ -962,3 +962,62 @@ def test_market_sentiment_snapshot_and_backtest_daily(tmp_path, monkeypatch):
         assert m_resp["seal_rate_pct"] == 80.0
     finally:
         srv.stop()
+
+
+def test_exchange_routing_watchlist_and_batch_scan(monkeypatch):
+    import requests
+    import urllib.request
+
+    # 沪ETF(588940)与科创板(688037)走 sh/1，创业板(300750)与深ETF(159155)走 sz/0，北交所走 bj/0
+    assert s.StockDataFetcher._exchange_market("588940") == ("1", "sh")
+    assert s.StockDataFetcher._exchange_market("688037") == ("1", "sh")
+    assert s.StockDataFetcher._exchange_market("300750") == ("0", "sz")
+    assert s.StockDataFetcher._exchange_market("159155") == ("0", "sz")
+    assert s.StockDataFetcher._exchange_market("002594") == ("0", "sz")
+    assert s.StockDataFetcher._exchange_market("830001") == ("0", "bj")
+
+    # 补齐同花顺4张自选图里的40只个股 + 2只场内ETF
+    for code in ("002531", "002086", "000980", "688037", "600715", "300324", "002594", "300750", "000678"):
+        assert code in s.USER_WATCHLIST_CODES
+    assert len(s.USER_WATCHLIST_CODES) == 40 and len(set(s.USER_WATCHLIST_CODES)) == 40
+    assert s.USER_ETF_CODES == ["588940", "159155"]
+
+    def _tx_line(var_prefix, name, code, price, pct):
+        p = [""] * 55
+        p[1], p[2], p[3], p[4], p[5], p[6] = name, code, str(price), str(price), str(price), "1000"
+        p[9], p[10], p[19], p[20] = str(price), "200", str(price + 0.01), "50"
+        p[31], p[32], p[33], p[34], p[51] = "0.10", str(pct), str(price), str(price), str(price)
+        return f'{var_prefix}="{ "~".join(p) }";'
+
+    body = "\n".join([
+        _tx_line("v_sh000001", "上证指数", "000001", 3602.57, -0.87),
+        _tx_line("v_sz399001", "深证成指", "399001", 10690.78, -2.53),
+        _tx_line("v_sz399006", "创业板指", "399006", 2320.02, -4.37),
+        _tx_line("v_sh588940", "科创50ETF富国", "588940", 0.630, -5.41),
+        _tx_line("v_sz002594", "比亚迪", "002594", 80.49, 0.63),
+    ]).encode("gbk")
+
+    class Resp:
+        content = body
+        def raise_for_status(self):
+            pass
+
+    seen_urls = []
+    monkeypatch.setattr(requests, "get", lambda url, **kw: (seen_urls.append(url), Resp())[1])
+    batch = s.StockDataFetcher.fetch_realtime_batch(["588940", "002594"], include_indices=True, bypass_proxy=False)
+    assert "sh588940" in seen_urls[0] and "sz002594" in seen_urls[0]
+    assert len(batch["indices"]) == 3
+    assert batch["quotes"]["588940"]["price"] == 0.630 and batch["quotes"]["002594"]["name"] == "比亚迪"
+
+    svc = s.AutoAnalysisService(codes=["588940", "002594"], persist_dir=None, persist_snapshots=False)
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_batch", lambda codes, include_indices=True: batch)
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
+    srv.start(background=True)
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.port}/api/scan_watchlist", data=b"{}", method="POST")
+        scan_res = json.loads(urllib.request.urlopen(req, timeout=3).read().decode("utf-8"))
+        assert scan_res["ok"] is True and scan_res["count"] == 2
+        st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/api/state", timeout=3).read().decode("utf-8"))
+        assert len(st["indices"]) == 3 and st["watchlist_summary"][0]["price"] == 0.630
+    finally:
+        srv.stop()

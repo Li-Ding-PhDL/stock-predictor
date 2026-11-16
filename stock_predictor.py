@@ -1499,6 +1499,114 @@ class StockDataFetcher:
         return StockDataFetcher.fetch_name_industry(code, bypass_proxy).get("industry", "")
 
     @staticmethod
+    def _exchange_market(code: str) -> Tuple[str, str]:
+        """返回 (东方财富 secid 前缀 '1'|'0', 腾讯行情前缀 'sh'|'sz'|'bj')；兼容沪A/科创688/沪ETF5xx/深A/创300/深ETF15x/北交所。"""
+        cs = str(code).strip()
+        if cs.startswith(("6", "900", "5")):
+            return "1", "sh"
+        if cs.startswith(("8", "4", "92")):
+            return "0", "bj"
+        return "0", "sz"
+
+    @staticmethod
+    def _parse_tencent_quote_line(raw_line: str, expected_code: Optional[str] = None) -> Dict[str, Any]:
+        """解析腾讯 qt.gtimg.cn 单行行情（五档与成交量单位天然为「手」）。"""
+        parts = str(raw_line or "").split("~")
+        if len(parts) < 40:
+            raise RuntimeError("腾讯实时行情返回字段不足。")
+        got_code = str(parts[2]).strip()
+        if expected_code is not None and got_code != str(expected_code).strip():
+            raise RuntimeError("实时行情返回的股票代码不匹配。")
+
+        def tp(idx: int):
+            if idx >= len(parts):
+                return None
+            val = str(parts[idx]).strip()
+            if not val or val == "-":
+                return None
+            try:
+                num = float(val)
+                return num if np.isfinite(num) else None
+            except (TypeError, ValueError):
+                return None
+
+        price = tp(3)
+        if price is None or price <= 0:
+            raise RuntimeError("腾讯实时行情价格无效。")
+        amt = None
+        if len(parts) > 35 and "/" in parts[35]:
+            try:
+                amt = float(parts[35].split("/")[-1])
+            except (TypeError, ValueError):
+                amt = None
+        if amt is None and tp(37) is not None:
+            amt = float(tp(37)) * 10000.0
+        bids_t = [(tp(9 + 2 * i), tp(10 + 2 * i)) for i in range(5)]
+        asks_t = [(tp(19 + 2 * i), tp(20 + 2 * i)) for i in range(5)]
+        nm = str(parts[1]).strip() if len(parts) > 1 and str(parts[1]).strip() else None
+        return {
+            "code": got_code,
+            "name": nm,
+            "price": price, "pct": tp(32), "chg": tp(31),
+            "open": tp(5), "high": tp(33), "low": tp(34), "prev": tp(4),
+            "avg": tp(51), "vol": tp(6), "amount": amt,
+            "turnover": tp(38), "vol_ratio": tp(49),
+            "limit_up": tp(47), "limit_down": tp(48), "book_volume_unit": "手",
+            "received_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "bids": bids_t, "asks": asks_t, "source": "tencent",
+        }
+
+    @staticmethod
+    def fetch_realtime_batch(codes: List[str], include_indices: bool = True,
+                             bypass_proxy: bool = True) -> Dict[str, Any]:
+        """单次 HTTP 批量拉取一批股票/ETF 五档盘口与大盘三大指数（用于同花顺自选全表快速扫描）。"""
+        import requests
+
+        clean = []
+        for c in (codes or []):
+            cs = str(c).strip()
+            if re.fullmatch(r"\d{6}", cs) and cs not in clean:
+                clean.append(cs)
+        sym_pairs: List[Tuple[str, str]] = []
+        if include_indices:
+            sym_pairs.extend([("sh000001", "idx_000001"), ("sz399001", "idx_399001"), ("sz399006", "idx_399006")])
+        for cs in clean:
+            _, tx_px = StockDataFetcher._exchange_market(cs)
+            sym_pairs.append((f"{tx_px}{cs}", cs))
+
+        quotes: Dict[str, Dict[str, Any]] = {}
+        indices: List[Dict[str, Any]] = []
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        with ctx:
+            for start_i in range(0, len(sym_pairs), 50):
+                chunk = sym_pairs[start_i:start_i + 50]
+                q_arg = ",".join(sym for sym, _ in chunk)
+                resp = requests.get(
+                    f"https://qt.gtimg.cn/q={q_arg}",
+                    headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
+                    timeout=8,
+                )
+                resp.raise_for_status()
+                txt = resp.content.decode("gbk", errors="ignore") if resp.content else (resp.text or "")
+                for raw_line in txt.split(";"):
+                    ln = raw_line.strip()
+                    if not ln or "~" not in ln:
+                        continue
+                    try:
+                        item = StockDataFetcher._parse_tencent_quote_line(ln)
+                        c_got = item["code"]
+                        if "v_sh000001" in ln or "v_sz399001" in ln or "v_sz399006" in ln:
+                            indices.append({
+                                "code": c_got, "name": item["name"],
+                                "price": item["price"], "pct": item["pct"], "chg": item["chg"],
+                            })
+                        elif c_got in clean:
+                            quotes[c_got] = item
+                    except Exception:
+                        continue
+        return {"quotes": quotes, "indices": indices}
+
+    @staticmethod
     def fetch_realtime_fundflow(code: str, bypass_proxy: bool = True) -> Dict[str, Any]:
         """实时主力资金快照(今日累计)：东财实时行情 push2.eastmoney.com f62/f184/f66.../f184。
         返回 {main_net(主力净流入元), main_pct(净占比%), xl/l/m/s_net(超大/大/中/小单净额)}。
@@ -1507,7 +1615,8 @@ class StockDataFetcher:
         import requests
         out: Dict[str, Any] = {"main_net": None, "main_pct": None,
                                "xl_net": None, "l_net": None, "m_net": None, "s_net": None}
-        secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+        em_px, _ = StockDataFetcher._exchange_market(code)
+        secid = f"{em_px}.{code}"
         params = {"secid": secid, "ut": "b2884a393a59ad64002292a3e90d46a5",
                   "fields": "f62,f184,f66,f69,f72,f75,f78,f81,f84,f87"}
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
@@ -1550,10 +1659,11 @@ class StockDataFetcher:
         fields = ("f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,"
                   "f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,"
                   "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f71,f168,f169,f170,f530")
+        em_px, tx_px = StockDataFetcher._exchange_market(code)
         def request():
             response = requests.get("https://push2.eastmoney.com/api/qt/stock/get",
                                     params={"fltt": "2", "invt": "2", "fields": fields,
-                                            "secid": f"{1 if code.startswith('6') else 0}.{code}"},
+                                            "secid": f"{em_px}.{code}"},
                                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/",
                                              "Connection": "close"},
                                     timeout=8)
@@ -1566,54 +1676,12 @@ class StockDataFetcher:
             return data
 
         def request_tencent():
-            ex = "sh" if code.startswith(("6", "9")) else ("bj" if code.startswith(("8", "4")) else "sz")
-            resp = requests.get(f"https://qt.gtimg.cn/q={ex}{code}",
+            resp = requests.get(f"https://qt.gtimg.cn/q={tx_px}{code}",
                                 headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
                                 timeout=6)
             resp.raise_for_status()
             txt = resp.content.decode("gbk", errors="ignore") if resp.content else (resp.text or "")
-            parts = txt.split("~")
-            if len(parts) < 40:
-                raise RuntimeError("腾讯实时行情返回字段不足。")
-            if str(parts[2]).strip() != code:
-                raise RuntimeError("实时行情返回的股票代码不匹配。")
-
-            def tp(idx):
-                if idx >= len(parts):
-                    return None
-                val = str(parts[idx]).strip()
-                if not val or val == "-":
-                    return None
-                try:
-                    num = float(val)
-                    return num if np.isfinite(num) else None
-                except (TypeError, ValueError):
-                    return None
-
-            price = tp(3)
-            if price is None or price <= 0:
-                raise RuntimeError("腾讯实时行情价格无效。")
-            amt = None
-            if len(parts) > 35 and "/" in parts[35]:
-                try:
-                    amt = float(parts[35].split("/")[-1])
-                except (TypeError, ValueError):
-                    amt = None
-            if amt is None and tp(37) is not None:
-                amt = float(tp(37)) * 10000.0
-            bids_t = [(tp(9 + 2 * i), tp(10 + 2 * i)) for i in range(5)]
-            asks_t = [(tp(19 + 2 * i), tp(20 + 2 * i)) for i in range(5)]
-            nm = str(parts[1]).strip() if len(parts) > 1 and str(parts[1]).strip() else None
-            return {
-                "name": nm,
-                "price": price, "pct": tp(32), "chg": tp(31),
-                "open": tp(5), "high": tp(33), "low": tp(34), "prev": tp(4),
-                "avg": tp(51), "vol": tp(6), "amount": amt,
-                "turnover": tp(38), "vol_ratio": tp(49),
-                "limit_up": tp(47), "limit_down": tp(48), "book_volume_unit": "手",
-                "received_at": dt.datetime.now().isoformat(timespec="seconds"),
-                "bids": bids_t, "asks": asks_t, "source": "tencent",
-            }
+            return StockDataFetcher._parse_tencent_quote_line(txt, expected_code=code)
 
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
@@ -1669,7 +1737,8 @@ class StockDataFetcher:
         last_err: Optional[Exception] = None
         try:
             import requests
-            secid = f"{1 if code.startswith('6') else 0}.{code}"
+            em_px, _ = StockDataFetcher._exchange_market(code)
+            secid = f"{em_px}.{code}"
             params = {
                 "secid": secid,
                 "klt": period_str,
@@ -8114,7 +8183,8 @@ class AutoAnalysisService:
                  persist_dir: Optional[str] = MONITOR_DIR,
                  persist_snapshots: bool = False):
         clean_codes = []
-        for c in (codes or list(USER_WATCHLIST_CODES[:5]) or ["600519"]):
+        default_pool = list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES)
+        for c in (codes or default_pool or ["600519"]):
             cs = str(c).strip()
             if re.fullmatch(r"\d{6}", cs) and cs not in clean_codes:
                 clean_codes.append(cs)
@@ -8148,6 +8218,9 @@ class AutoAnalysisService:
         self._daily_errors: Dict[str, str] = {}
         self._last_alert_ts: Dict[str, float] = {}
         self._offhours_persisted: set = set()
+        self._indices: List[Dict[str, Any]] = []
+        self._batch_overview: Dict[str, Dict[str, Any]] = {}
+        self._last_batch_ts: float = 0.0
         self._cycle_count: int = 0
         self._last_cycle_at: str = ""
 
@@ -8171,7 +8244,7 @@ class AutoAnalysisService:
         with self._lock:
             if cs not in self.codes:
                 self.codes.insert(0, cs)
-                self.codes = self.codes[:20]
+                self.codes = self.codes[:60]
             self.active_code = cs
         self._wake_event.set()
         return cs
@@ -8356,9 +8429,78 @@ class AutoAnalysisService:
         threading.Thread(target=_worker, name=f"DailyAsync-{cs}", daemon=True).start()
         return {"ok": True, "status": "started", "code": cs}
 
+    def refresh_batch_overview(self, force: bool = False) -> Dict[str, Any]:
+        """单次批量刷新三大指数（上证/深证/创业板）与自选池全部股票的五档失衡与实时涨跌倾向。"""
+        now_m = time.monotonic()
+        with self._lock:
+            if not force and (now_m - self._last_batch_ts) < 15.0 and self._batch_overview:
+                return {"indices": list(self._indices), "count": len(self._batch_overview), "cached": True}
+            codes_copy = list(self.codes)
+        res = StockDataFetcher.fetch_realtime_batch(codes_copy, include_indices=True)
+        indices = res.get("indices") or []
+        quotes = res.get("quotes") or {}
+        overview: Dict[str, Dict[str, Any]] = {}
+        for c, q in quotes.items():
+            try:
+                pred = compute_intraday_realtime_prediction(q)
+                overview[c] = {
+                    "code": c,
+                    "name": q.get("name") or STOCK_NAME_OVERRIDES.get(c),
+                    "price": q.get("price"),
+                    "pct": q.get("pct"),
+                    "p_up_pct": pred.get("p_up_pct"),
+                    "weighted_obi_pct": pred.get("weighted_obi_pct"),
+                    "direction": pred.get("direction"),
+                    "updated_at": q.get("received_at"),
+                }
+            except Exception:
+                continue
+        with self._lock:
+            if indices:
+                self._indices = indices
+            self._batch_overview.update(overview)
+            self._last_batch_ts = time.monotonic()
+        return {"indices": list(self._indices), "count": len(overview), "cached": False}
+
     def get_state(self, code: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
             target = str(code).strip() if code and re.fullmatch(r"\d{6}", str(code).strip()) else self.active_code
+            summary_rows = []
+            for c in self.codes:
+                if c in self._latest_by_code:
+                    it = self._latest_by_code[c]
+                    summary_rows.append({
+                        "code": c,
+                        "name": it.get("name") or STOCK_NAME_OVERRIDES.get(c),
+                        "price": it["quote"]["price"],
+                        "pct": it["quote"]["pct"],
+                        "p_up_pct": it["intraday_prediction"]["p_up_pct"],
+                        "weighted_obi_pct": it["intraday_prediction"].get("weighted_obi_pct"),
+                        "direction": it["intraday_prediction"]["direction"],
+                        "updated_at": it["updated_at"],
+                        "error": self._errors_by_code.get(c),
+                    })
+                elif c in self._batch_overview:
+                    bt_item = self._batch_overview[c]
+                    summary_rows.append({
+                        "code": c,
+                        "name": bt_item.get("name") or STOCK_NAME_OVERRIDES.get(c),
+                        "price": bt_item.get("price"),
+                        "pct": bt_item.get("pct"),
+                        "p_up_pct": bt_item.get("p_up_pct"),
+                        "weighted_obi_pct": bt_item.get("weighted_obi_pct"),
+                        "direction": bt_item.get("direction"),
+                        "updated_at": bt_item.get("updated_at"),
+                        "error": self._errors_by_code.get(c),
+                    })
+                else:
+                    summary_rows.append({
+                        "code": c,
+                        "name": STOCK_NAME_OVERRIDES.get(c),
+                        "price": None, "pct": None, "p_up_pct": None,
+                        "weighted_obi_pct": None, "direction": None, "updated_at": None,
+                        "error": self._errors_by_code.get(c),
+                    })
             return {
                 "active_code": target,
                 "codes": list(self.codes),
@@ -8370,24 +8512,13 @@ class AutoAnalysisService:
                 "off_hours_slowdown": self.off_hours_slowdown,
                 "cycle_count": self._cycle_count,
                 "last_cycle_at": self._last_cycle_at,
+                "indices": list(self._indices),
                 "active": self._latest_by_code.get(target),
                 "active_error": self._errors_by_code.get(target),
                 "daily": self._daily_by_code.get(target),
                 "daily_running": bool(self._daily_running.get(target, False)),
                 "daily_error": self._daily_errors.get(target),
-                "watchlist_summary": [
-                    {
-                        "code": c,
-                        "name": (self._latest_by_code[c].get("name") if c in self._latest_by_code else None),
-                        "price": (self._latest_by_code[c]["quote"]["price"] if c in self._latest_by_code else None),
-                        "pct": (self._latest_by_code[c]["quote"]["pct"] if c in self._latest_by_code else None),
-                        "p_up_pct": (self._latest_by_code[c]["intraday_prediction"]["p_up_pct"] if c in self._latest_by_code else None),
-                        "direction": (self._latest_by_code[c]["intraday_prediction"]["direction"] if c in self._latest_by_code else None),
-                        "updated_at": (self._latest_by_code[c]["updated_at"] if c in self._latest_by_code else None),
-                        "error": self._errors_by_code.get(c),
-                    }
-                    for c in self.codes
-                ],
+                "watchlist_summary": summary_rows,
                 "disclaimer": "自动实时测算仅供量化研究，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。",
             }
 
@@ -8396,6 +8527,10 @@ class AutoAnalysisService:
             self._wake_event.clear()
             wait_sec = self.interval_sec
             if not self.paused:
+                try:
+                    self.refresh_batch_overview(force=False)
+                except Exception:
+                    pass
                 with self._lock:
                     # 优先刷新当前活跃股，再轮询1只自选列表其他股票（避免并发轰炸数据源）
                     active = self.active_code
@@ -8413,7 +8548,10 @@ class AutoAnalysisService:
                 with self._lock:
                     self._cycle_count += 1
                     self._last_cycle_at = dt.datetime.now().strftime("%H:%M:%S")
-                    all_fetched = all((c in self._latest_by_code or c in self._errors_by_code) for c in self.codes)
+                    all_fetched = all(
+                        (c in self._latest_by_code or c in self._errors_by_code or c in self._batch_overview)
+                        for c in self.codes
+                    )
                 try:
                     trading_now, _ = is_trading_now()
                 except Exception:
@@ -8464,6 +8602,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
 </head>
 <body>
   <div class="card">
+    <div id="idxBar" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px"></div>
     <div class="row">
       <b>📈 A股场内实时预测</b>
       <span id="statusBadge" class="muted">自动运行中...</span>
@@ -8487,6 +8626,17 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
 
   <div id="mainCard" class="card"><div class="muted">正在拉取实时行情并计算...</div></div>
   <div id="factorsCard" class="card" style="display:none"></div>
+
+  <div class="card">
+    <div class="row">
+      <b>📋 同花顺自选全表实时扫描（点选切换盯盘）</b>
+      <div>
+        <button class="sec" onclick="scanWatchlist()">⚡ 批扫自选</button>
+        <button class="sec" onclick="toggleWatchTable()">展开/收起</button>
+      </div>
+    </div>
+    <div id="watchBox" class="muted" style="margin-top:6px;display:none"></div>
+  </div>
 
   <div class="card">
     <div class="row">
@@ -8612,6 +8762,25 @@ async function refresh() {{
       const cls = x.code === d.active_code ? 'chip active' : 'chip';
       return `<button class="${{cls}}" onclick="pickCode('${{x.code}}')">${{x.code}}${{nm}}${{pTxt}}</button>`;
     }}).join('');
+    const idxBar = document.getElementById('idxBar');
+    if (idxBar && d.indices && d.indices.length) {{
+      idxBar.innerHTML = d.indices.map(ix => {{
+        const cls = (ix.pct || 0) >= 0 ? 'up' : 'dn';
+        const ps = ix.pct != null ? `${{ix.pct>=0?'+':''}}${{Number(ix.pct).toFixed(2)}}%` : '--';
+        return `<div style="background:#0f172a;padding:6px 8px;border-radius:8px;text-align:center"><div class="muted" style="font-size:11px">${{ix.name}}</div><b class="${{cls}}" style="font-size:13px">${{ix.price}}</b><div class="${{cls}}" style="font-size:11px">${{ps}}</div></div>`;
+      }}).join('');
+    }}
+    const wbox = document.getElementById('watchBox');
+    if (wbox) {{
+      const wrows = (d.watchlist_summary || []).map(x => {{
+        const cls = (x.pct || 0) >= 0 ? 'up' : 'dn';
+        const pCls = (x.p_up_pct || 50) >= 55 ? 'up' : ((x.p_up_pct || 50) <= 45 ? 'dn' : '');
+        const pctS = x.pct != null ? `${{x.pct>=0?'+':''}}${{Number(x.pct).toFixed(2)}}%` : '--';
+        const obiS = x.weighted_obi_pct != null ? `${{x.weighted_obi_pct>=0?'+':''}}${{Number(x.weighted_obi_pct).toFixed(1)}}%` : '--';
+        return `<tr style="cursor:pointer" onclick="pickCode('${{x.code}}')"><td><b>${{x.name || x.code}}</b><div class="muted">${{x.code}}</div></td><td class="${{cls}}">${{x.price ?? '--'}}</td><td class="${{cls}}">${{pctS}}</td><td class="${{pCls}}">${{x.p_up_pct != null ? x.p_up_pct+'%' : '--'}}</td><td>${{obiS}}</td></tr>`;
+      }}).join('');
+      wbox.innerHTML = `<div class="muted">共 ${{d.watchlist_summary.length}} 只自选（点击任意行立即切过去实时测算）</div><table><tr><th>名称/代码</th><th>最新</th><th>涨幅</th><th>P(涨)</th><th>五档失衡</th></tr>${{wrows}}</table>`;
+    }}
     renderActive(d);
   }} catch (e) {{
     document.getElementById('statusBadge').textContent = '连接重试中: ' + e;
@@ -8714,6 +8883,16 @@ function renderActive(d) {{
 
 async function togglePause() {{
   await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{paused:!window._curPaused}})}});
+  refresh();
+}}
+function toggleWatchTable() {{
+  const wb = document.getElementById('watchBox');
+  if (wb) wb.style.display = (wb.style.display === 'none' ? 'block' : 'none');
+}}
+async function scanWatchlist() {{
+  const wb = document.getElementById('watchBox');
+  if (wb) wb.style.display = 'block';
+  await fetch(apiUrl('/api/scan_watchlist'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:'{{}}'}});
   refresh();
 }}
 async function forceRefresh() {{
@@ -9010,6 +9189,10 @@ class MobileWebServer:
                         self._send(200, "application/json; charset=utf-8",
                                    json.dumps({"ok": True, "active_code": parent.service.active_code},
                                               ensure_ascii=False).encode("utf-8"))
+                    elif parsed.path == "/api/scan_watchlist":
+                        scan_out = parent.service.refresh_batch_overview(force=True)
+                        self._send(200, "application/json; charset=utf-8",
+                                   json.dumps({"ok": True, **scan_out}, ensure_ascii=False).encode("utf-8"))
                     elif parsed.path == "/api/daily_analyze":
                         code = str(payload.get("code") or parent.service.active_code).strip()
                         if payload.get("sync"):
@@ -12863,7 +13046,7 @@ if HAS_PYSIDE6:
             """启动后台手机自动分析 Web 服务，并弹出手机访问地址、同花顺小窗地址与同花顺副图公式。"""
             code = self.code_edit.text().strip()
             codes = [code] if re.fullmatch(r"\d{6}", code) else []
-            for c in USER_WATCHLIST_CODES[:4]:
+            for c in list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES):
                 if c not in codes:
                     codes.append(c)
             period, hbars = self._mon_bar_params()
@@ -18051,10 +18234,14 @@ GLOBAL_SUBSET_CODES: List[str] = [
 POOL_FEATURE_ALGOS: List[str] = ["SVR", "GPR", "Lasso", "PLSR", "ELM"]
 # 用户的同花顺自选股(个股，不含 ETF/指数)——供"我的自选"一键打分/排序。想改就改这里。
 USER_WATCHLIST_CODES: List[str] = [
-    "600611", "002354", "002437", "002743", "002418", "002045", "600833", "002031",
-    "601212", "000950", "002651", "002746", "600664", "601678", "002131", "000908",
-    "600207", "002560", "002692", "000523", "002377",   # 新增：安彩高科/通达股份/远程股份/红棉股份/国创高新
+    "002031", "000950", "002651", "002746", "600664", "601678", "002131", "000908",
+    "002531", "600207", "002560", "002692", "000523", "002377", "600611", "002354",
+    "002743", "002045", "600833", "002086", "000980", "688037", "600715", "002218",
+    "002418", "002437", "002909", "000560", "000981", "601218", "002520", "002593",
+    "601212", "000802", "300324", "600103", "002594", "002088", "300750", "000678",
 ]
+# 用户同花顺自选里的场内 ETF（仅实时看板/微结构监控使用，不混入纯个股基本面打分池）
+USER_ETF_CODES: List[str] = ["588940", "159155"]
 
 # ⚖️ 合规与法律须知（软件内展示；非法律意见，条文以官方最新文本为准）
 LEGAL_COMPLIANCE_NOTICE = (
@@ -18081,6 +18268,8 @@ LEGAL_COMPLIANCE_NOTICE = (
 STOCK_NAME_OVERRIDES: Dict[str, str] = {
     "000908": "石药景峰",   # 原名『景峰医药/ST景峰』，已更名
     "002743": "ST富煌",     # 原『富煌钢构』，已被 ST
+    "588940": "科创50ETF",
+    "159155": "电池ETF大成",
 }
 
 # 模型 X 只用这些"尺度无关、当天及以前可得"的特征(绝对股价不入 X：跨股票不可比且强自相关)
@@ -20432,8 +20621,13 @@ def main():
         return ev
 
     if args.web:
-        codes = ([c.strip() for c in args.web_codes.split(",") if c.strip()]
-                 if args.web_codes.strip() else [args.code.strip()] + [c for c in USER_WATCHLIST_CODES[:4] if c != args.code.strip()])
+        default_pool = list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES)
+        if args.web_codes.strip():
+            codes = [c.strip() for c in args.web_codes.split(",") if c.strip()]
+        elif "--code" in sys.argv:
+            codes = [args.code.strip()] + [c for c in default_pool if c != args.code.strip()]
+        else:
+            codes = default_pool
         srv = start_mobile_web_server(
             codes=codes, host=args.web_host, port=args.web_port,
             interval=args.web_interval, bar_period=args.bar_period,
