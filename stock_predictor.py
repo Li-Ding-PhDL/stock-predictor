@@ -7772,6 +7772,137 @@ def orderbook_eval_report_html(ev: Dict[str, Any], light: bool = False) -> str:
     )
 
 
+_MARKET_MOOD_LOCK = threading.Lock()
+_MARKET_MOOD_CACHE: Dict[str, Any] = {"ts": 0.0, "day": "", "data": None}
+
+
+def fetch_market_sentiment_snapshot(
+    day: Optional[str] = None,
+    bypass_proxy: bool = True,
+) -> Dict[str, Any]:
+    """
+    客观统计 A 股当日涨停池/炸板率/连板阶梯/昨日涨停今表现/热点行业（严格描述性统计，不预测明日涨停）。
+    借鉴涨停复盘面板直观结构，但剔除夸大概率营销话术，失败时优雅降级返回明确提示。
+    """
+    target_day = str(day).strip() if day else None
+    now_mono = time.monotonic()
+    if target_day is None:
+        with _MARKET_MOOD_LOCK:
+            if _MARKET_MOOD_CACHE["data"] is not None and (now_mono - _MARKET_MOOD_CACHE["ts"]) < 120.0:
+                return dict(_MARKET_MOOD_CACHE["data"])
+
+    if not HAS_AKSHARE:
+        return {
+            "error": "未安装 akshare，无法拉取全市场涨停池与情绪统计。",
+            "disclaimer": "市场情绪指标仅反映当日客观统计事实，不构成买卖或打板建议、盈亏自负。",
+        }
+
+    ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+    try:
+        with ctx:
+            cand_days = (
+                [target_day]
+                if target_day
+                else [(dt.date.today() - dt.timedelta(days=k)).strftime("%Y%m%d") for k in range(6)]
+            )
+            used_day = cand_days[0]
+            zt_df = pd.DataFrame()
+            for d_str in cand_days:
+                try:
+                    tmp = ak.stock_zt_pool_em(date=d_str)
+                    if tmp is not None and len(tmp) > 0:
+                        zt_df = tmp
+                        used_day = d_str
+                        break
+                except Exception:
+                    continue
+
+            if zt_df is None or len(zt_df) == 0:
+                return {
+                    "date": used_day,
+                    "error": "近期交易日涨停池暂无数据或接口暂不可达。",
+                    "disclaimer": "市场情绪指标仅反映当日客观统计事实，不构成买卖或打板建议、盈亏自负。",
+                }
+
+            zb_df = pd.DataFrame()
+            pv_df = pd.DataFrame()
+            try:
+                zb_df = ak.stock_zt_pool_zbgc_em(date=used_day)
+            except Exception:
+                pass
+            try:
+                pv_df = ak.stock_zt_pool_previous_em(date=used_day)
+            except Exception:
+                pass
+    except Exception as exc:
+        return {
+            "error": f"获取全市场涨停情绪失败: {exc}",
+            "disclaimer": "市场情绪指标仅反映当日客观统计事实，不构成买卖或打板建议、盈亏自负。",
+        }
+
+    zt_count = int(len(zt_df))
+    zb_count = int(len(zb_df)) if zb_df is not None else 0
+    seal_rate = round(zt_count / (zt_count + zb_count) * 100.0, 1) if (zt_count + zb_count) > 0 else None
+
+    lb_col = next((c for c in ("连板数", "连板天数") if c in zt_df.columns), None)
+    if lb_col:
+        lbs = pd.to_numeric(zt_df[lb_col], errors="coerce").dropna().astype(int)
+        max_lb = int(lbs.max()) if len(lbs) else 1
+        ladder = {
+            "1板": int((lbs == 1).sum()),
+            "2板": int((lbs == 2).sum()),
+            "3板及以上": int((lbs >= 3).sum()),
+        }
+    else:
+        max_lb = 1
+        ladder = {"1板": zt_count, "2板": 0, "3板及以上": 0}
+
+    hot_industries: List[Dict[str, Any]] = []
+    if "所属行业" in zt_df.columns:
+        vc = zt_df["所属行业"].dropna().astype(str).str.strip()
+        vc = vc[vc != ""]
+        for ind_name, cnt in vc.value_counts().head(4).items():
+            hot_industries.append({"industry": str(ind_name), "count": int(cnt)})
+
+    prev_zt_count = int(len(pv_df)) if pv_df is not None else 0
+    prev_avg_pct = None
+    prev_up_pct = None
+    if pv_df is not None and len(pv_df) > 0 and "涨跌幅" in pv_df.columns:
+        pv_pct = pd.to_numeric(pv_df["涨跌幅"], errors="coerce").dropna()
+        if len(pv_pct) > 0:
+            prev_avg_pct = round(float(pv_pct.mean()), 2)
+            prev_up_pct = round(float((pv_pct > 0).mean() * 100.0), 1)
+
+    if seal_rate is not None and seal_rate >= 70.0 and (prev_avg_pct is None or prev_avg_pct >= 1.5):
+        mood_label = "接力活跃(封板顺畅)"
+    elif seal_rate is not None and seal_rate < 55.0:
+        mood_label = "炸板分歧(谨慎追高)"
+    elif prev_avg_pct is not None and prev_avg_pct < -0.5:
+        mood_label = "昨日涨停溢价走弱"
+    else:
+        mood_label = "情绪温和(结构轮动)"
+
+    out = {
+        "date": used_day,
+        "mood_label": mood_label,
+        "zt_count": zt_count,
+        "zb_count": zb_count,
+        "seal_rate_pct": seal_rate,
+        "max_lb": max_lb,
+        "ladder": ladder,
+        "prev_zt_count": prev_zt_count,
+        "prev_zt_avg_pct": prev_avg_pct,
+        "prev_zt_up_pct": prev_up_pct,
+        "hot_industries": hot_industries,
+        "updated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "disclaimer": "市场情绪与涨停池仅反映当日客观统计事实，打板与连板博弈波动极高，不构成任何投资建议、盈亏自负。",
+    }
+    if target_day is None:
+        with _MARKET_MOOD_LOCK:
+            _MARKET_MOOD_CACHE.update({"ts": time.monotonic(), "day": used_day, "data": out})
+    return out
+
+
 # ==================== 第八部分补充6b：手机移动端自动分析服务 + 同花顺浮窗/副图公式 ====================
 def _ths_fit_linear_weights(df: Optional[pd.DataFrame], horizon: int = 1) -> Tuple[Dict[str, float], Optional[Dict[str, Any]]]:
     """用因果时间序列切分与 Ridge 回归，为同花顺公式的 6 个平稳量价特征拟合数据校准权重。
@@ -8151,8 +8282,10 @@ class AutoAnalysisService:
             code=cs, algos=["Ensemble", "RF", "GBRT", "Lasso"],
             hpo="关闭", horizon=1, forecast=True,
             use_valuation=False, use_index=False, use_fundflow=False,
+            backtest=True,
         )
         rows = []
+        best_bt = None
         for r in out.get("results") or []:
             if r.get("error"):
                 continue
@@ -8163,12 +8296,37 @@ class AutoAnalysisService:
                 "up_p": round(float(m.get("UP_P", 0.0)), 2),
                 "rmse": round(float(m.get("RMSE", 0.0)), 4),
             })
+            if best_bt is None and isinstance(r.get("backtest"), dict):
+                bt = r["backtest"]
+                eq_s = list(bt.get("eq_strat") or [])
+                eq_b = list(bt.get("eq_bh") or [])
+                if eq_s and eq_b and len(eq_s) == len(eq_b):
+                    step = max(1, len(eq_s) // 40)
+                    eq_s_ds = [round(float(v), 4) for v in eq_s[::step]]
+                    eq_b_ds = [round(float(v), 4) for v in eq_b[::step]]
+                    if eq_s_ds[-1] != round(float(eq_s[-1]), 4):
+                        eq_s_ds.append(round(float(eq_s[-1]), 4))
+                        eq_b_ds.append(round(float(eq_b[-1]), 4))
+                else:
+                    eq_s_ds, eq_b_ds = [], []
+                best_bt = {
+                    "algo": r["algo"],
+                    "total_return_pct": bt.get("total_return_pct"),
+                    "buyhold_return_pct": bt.get("buyhold_return_pct"),
+                    "excess_vs_buyhold_pct": bt.get("excess_vs_buyhold_pct"),
+                    "max_drawdown_pct": bt.get("max_drawdown_pct"),
+                    "n_segments": bt.get("n_segments"),
+                    "cost_bps": bt.get("cost_bps"),
+                    "eq_strat": eq_s_ds,
+                    "eq_bh": eq_b_ds,
+                }
         summary = {
             "code": cs,
             "updated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "models": rows,
             "forecast": out.get("forecast") or [],
             "trust_gate": out.get("trust_gate") or {},
+            "backtest": best_bt,
         }
         with self._lock:
             self._daily_by_code[cs] = summary
@@ -8332,6 +8490,14 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
 
   <div class="card">
     <div class="row">
+      <b>🌡️ A股市场情绪与涨停温度计（客观描述统计）</b>
+      <button class="sec" onclick="loadMood()">刷新情绪</button>
+    </div>
+    <div id="moodBox" class="muted" style="margin-top:6px">正在获取当日涨停池、封板率、连板高度与热点行业...</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
       <b>📏 买手/卖手盘口准确率实测（历史快照因果回放）</b>
       <div>
         <select id="evalHor" onchange="loadEval()">
@@ -8367,6 +8533,61 @@ const TQ = {json.dumps(token_qs)};
 const THS = {ths_json};
 document.getElementById('thsPre').textContent = THS.formula + '\\n\\n' + (THS.intraday_formula || '');
 let curCode = new URLSearchParams(location.search).get('code') || '';
+const liveTrace = {{}};
+
+function sparkSvg(pts, avgVal) {{
+  if (!pts || pts.length < 2) return '';
+  const w = 320, h = 54, pad = 4;
+  const vals = pts.map(x => x.p);
+  if (avgVal != null && isFinite(avgVal)) vals.push(avgVal);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (hi - lo < 1e-6) {{ lo -= 0.05; hi += 0.05; }}
+  const xy = pts.map((x, idx) => {{
+    const xx = pad + (idx / Math.max(1, pts.length - 1)) * (w - 2 * pad);
+    const yy = h - pad - ((x.p - lo) / (hi - lo)) * (h - 2 * pad);
+    return `${{xx.toFixed(1)}},${{yy.toFixed(1)}}`;
+  }}).join(' ');
+  const avgLine = (avgVal != null && isFinite(avgVal))
+    ? (() => {{
+        const ay = h - pad - ((avgVal - lo) / (hi - lo)) * (h - 2 * pad);
+        return `<line x1="${{pad}}" y1="${{ay.toFixed(1)}}" x2="${{w-pad}}" y2="${{ay.toFixed(1)}}" stroke="#f59e0b" stroke-width="1" stroke-dasharray="3,3"/>`;
+      }})() : '';
+  return `<div style="margin-top:8px"><div class="muted" style="font-size:11px">本机实时轨迹(${{pts.length}}点，橙虚线为分时均价)</div>` +
+    `<svg viewBox="0 0 ${{w}} ${{h}}" style="width:100%;height:54px;background:#0f172a;border-radius:8px;margin-top:2px">` +
+    `${{avgLine}}<polyline fill="none" stroke="#60a5fa" stroke-width="2" points="${{xy}}"/></svg></div>`;
+}}
+
+function ringSvg(factors) {{
+  if (!factors || !factors.length) return '';
+  const r = 34, cx = 44, cy = 44, circ = 2 * Math.PI * r;
+  const totW = factors.reduce((s, f) => s + Math.max(0.01, f.weight || 0), 0) || 1;
+  let offset = 0;
+  const segs = factors.map(f => {{
+    const frac = Math.max(0.01, f.weight || 0) / totW;
+    const len = frac * circ;
+    const col = f.bias === '偏多' ? '#ff6b6b' : (f.bias === '偏空' ? '#2ecc71' : '#64748b');
+    const seg = `<circle r="${{r}}" cx="${{cx}}" cy="${{cy}}" fill="transparent" stroke="${{col}}" stroke-width="12" stroke-dasharray="${{len.toFixed(2)}} ${{(circ-len).toFixed(2)}}" stroke-dashoffset="${{(-offset).toFixed(2)}}" transform="rotate(-90 ${{cx}} ${{cy}})"/>`;
+    offset += len;
+    return seg;
+  }}).join('');
+  return `<svg width="88" height="88" viewBox="0 0 88 88" style="flex-shrink:0">${{segs}}<circle r="24" cx="${{cx}}" cy="${{cy}}" fill="#1e293b"/><text x="${{cx}}" y="${{cy+4}}" text-anchor="middle" fill="#cbd5e1" font-size="11">${{factors.length}}因子</text></svg>`;
+}}
+
+function btCurveSvg(eqS, eqB) {{
+  if (!eqS || !eqB || eqS.length < 2) return '';
+  const w = 320, h = 68, pad = 6;
+  const all = eqS.concat(eqB);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  if (hi - lo < 1e-6) {{ lo -= 0.01; hi += 0.01; }}
+  const toPts = arr => arr.map((v, idx) => {{
+    const xx = pad + (idx / Math.max(1, arr.length - 1)) * (w - 2 * pad);
+    const yy = h - pad - ((v - lo) / (hi - lo)) * (h - 2 * pad);
+    return `${{xx.toFixed(1)}},${{yy.toFixed(1)}}`;
+  }}).join(' ');
+  return `<svg viewBox="0 0 ${{w}} ${{h}}" style="width:100%;height:68px;background:#0f172a;border-radius:8px;margin-top:6px">` +
+    `<polyline fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="3,2" points="${{toPts(eqB)}}"/>` +
+    `<polyline fill="none" stroke="#60a5fa" stroke-width="2" points="${{toPts(eqS)}}"/></svg>`;
+}}
 
 function apiUrl(p, extra='') {{
   if (!TQ) return p + (extra ? '?' + extra : '');
@@ -8427,6 +8648,16 @@ function renderActive(d) {{
     ? `<div class="muted" style="margin-top:6px">实盘滚动核验：本次 <b>${{v.verified_n}}</b> 次，命中率 <b class="up">${{v.hit_rate_pct}}%</b> (同期实际涨 ${{v.baseline_up_pct}}%)${{histTxt}}</div>`
     : `<div class="muted" style="margin-top:6px">实盘滚动核验：本次已记录 ${{v.total_recorded || 0}} 次，等待窗口到期${{histTxt}}</div>`;
 
+  if (q.price != null && isFinite(q.price)) {{
+    const arr = liveTrace[a.code] || (liveTrace[a.code] = []);
+    const last = arr[arr.length - 1];
+    if (!last || last.t !== a.updated_at || last.p !== q.price) {{
+      arr.push({{t: a.updated_at, p: Number(q.price), pup: p.p_up_pct}});
+      if (arr.length > 60) arr.shift();
+    }}
+  }}
+  const traceHtml = sparkSvg(liveTrace[a.code], q.avg);
+
   box.innerHTML = `
     <div class="row">
       <div><b style="font-size:18px">${{titleName}}</b> <span class="muted">[${{a.status}}] ${{a.updated_at}}</span></div>
@@ -8448,6 +8679,7 @@ function renderActive(d) {{
       <span class="muted">微价 ${{p.micro_price ?? '-'}} | 失衡 ${{p.weighted_obi_pct ?? '-'}}%</span>
       <b class="dn">P(跌) ${{p.p_down_pct}}%</b>
     </div>
+    ${{traceHtml}}
     ${{bfHtml}}
     ${{verHtml}}
     <div class="muted" style="margin-top:6px;color:#fca5a5">⚠ ${{p.disclaimer}}</div>
@@ -8455,9 +8687,11 @@ function renderActive(d) {{
 
   if (p.factors && p.factors.length) {{
     fbox.style.display = 'block';
-    fbox.innerHTML = '<b>实时因子拆解</b><table><tr><th>因子</th><th>测算值</th><th>倾向</th><th>权重</th></tr>' +
+    fbox.innerHTML = '<div class="row"><b>实时因子多维拆解</b><span class="muted">红=偏多 / 绿=偏空 / 灰=中性</span></div>' +
+      '<div style="display:flex;align-items:center;gap:10px;margin-top:6px">' + ringSvg(p.factors) +
+      '<div style="flex:1"><table><tr><th>因子</th><th>测算值</th><th>倾向</th><th>权重</th></tr>' +
       p.factors.map(f => `<tr><td>${{f.name}}</td><td>${{f.value}}</td><td class="${{f.bias==='偏多'?'up':(f.bias==='偏空'?'dn':'')}}">${{f.bias}}</td><td>${{Math.round(f.weight*100)}}%</td></tr>`).join('') +
-      '</table>';
+      '</table></div></div>';
   }}
   if (d.daily_error) {{
     document.getElementById('dailyBox').innerHTML = `<div class="up">日线计算失败: ${{d.daily_error}}</div>`;
@@ -8467,9 +8701,14 @@ function renderActive(d) {{
       `<div><b>${{f.algo}}</b> 明日预估 <b>${{f.pred_close}}</b> (<span class="${{f.pred_change_pct>=0?'up':'dn'}}">${{f.pred_change_pct>=0?'+':''}}${{f.pred_change_pct}}%</span>)</div>`
     ).join('');
     const tg = dm.trust_gate && dm.trust_gate.n_models ? `<div class="muted" style="margin-top:4px">可信度闸门: <b>${{dm.trust_gate.n_passed}}/${{dm.trust_gate.n_models}}</b> 通过</div>` : '';
+    const bt = dm.backtest;
+    const btHtml = bt ? `<div style="margin-top:8px;padding:8px;background:#0f172a;border-radius:8px;font-size:12px">
+      <div><b>样本外回测(${{bt.algo}})</b> 策略累计 <b class="${{bt.total_return_pct>=0?'up':'dn'}}">${{bt.total_return_pct>=0?'+':''}}${{bt.total_return_pct}}%</b> | 买入持有 <b>${{bt.buyhold_return_pct>=0?'+':''}}${{bt.buyhold_return_pct}}%</b> | 超额 <b class="${{bt.excess_vs_buyhold_pct>=0?'up':'dn'}}">${{bt.excess_vs_buyhold_pct>=0?'+':''}}${{bt.excess_vs_buyhold_pct}}%</b> | 最大回撤 <b>${{bt.max_drawdown_pct}}%</b></div>
+      <div class="muted" style="font-size:11px">蓝线=策略净值 · 灰虚线=买入持有(含往返${{bt.cost_bps}}bps手续费，共${{bt.n_segments}}段)</div>
+      ${{btCurveSvg(bt.eq_strat, bt.eq_bh)}}</div>` : '';
     document.getElementById('dailyBox').innerHTML = `<div>更新: ${{dm.updated_at}}</div>` +
       '<table><tr><th>模型</th><th>DA%</th><th>UP_P%</th><th>RMSE</th></tr>' +
-      dm.models.map(m => `<tr><td>${{m.algo}}</td><td>${{m.da}}</td><td>${{m.up_p}}</td><td>${{m.rmse}}</td></tr>`).join('') + '</table>' + fc + tg;
+      dm.models.map(m => `<tr><td>${{m.algo}}</td><td>${{m.da}}</td><td>${{m.up_p}}</td><td>${{m.rmse}}</td></tr>`).join('') + '</table>' + fc + tg + btHtml;
   }}
 }}
 
@@ -8543,8 +8782,34 @@ function copyThs() {{
   const txt = THS.formula + '\\n\\n' + (THS.intraday_formula || '');
   navigator.clipboard.writeText(txt).then(() => alert('已复制同花顺副图公式（通用版+盘中短线版）！')).catch(() => alert('请长按下方代码块手动全选复制'));
 }}
+async function loadMood() {{
+  const box = document.getElementById('moodBox');
+  if (!box) return;
+  try {{
+    const r = await fetch(apiUrl('/api/market_mood'));
+    const m = await r.json();
+    if (m.error) {{
+      box.innerHTML = `<span class="muted">${{m.error}}</span>`;
+      return;
+    }}
+    const hot = (m.hot_industries || []).map(x => `<span class="chip">${{x.industry}} ${{x.count}}家</span>`).join('');
+    const pvCls = (m.prev_zt_avg_pct || 0) >= 0 ? 'up' : 'dn';
+    const pvStr = m.prev_zt_avg_pct != null ? `${{m.prev_zt_avg_pct>=0?'+':''}}${{m.prev_zt_avg_pct}}%` : '-';
+    box.innerHTML = `<div class="row"><span>日期 <b>${{m.date}}</b></span><b class="up">${{m.mood_label}}</b></div>` +
+      `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:6px">` +
+      `<div style="background:#0f172a;padding:8px;border-radius:8px"><div class="muted">连板高度</div><b class="up">${{m.max_lb}}板</b><div class="muted">1/2/3+板: ${{m.ladder['1板']}}/${{m.ladder['2板']}}/${{m.ladder['3板及以上']}}</div></div>` +
+      `<div style="background:#0f172a;padding:8px;border-radius:8px"><div class="muted">涨停 / 封板率</div><b>${{m.zt_count}}家 <span class="up">${{m.seal_rate_pct ?? '-'}}%</span></b><div class="muted">炸板 ${{m.zb_count}}家</div></div>` +
+      `<div style="background:#0f172a;padding:8px;border-radius:8px"><div class="muted">昨涨停今均值</div><b class="${{pvCls}}">${{pvStr}}</b><div class="muted">红盘 ${{m.prev_zt_up_pct ?? '-'}}% (${{m.prev_zt_count}}家)</div></div>` +
+      `</div>` +
+      (hot ? `<div class="chips" style="margin-top:6px">${{hot}}</div>` : '') +
+      `<div class="muted" style="margin-top:4px;font-size:11px">⚠ ${{m.disclaimer}}</div>`;
+  }} catch (e) {{
+    box.textContent = '情绪数据加载失败: ' + e;
+  }}
+}}
 refresh();
 setTimeout(loadEval, 900);
+setTimeout(loadMood, 1100);
 setInterval(refresh, 4000);
 </script>
 </body>
@@ -8691,6 +8956,11 @@ class MobileWebServer:
                     cal = intraday_calibration_summary(code=code, persist_dir=parent.service._tracker.persist_dir)
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(cal, ensure_ascii=False).encode("utf-8"))
+                elif parsed.path == "/api/market_mood":
+                    day_arg = (qs.get("day") or [""])[0].strip() or None
+                    mood = fetch_market_sentiment_snapshot(day=day_arg)
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(mood, ensure_ascii=False).encode("utf-8"))
                 elif parsed.path in ("/api/orderbook_eval", "/orderbook_eval"):
                     raw_code = (qs.get("code") or [""])[0].strip()
                     try:
@@ -19895,6 +20165,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="严格因果回放 monitor_log/ 中已采集的买手/卖手快照，检验各盘口因子准确率与多数基准")
     p.add_argument("--eval-horizon", type=float, default=60.0,
                    help="配合 --eval-orderbook 的前瞻验证窗口(秒，默认60)")
+    p.add_argument("--market-mood", action="store_true",
+                   help="A股当日情绪温度计：统计涨停家数/封板率/连板阶梯/昨涨停今表现/热点行业")
     p.add_argument("--export-ths", nargs="?", const="SP_QUANT_同花顺副图.txt", default=None,
                    help="生成并导出可直接粘贴进同花顺 PC/手机云公式的副图指标源码")
     p.add_argument("--verify", action="store_true",
@@ -20098,6 +20370,28 @@ def main():
         print(full_txt)
         print("\n".join(ths["guide"]))
         return ths
+
+    if getattr(args, "market_mood", False):
+        mood = fetch_market_sentiment_snapshot()
+        if mood.get("error"):
+            print(f"[market-mood] {mood['error']}")
+        else:
+            print("=" * 72)
+            print(f"🌡️ A股情绪温度计 ({mood['date']})  状态: {mood['mood_label']}")
+            print(f"  涨停: {mood['zt_count']} 家 | 炸板: {mood['zb_count']} 家 | 封板率: {mood['seal_rate_pct']}%")
+            ld = mood["ladder"]
+            print(f"  连板高度: {mood['max_lb']} 板  (1板={ld['1板']} / 2板={ld['2板']} / 3板及以上={ld['3板及以上']})")
+            print(f"  昨日涨停今日表现({mood['prev_zt_count']}家): 平均 {mood['prev_zt_avg_pct']:+.2f}% | 红盘率 {mood['prev_zt_up_pct']}%")
+            if mood["hot_industries"]:
+                ind_str = " | ".join(f"{x['industry']}({x['count']})" for x in mood["hot_industries"])
+                print(f"  涨停聚集行业: {ind_str}")
+            print(f"  ⚠ {mood['disclaimer']}")
+            print("=" * 72)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump(mood, fh, ensure_ascii=False, indent=2)
+            print(f"结果 JSON 已写入: {args.json}")
+        return mood
 
     if getattr(args, "eval_orderbook", False):
         codes = ([c.strip() for c in args.web_codes.split(",") if c.strip()]

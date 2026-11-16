@@ -898,3 +898,67 @@ def test_auto_service_persists_orderbook_and_eval_endpoints(tmp_path, monkeypatc
         assert "#ffffff" in s.orderbook_eval_report_html(ev, light=True)
     finally:
         srv.stop()
+
+
+def test_market_sentiment_snapshot_and_backtest_daily(tmp_path, monkeypatch):
+    import pandas as pd
+    import urllib.request
+
+    zt_df = pd.DataFrame([
+        {"代码": "600001", "连板数": 3, "所属行业": "军工"},
+        {"代码": "600002", "连板数": 2, "所属行业": "军工"},
+        {"代码": "600003", "连板数": 1, "所属行业": "半导体"},
+        {"代码": "600004", "连板数": 1, "所属行业": "半导体"},
+    ])
+    zb_df = pd.DataFrame([{"代码": "600005"}])
+    pv_df = pd.DataFrame([{"涨跌幅": 3.5}, {"涨跌幅": -1.5}])
+
+    monkeypatch.setattr(s, "HAS_AKSHARE", True)
+    monkeypatch.setattr(s, "_MARKET_MOOD_CACHE", {"ts": 0.0, "day": "", "data": None})
+    monkeypatch.setattr(s.ak, "stock_zt_pool_em", lambda date: zt_df)
+    monkeypatch.setattr(s.ak, "stock_zt_pool_zbgc_em", lambda date: zb_df)
+    monkeypatch.setattr(s.ak, "stock_zt_pool_previous_em", lambda date: pv_df)
+
+    mood = s.fetch_market_sentiment_snapshot(day="20261116", bypass_proxy=False)
+    assert mood["zt_count"] == 4 and mood["zb_count"] == 1
+    assert mood["seal_rate_pct"] == 80.0
+    assert mood["max_lb"] == 3 and mood["ladder"]["3板及以上"] == 1
+    assert mood["prev_zt_avg_pct"] == 1.0 and mood["prev_zt_up_pct"] == 50.0
+    assert {x["industry"] for x in mood["hot_industries"]} == {"军工", "半导体"}
+
+    out_json = tmp_path / "mood.json"
+    monkeypatch.setattr(s.sys, "argv", ["stock_predictor.py", "--market-mood", "--json", str(out_json)])
+    cli_mood = s.main()
+    assert cli_mood["zt_count"] == 4 and out_json.exists()
+
+    bars = _synthetic_intraday_bars(n=80)
+    q = dict(_quote(), name="贵州茅台", book_volume_unit="手")
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime", lambda code: dict(q))
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_fundflow", lambda code: None)
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_intraday_bars", lambda code, period="5": bars)
+    monkeypatch.setattr(s, "run_experiment", lambda **kw: {
+        "results": [{
+            "algo": "Ensemble",
+            "metrics": {"DA": 58.0, "UP_P": 60.0, "RMSE": 1.2},
+            "backtest": {
+                "total_return_pct": 12.5, "buyhold_return_pct": 4.2,
+                "excess_vs_buyhold_pct": 8.3, "max_drawdown_pct": -6.1,
+                "n_segments": 3, "cost_bps": 0.2,
+                "eq_strat": [1.0, 1.05, 1.125], "eq_bh": [1.0, 1.02, 1.042],
+            },
+            "error": None,
+        }],
+        "forecast": [], "trust_gate": {"n_passed": 1, "n_models": 1},
+    })
+    svc = s.AutoAnalysisService(codes=["600519"], persist_dir=str(tmp_path), persist_snapshots=False)
+    daily = svc.run_daily_analysis("600519")
+    assert daily["backtest"]["excess_vs_buyhold_pct"] == 8.3
+    assert len(daily["backtest"]["eq_strat"]) == 3
+
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
+    srv.start(background=True)
+    try:
+        m_resp = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/api/market_mood", timeout=3).read().decode("utf-8"))
+        assert m_resp["seal_rate_pct"] == 80.0
+    finally:
+        srv.stop()
