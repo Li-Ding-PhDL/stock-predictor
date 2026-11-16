@@ -599,3 +599,73 @@ def test_fetch_intraday_bars_transport_and_intraday_predict_cli(tmp_path, monkey
     assert res["intraday_prediction"]["bar_forecast"]["available"] is True
     saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["code"] == "600000" and "p_up_pct" in saved["intraday_prediction"]
+
+
+
+def test_generate_ths_formula_and_export_cli(tmp_path, monkeypatch):
+    ths = s.generate_ths_formula("MY_THS")
+    assert ths["name"] == "MY_THS"
+    assert "MA(CLOSE, 5)" in ths["formula"]
+    assert "量化多空分" in ths["formula"]
+    assert "非买卖信号" in ths["formula"]
+    assert len(ths["guide"]) >= 4
+
+    out_txt = tmp_path / "ths.txt"
+    monkeypatch.setattr(sys, "argv", ["stock_predictor.py", "--export-ths", str(out_txt)])
+    res = s.main()
+    assert res["name"] == "SP_QUANT"
+    content = out_txt.read_text(encoding="utf-8")
+    assert "量化多空分" in content and "云同步" in content
+
+
+def test_mobile_web_server_and_auto_analysis_service(monkeypatch):
+    import urllib.request
+    import urllib.error
+
+    bars = _synthetic_intraday_bars(n=100)
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime", lambda code: _quote())
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_fundflow", lambda code: {"main_net": 1.5e6, "main_pct": 3.2})
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_intraday_bars", lambda code, period="5": bars)
+    monkeypatch.setattr(s, "is_trading_now", lambda: (True, "盘中交易"))
+
+    svc = s.AutoAnalysisService(codes=["600519", "000001"], interval_sec=10.0)
+    entry = svc.analyze_code_once("600519")
+    assert entry["code"] == "600519"
+    assert entry["intraday_prediction"]["bar_forecast"]["available"] is True
+
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0, auth_token="secret42")
+    urls = srv.start(background=True)
+    try:
+        base = f"http://127.0.0.1:{srv.port}"
+        # 未带 token 应拒绝访问
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"{base}/api/state", timeout=3)
+        assert exc_info.value.code == 403
+
+        # 携带 token 读取手机主页、浮窗页、状态 JSON 与同花顺公式
+        html_main = urllib.request.urlopen(f"{base}/?token=secret42", timeout=3).read().decode("utf-8")
+        assert "A股场内实时预测" in html_main and "/widget?token=secret42" in html_main
+
+        html_widget = urllib.request.urlopen(f"{base}/widget?token=secret42", timeout=3).read().decode("utf-8")
+        assert "同花顺悬浮预测条" in html_widget
+
+        state = json.loads(urllib.request.urlopen(f"{base}/api/state?token=secret42", timeout=3).read().decode("utf-8"))
+        assert state["active_code"] == "600519"
+        assert state["active"]["intraday_prediction"]["p_up_pct"] > 0
+
+        ths_api = json.loads(urllib.request.urlopen(f"{base}/api/ths_formula?token=secret42", timeout=3).read().decode("utf-8"))
+        assert "量化多空分" in ths_api["formula"]
+
+        # POST /api/watch 动态切换/添加监控代码
+        req = urllib.request.Request(
+            f"{base}/api/watch?token=secret42",
+            data=json.dumps({"code": "002418", "bar_period": "1", "horizon_bars": 5}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        post_res = json.loads(urllib.request.urlopen(req, timeout=3).read().decode("utf-8"))
+        assert post_res["ok"] is True and post_res["active_code"] == "002418"
+        assert "002418" in svc.codes and svc.bar_period == "1" and svc.horizon_bars == 5
+        assert "token=secret42" in urls["widget_url"]
+    finally:
+        srv.stop()

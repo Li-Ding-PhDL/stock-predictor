@@ -7253,6 +7253,736 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
     }
 
 
+# ==================== 第八部分补充6b：手机移动端自动分析服务 + 同花顺浮窗/副图公式 ====================
+def generate_ths_formula(name: str = "SP_QUANT") -> Dict[str, Any]:
+    """生成可直接粘贴进【同花顺 PC/手机云公式】的副图技术指标源码。
+
+    诚实边界：同花顺原生公式引擎只支持量价序列与内置函数，不能直接运行 Python sklearn/GBRT 或
+    实时五档盘口机器学习；本公式将本平台已验证的平稳量价特征（均线偏离、波幅调整动量、有向成交量流、
+    归一化MACD、超跌首阳）翻译为同花顺副图语法，配合同花顺「云同步公式」即可直接在手机同花顺 K 线/
+    分时副图屏幕上显示。如需完整五档+分钟ML实时计算，请同时开启 `--web` 的 `/widget` 悬浮窗页面。
+    """
+    formula_code = (
+        "{ " + str(name) + " · 量化平稳动量与量价副图（仅供研究参考，非买卖信号，盈亏自负） }\n"
+        "{ 适用：同花顺 PC端 公式管理 -> 新建技术指标(副图) -> 开启云同步 -> 手机同花顺直接显示 }\n"
+        "MA5 := MA(CLOSE, 5);\n"
+        "MA20 := MA(CLOSE, 20);\n"
+        "EMA5 := EMA(CLOSE, 5);\n"
+        "EMA20 := EMA(CLOSE, 20);\n"
+        "DIF := EMA(CLOSE, 12) - EMA(CLOSE, 26);\n"
+        "DEA := EMA(DIF, 9);\n"
+        "MACDH := (DIF - DEA) * 2;\n"
+        "\n"
+        "{ 1) 均线偏离趋势 }\n"
+        "MA_DEV := (MA5 / (MA20 + 0.0001) - 1) * 100;\n"
+        "EMA_DEV := (EMA5 / (EMA20 + 0.0001) - 1) * 100;\n"
+        "\n"
+        "{ 2) 波动率调整5期动量 }\n"
+        "RET1 := (CLOSE / (REF(CLOSE, 1) + 0.0001) - 1) * 100;\n"
+        "RET5 := (CLOSE / (REF(CLOSE, 5) + 0.0001) - 1) * 100;\n"
+        "VOLAT := STD(RET1, 20) + 0.01;\n"
+        "RET_Z5 := RET5 / (VOLAT * SQRT(5));\n"
+        "\n"
+        "{ 3) 10期有向成交量流 OBV_SLOPE }\n"
+        "SGN_VOL := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));\n"
+        "OBV_FLOW := SUM(SGN_VOL, 10) / (SUM(VOL, 10) + 0.0001) * 100;\n"
+        "\n"
+        "{ 4) 归一化 MACD 柱 }\n"
+        "MACD_N := MACDH / (CLOSE + 0.0001) * 1000;\n"
+        "\n"
+        "{ 合成平稳量化得分 [-100, +100] }\n"
+        "RAW_SCORE := 8 * MA_DEV + 8 * EMA_DEV + 22 * RET_Z5 + 0.45 * OBV_FLOW + 3 * MACD_N;\n"
+        "量化多空分 : MAX(-100, MIN(100, RAW_SCORE)), COLORWHITE, LINETHICK2;\n"
+        "零轴 : 0, COLORGRAY, DOTLINE;\n"
+        "偏多阈值 : 20, COLORRED, DOTLINE;\n"
+        "偏空阈值 : -20, COLORGREEN, DOTLINE;\n"
+        "STICKLINE(量化多空分 >= 0, 0, 量化多空分, 3, 0), COLORRED;\n"
+        "STICKLINE(量化多空分 < 0, 0, 量化多空分, 3, 0), COLORGREEN;\n"
+        "\n"
+        "{ 5) 暴跌超卖首阳研究标记（近10期>=8期跌且末期翻红） }\n"
+        "DOWN_CNT := COUNT(CLOSE < REF(CLOSE, 1), 10);\n"
+        "FIRST_UP := REF(DOWN_CNT, 1) >= 8 AND CLOSE > REF(CLOSE, 1);\n"
+        "DRAWTEXT(FIRST_UP, -85, '超跌首阳(研究)'), COLORYELLOW;\n"
+    )
+    guide = [
+        "1. 打开同花顺电脑版 → 按 Ctrl+F 打开【公式管理】→ 选【技术指标】→ 点【新建】；",
+        f"2. 公式名称填 {name}，画线方式选【副图】，将上方代码完整粘贴进去，点【测试公式】通过后保存；",
+        "3. 登录同一同花顺账号，在公式管理器中开启【云同步/同步到云端】；",
+        "4. 打开手机同花顺 App → 任意股票 K 线图（或 5分钟/1分钟 K 线）→ 点击副图指标名称切换为【" + name + "】，即可直接在同花顺屏幕上查看！",
+        "5. 诚实提示：同花顺公式仅含平稳技术量价因子；如需五档盘口微结构 + 分钟级 ML 实时涨跌概率，请用手机小窗/分屏打开本软件的 `/widget` 悬浮窗页面。",
+    ]
+    return {
+        "name": name,
+        "formula": formula_code,
+        "guide": guide,
+        "disclaimer": "仅供研究学习，不构成买卖信号或投资建议，盈亏自负。",
+    }
+
+
+def _get_lan_ip() -> str:
+    """获取本机局域网 IP，方便手机同 Wi-Fi / 热点扫码或输入访问（失败回退 127.0.0.1）。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        return ip or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+class AutoAnalysisService:
+    """后台全自动实时分析引擎：定时轮询自选/盯盘股票，跑盘口+分钟ML+滚动实盘核验，
+    支持手机端动态切股、加股、手动触发日线模型与可选阈值微信推送。
+    """
+
+    def __init__(self, codes: Optional[List[str]] = None, interval_sec: float = 10.0,
+                 bar_period: str = "5", horizon_bars: int = 3,
+                 push_spec: str = "", alert_prob: float = 64.0):
+        clean_codes = []
+        for c in (codes or list(USER_WATCHLIST_CODES[:5]) or ["600519"]):
+            cs = str(c).strip()
+            if re.fullmatch(r"\d{6}", cs) and cs not in clean_codes:
+                clean_codes.append(cs)
+        if not clean_codes:
+            clean_codes = ["600519"]
+        self.codes: List[str] = clean_codes
+        self.active_code: str = clean_codes[0]
+        self.interval_sec: float = max(3.0, float(interval_sec))
+        self.bar_period: str = str(bar_period) if str(bar_period) in ("1", "5", "15", "30", "60") else "5"
+        self.horizon_bars: int = max(1, int(horizon_bars))
+        self.push_spec: str = str(push_spec or "").strip()
+        self.alert_prob: float = float(np.clip(alert_prob, 55.0, 75.0))
+        self.paused: bool = False
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._snapshots_by_code: Dict[str, List[Dict[str, Any]]] = {}
+        self._bar_cache_by_code: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._tracker = IntradayPredictionTracker(horizon_sec=max(60.0, self.interval_sec * 3.0))
+        self._latest_by_code: Dict[str, Dict[str, Any]] = {}
+        self._errors_by_code: Dict[str, str] = {}
+        self._daily_by_code: Dict[str, Dict[str, Any]] = {}
+        self._last_alert_ts: Dict[str, float] = {}
+        self._cycle_count: int = 0
+        self._last_cycle_at: str = ""
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="AutoAnalysisLoop", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def add_or_select_code(self, code: str) -> str:
+        cs = str(code).strip()
+        if not re.fullmatch(r"\d{6}", cs):
+            raise ValueError("股票代码必须是六位数字。")
+        with self._lock:
+            if cs not in self.codes:
+                self.codes.insert(0, cs)
+                self.codes = self.codes[:20]
+            self.active_code = cs
+        self._wake_event.set()
+        return cs
+
+    def set_bar_params(self, bar_period: str, horizon_bars: int) -> None:
+        if str(bar_period) not in ("1", "5", "15", "30", "60"):
+            raise ValueError("分钟周期仅支持 1/5/15/30/60。")
+        with self._lock:
+            self.bar_period = str(bar_period)
+            self.horizon_bars = max(1, int(horizon_bars))
+            self._bar_cache_by_code.clear()
+        self._wake_event.set()
+
+    def analyze_code_once(self, code: str, force_bars: bool = False) -> Dict[str, Any]:
+        """执行一次单股场内实时测算并更新线程安全状态（供后台循环与测试直接调用）。"""
+        cs = str(code).strip()
+        if not re.fullmatch(r"\d{6}", cs):
+            raise ValueError("股票代码必须是六位数字。")
+        with self._lock:
+            bar_period = self.bar_period
+            horizon_bars = self.horizon_bars
+            snaps = list(self._snapshots_by_code.get(cs, []))
+            cached_entry = self._bar_cache_by_code.get(cs)
+
+        now_mono = time.monotonic()
+        cached_bf = None
+        if not force_bars and cached_entry is not None and (now_mono - cached_entry[0]) < 60.0:
+            cached_bf = cached_entry[1]
+
+        res = collect_intraday_snapshot(
+            cs, persist=False, include_bars=(cached_bf is None),
+            bar_period=bar_period, horizon_bars=horizon_bars,
+            snapshots=snaps, cached_bar_forecast=cached_bf,
+        )
+        q = res["quote"]
+        pred = res["intraday_prediction"]
+        bf = res.get("bar_forecast")
+        ver = self._tracker.update(cs, pred.get("price"), pred.get("p_up_pct"))
+
+        entry = {
+            "code": cs,
+            "updated_at": q.get("received_at") or dt.datetime.now().isoformat(timespec="seconds"),
+            "trading": res["trading"],
+            "status": res["status"],
+            "quote": {
+                "price": q.get("price"), "pct": q.get("pct"), "chg": q.get("chg"),
+                "open": q.get("open"), "high": q.get("high"), "low": q.get("low"),
+                "prev": q.get("prev"), "avg": q.get("avg"), "vol": q.get("vol"),
+                "turnover": q.get("turnover"), "vol_ratio": q.get("vol_ratio"),
+                "bids": q.get("bids"), "asks": q.get("asks"),
+            },
+            "fundflow": res["fundflow"],
+            "analysis": res["analysis"],
+            "intraday_prediction": pred,
+            "live_verification": ver,
+        }
+        with self._lock:
+            snaps.append(q)
+            self._snapshots_by_code[cs] = snaps[-120:]
+            if bf is not None:
+                self._bar_cache_by_code[cs] = (now_mono, bf)
+            self._latest_by_code[cs] = entry
+            self._errors_by_code.pop(cs, None)
+
+        # 可选手机微信阈值推送（仅在用户显式提供 --push 时，且每只股票至少冷却30分钟）
+        if self.push_spec and res.get("trading"):
+            p_up = float(pred.get("p_up_pct", 50.0))
+            if p_up >= self.alert_prob or p_up <= (100.0 - self.alert_prob):
+                now_wall = time.time()
+                last_sent = self._last_alert_ts.get(cs, 0.0)
+                if (now_wall - last_sent) >= 1800.0:
+                    self._last_alert_ts[cs] = now_wall
+                    title = f"[盘中实时] {cs} {pred['direction']} P(涨)={p_up:.1f}%"
+                    body = (f"代码: {cs}\n现价: {pred['price']} ({q.get('pct')}%)\n"
+                            f"实时涨跌倾向: {pred['direction']} | P(涨)={p_up:.1f}% / P(跌)={pred['p_down_pct']:.1f}%\n"
+                            f"微价格: {pred.get('micro_price')} | 五档失衡: {pred.get('weighted_obi_pct')}%\n"
+                            f"⚠ {pred['disclaimer']}")
+                    try:
+                        _push_message(self.push_spec, title, body)
+                    except Exception:
+                        pass
+        return entry
+
+    def run_daily_analysis(self, code: str) -> Dict[str, Any]:
+        """在后台按需运行日线多模型（Ensemble/RF/GBRT/Lasso）预测与方向可信度检查。"""
+        cs = str(code).strip()
+        if not re.fullmatch(r"\d{6}", cs):
+            raise ValueError("股票代码必须是六位数字。")
+        out = run_experiment(
+            code=cs, algos=["Ensemble", "RF", "GBRT", "Lasso"],
+            hpo="关闭", horizon=1, forecast=True,
+            use_valuation=False, use_index=False, use_fundflow=False,
+        )
+        rows = []
+        for r in out.get("results") or []:
+            if r.get("error"):
+                continue
+            m = r.get("metrics") or {}
+            rows.append({
+                "algo": r["algo"],
+                "da": round(float(m.get("DA", 0.0)), 2),
+                "up_p": round(float(m.get("UP_P", 0.0)), 2),
+                "rmse": round(float(m.get("RMSE", 0.0)), 4),
+            })
+        summary = {
+            "code": cs,
+            "updated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "models": rows,
+            "forecast": out.get("forecast") or [],
+            "trust_gate": out.get("trust_gate") or {},
+        }
+        with self._lock:
+            self._daily_by_code[cs] = summary
+        return summary
+
+    def get_state(self, code: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            target = str(code).strip() if code and re.fullmatch(r"\d{6}", str(code).strip()) else self.active_code
+            return {
+                "active_code": target,
+                "codes": list(self.codes),
+                "interval_sec": self.interval_sec,
+                "bar_period": self.bar_period,
+                "horizon_bars": self.horizon_bars,
+                "paused": self.paused,
+                "cycle_count": self._cycle_count,
+                "last_cycle_at": self._last_cycle_at,
+                "active": self._latest_by_code.get(target),
+                "active_error": self._errors_by_code.get(target),
+                "daily": self._daily_by_code.get(target),
+                "watchlist_summary": [
+                    {
+                        "code": c,
+                        "price": (self._latest_by_code[c]["quote"]["price"] if c in self._latest_by_code else None),
+                        "pct": (self._latest_by_code[c]["quote"]["pct"] if c in self._latest_by_code else None),
+                        "p_up_pct": (self._latest_by_code[c]["intraday_prediction"]["p_up_pct"] if c in self._latest_by_code else None),
+                        "direction": (self._latest_by_code[c]["intraday_prediction"]["direction"] if c in self._latest_by_code else None),
+                        "updated_at": (self._latest_by_code[c]["updated_at"] if c in self._latest_by_code else None),
+                        "error": self._errors_by_code.get(c),
+                    }
+                    for c in self.codes
+                ],
+                "disclaimer": "自动实时测算仅供量化研究，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。",
+            }
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._wake_event.clear()
+            if not self.paused:
+                with self._lock:
+                    # 优先刷新当前活跃股，再轮询1只自选列表其他股票（避免并发轰炸数据源）
+                    active = self.active_code
+                    others = [c for c in self.codes if c != active]
+                    idx = self._cycle_count % max(1, len(others)) if others else 0
+                    batch = [active] + ([others[idx]] if others else [])
+                for c in batch:
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        self.analyze_code_once(c)
+                    except Exception as exc:
+                        with self._lock:
+                            self._errors_by_code[c] = str(exc)
+                with self._lock:
+                    self._cycle_count += 1
+                    self._last_cycle_at = dt.datetime.now().strftime("%H:%M:%S")
+            self._wake_event.wait(self.interval_sec)
+
+
+def _render_mobile_app_html(token_qs: str = "") -> str:
+    """手机端全功能自动分析与看盘网页（响应式 + PWA桌面图标支持）。"""
+    ths_json = json.dumps(generate_ths_formula(), ensure_ascii=False)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>A股实时预测 · 手机看盘</title>
+<style>
+  :root {{ --red:#d63031; --green:#00b894; --bg:#0f172a; --card:#1e293b; --text:#f1f5f9; --muted:#94a3b8; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; padding:10px; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); font-size:14px; }}
+  .card {{ background:var(--card); border-radius:12px; padding:12px; margin-bottom:10px; border:1px solid #334155; }}
+  .row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }}
+  .chips {{ display:flex; gap:6px; overflow-x:auto; padding-bottom:4px; }}
+  .chip {{ padding:5px 10px; border-radius:16px; background:#334155; color:var(--text); border:none; font-size:13px; white-space:nowrap; cursor:pointer; }}
+  .chip.active {{ background:#2563eb; font-weight:700; }}
+  input, select, button {{ border-radius:8px; border:1px solid #475569; background:#0f172a; color:var(--text); padding:7px 10px; font-size:13px; }}
+  button {{ background:#2563eb; border:none; font-weight:600; cursor:pointer; }}
+  button.sec {{ background:#334155; }}
+  .price-big {{ font-size:28px; font-weight:800; }}
+  .bar-wrap {{ height:14px; border-radius:8px; overflow:hidden; display:flex; background:#334155; margin:8px 0; }}
+  .bar-up {{ background:var(--red); transition:width .3s; }}
+  .bar-dn {{ background:var(--green); transition:width .3s; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }}
+  th, td {{ border-bottom:1px solid #334155; padding:5px 4px; text-align:left; }}
+  th {{ color:var(--muted); }}
+  .muted {{ color:var(--muted); font-size:12px; }}
+  .up {{ color:#ff6b6b; }} .dn {{ color:#2ecc71; }}
+  pre {{ background:#020617; padding:10px; border-radius:8px; overflow-x:auto; font-size:11px; white-space:pre-wrap; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="row">
+      <b>📈 A股场内实时预测</b>
+      <span id="statusBadge" class="muted">自动运行中...</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="codeInput" placeholder="输入6位代码如600519" maxlength="6" style="width:140px">
+      <button onclick="switchCode()">盯盘</button>
+      <select id="barSel" onchange="changeBar()">
+        <option value="5:3">5分钟·15m预测</option>
+        <option value="5:6">5分钟·30m预测</option>
+        <option value="1:5">1分钟·5m预测</option>
+        <option value="15:4">15分钟·60m预测</option>
+      </select>
+      <a href="/widget{token_qs}" style="color:#60a5fa;font-size:12px;text-decoration:none">同花顺浮窗模式↗</a>
+    </div>
+    <div id="chips" class="chips" style="margin-top:8px"></div>
+  </div>
+
+  <div id="mainCard" class="card"><div class="muted">正在拉取实时行情并计算...</div></div>
+  <div id="factorsCard" class="card" style="display:none"></div>
+
+  <div class="card">
+    <div class="row">
+      <b>🧠 日线多模型预测（Ensemble/RF/GBRT/Lasso）</b>
+      <button id="dailyBtn" onclick="runDaily()">一键运行</button>
+    </div>
+    <div id="dailyBox" class="muted" style="margin-top:6px">点击“一键运行”在后台计算当前股票的日线样本外方向准确率与明日预测。</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <b>📊 同花顺屏幕直接显示（副图公式）</b>
+      <button class="sec" onclick="copyThs()">复制公式</button>
+    </div>
+    <div class="muted" style="margin-top:4px">同花顺手机端不支持外部程序注入界面；将下方公式导入 PC 同花顺并开启云同步，即可在手机同花顺 K 线/分时副图屏幕直接显示。或用安卓小窗打开顶部「同花顺浮窗模式」。</div>
+    <pre id="thsPre"></pre>
+  </div>
+
+<script>
+const TQ = {json.dumps(token_qs)};
+const THS = {ths_json};
+document.getElementById('thsPre').textContent = THS.formula;
+let curCode = new URLSearchParams(location.search).get('code') || '';
+
+function apiUrl(p, extra='') {{
+  if (!TQ) return p + (extra ? '?' + extra : '');
+  return p + TQ + (extra ? '&' + extra : '');
+}}
+
+async function refresh() {{
+  try {{
+    const r = await fetch(apiUrl('/api/state', curCode ? 'code=' + encodeURIComponent(curCode) : ''));
+    const d = await r.json();
+    if (!curCode) curCode = d.active_code;
+    document.getElementById('statusBadge').textContent = `自动轮询第${{d.cycle_count}}轮 · ${{d.last_cycle_at || '--'}}`;
+    const chips = document.getElementById('chips');
+    chips.innerHTML = d.watchlist_summary.map(x => {{
+      const pTxt = x.price != null ? ` ${{x.price}}` : '';
+      const cls = x.code === d.active_code ? 'chip active' : 'chip';
+      return `<button class="${{cls}}" onclick="pickCode('${{x.code}}')">${{x.code}}${{pTxt}}</button>`;
+    }}).join('');
+    renderActive(d);
+  }} catch (e) {{
+    document.getElementById('statusBadge').textContent = '连接重试中: ' + e;
+  }}
+}}
+
+function renderActive(d) {{
+  const box = document.getElementById('mainCard');
+  const fbox = document.getElementById('factorsCard');
+  if (!d.active) {{
+    box.innerHTML = d.active_error ? `<div class="up">拉取失败: ${{d.active_error}}</div>` : '<div class="muted">等待后台首次分析完成...</div>';
+    return;
+  }}
+  const a = d.active, q = a.quote, p = a.intraday_prediction, v = a.live_verification || {{}};
+  const cls = (q.pct || 0) >= 0 ? 'up' : 'dn';
+  const pctStr = q.pct != null ? (q.pct >= 0 ? '+' : '') + Number(q.pct).toFixed(2) + '%' : '--';
+  const bf = p.bar_forecast;
+  const bfHtml = (bf && bf.available) ? `<div style="margin-top:8px;padding:8px;background:#0f172a;border-radius:8px;font-size:12px">
+    <b>分钟级ML(${{d.bar_period}}m×${{bf.horizon_bars}})</b>：目标 <b>${{bf.pred_price}}</b> (${{bf.pred_ret_pct >= 0 ? '+' : ''}}${{bf.pred_ret_pct}}%)
+    | 80%区间 [${{bf.pred_lo}}, ${{bf.pred_hi}}]<br>
+    样本外DA <b>${{bf.oos_da_pct}}%</b> vs 多数基准 <b>${{bf.majority_baseline_pct}}%</b> (n=${{bf.oos_n}})
+  </div>` : '';
+  const verHtml = (v.verified_n > 0)
+    ? `<div class="muted" style="margin-top:6px">实盘滚动核验：已到期 <b>${{v.verified_n}}</b> 次，命中率 <b class="up">${{v.hit_rate_pct}}%</b> (同期实际涨 ${{v.baseline_up_pct}}%)</div>`
+    : `<div class="muted" style="margin-top:6px">实盘滚动核验：已记录 ${{v.total_recorded || 0}} 次，等待窗口到期验证</div>`;
+
+  box.innerHTML = `
+    <div class="row">
+      <div><b style="font-size:18px">${{a.code}}</b> <span class="muted">[${{a.status}}] ${{a.updated_at}}</span></div>
+      <div class="muted">${{p.limit_state}}</div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div class="price-big ${{cls}}">${{q.price ?? '-'}} <span style="font-size:16px">${{pctStr}}</span></div>
+      <div style="text-align:right">
+        <div style="font-size:16px;font-weight:700" class="${{p.p_up_pct >= 55 ? 'up' : (p.p_up_pct <= 45 ? 'dn' : '')}}">${{p.direction}}</div>
+        <div class="muted">综合分 ${{p.score >= 0 ? '+' : ''}}${{p.score}}</div>
+      </div>
+    </div>
+    <div class="bar-wrap">
+      <div class="bar-up" style="width:${{p.p_up_pct}}%"></div>
+      <div class="bar-dn" style="width:${{p.p_down_pct}}%"></div>
+    </div>
+    <div class="row">
+      <b class="up">P(涨) ${{p.p_up_pct}}%</b>
+      <span class="muted">微价 ${{p.micro_price ?? '-'}} | 失衡 ${{p.weighted_obi_pct ?? '-'}}%</span>
+      <b class="dn">P(跌) ${{p.p_down_pct}}%</b>
+    </div>
+    ${{bfHtml}}
+    ${{verHtml}}
+    <div class="muted" style="margin-top:6px;color:#fca5a5">⚠ ${{p.disclaimer}}</div>
+  `;
+
+  if (p.factors && p.factors.length) {{
+    fbox.style.display = 'block';
+    fbox.innerHTML = '<b>实时因子拆解</b><table><tr><th>因子</th><th>测算值</th><th>倾向</th><th>权重</th></tr>' +
+      p.factors.map(f => `<tr><td>${{f.name}}</td><td>${{f.value}}</td><td class="${{f.bias==='偏多'?'up':(f.bias==='偏空'?'dn':'')}}">${{f.bias}}</td><td>${{Math.round(f.weight*100)}}%</td></tr>`).join('') +
+      '</table>';
+  }}
+  if (d.daily) {{
+    const dm = d.daily;
+    document.getElementById('dailyBox').innerHTML = `<div>更新: ${{dm.updated_at}}</div>` +
+      '<table><tr><th>模型</th><th>DA%</th><th>UP_P%</th><th>RMSE</th></tr>' +
+      dm.models.map(m => `<tr><td>${{m.algo}}</td><td>${{m.da}}</td><td>${{m.up_p}}</td><td>${{m.rmse}}</td></tr>`).join('') + '</table>';
+  }}
+}}
+
+async function pickCode(c) {{
+  curCode = c;
+  await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:c}})}});
+  refresh();
+}}
+function switchCode() {{
+  const c = document.getElementById('codeInput').value.trim();
+  if (/^\\d{{6}}$/.test(c)) pickCode(c); else alert('请输入6位数字股票代码');
+}}
+async function changeBar() {{
+  const [p, h] = document.getElementById('barSel').value.split(':');
+  await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{bar_period:p, horizon_bars:Number(h)}})}});
+  refresh();
+}}
+async function runDaily() {{
+  const btn = document.getElementById('dailyBtn');
+  btn.disabled = true; btn.textContent = '计算中...';
+  try {{
+    await fetch(apiUrl('/api/daily_analyze'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:curCode}})}});
+    await refresh();
+  }} finally {{
+    btn.disabled = false; btn.textContent = '一键运行';
+  }}
+}}
+function copyThs() {{
+  navigator.clipboard.writeText(THS.formula).then(() => alert('已复制同花顺副图公式！')).catch(() => alert('请长按下方代码块手动全选复制'));
+}}
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>"""
+
+
+def _render_mobile_widget_html(token_qs: str = "") -> str:
+    """极简高对比度悬浮窗页面（专为安卓小窗/分屏挂在同花顺屏幕上方设计）。"""
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>同花顺悬浮预测条</title>
+<style>
+  body {{ margin:0; padding:6px; background:#090d16; color:#f8fafc; font-family:-apple-system,sans-serif; font-size:13px; }}
+  .box {{ border:1px solid #334155; border-radius:10px; padding:8px 10px; background:#111827; }}
+  .top {{ display:flex; justify-content:space-between; align-items:center; gap:6px; }}
+  .up {{ color:#ff6b6b; font-weight:700; }} .dn {{ color:#2ecc71; font-weight:700; }} .mu {{ color:#94a3b8; font-size:11px; }}
+  input {{ width:72px; background:#020617; color:#fff; border:1px solid #475569; border-radius:6px; padding:2px 6px; font-size:12px; }}
+  button {{ background:#2563eb; color:#fff; border:none; border-radius:6px; padding:3px 8px; font-size:12px; }}
+  .bar {{ height:8px; border-radius:6px; overflow:hidden; display:flex; background:#334155; margin:5px 0; }}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="top">
+    <div id="hdr"><b>加载中...</b></div>
+    <div><input id="wc" maxlength="6" placeholder="代码"><button onclick="setC()">切</button></div>
+  </div>
+  <div class="bar"><div id="bu" style="background:#d63031;width:50%"></div><div id="bd" style="background:#00b894;width:50%"></div></div>
+  <div class="top" id="sub"><span class="mu">等待实时数据...</span></div>
+  <div class="mu" style="margin-top:3px" id="foot">仅供参考·非买卖信号</div>
+</div>
+<script>
+const TQ = {json.dumps(token_qs)};
+let wCode = new URLSearchParams(location.search).get('code') || '';
+function api(p, q='') {{ return p + (TQ ? TQ + (q ? '&'+q : '') : (q ? '?'+q : '')); }}
+async function tick() {{
+  try {{
+    const r = await fetch(api('/api/state', wCode ? 'code='+encodeURIComponent(wCode) : ''));
+    const d = await r.json();
+    if (!wCode) wCode = d.active_code;
+    const a = d.active; if (!a) return;
+    const q = a.quote, p = a.intraday_prediction, v = a.live_verification || {{}};
+    const cls = (q.pct || 0) >= 0 ? 'up' : 'dn';
+    const pct = q.pct != null ? (q.pct >= 0 ? '+' : '') + Number(q.pct).toFixed(2) + '%' : '--';
+    document.getElementById('hdr').innerHTML = `<b>${{a.code}}</b> <span class="${{cls}}">${{q.price}} (${{pct}})</span>`;
+    document.getElementById('bu').style.width = p.p_up_pct + '%';
+    document.getElementById('bd').style.width = p.p_down_pct + '%';
+    document.getElementById('sub').innerHTML =
+      `<span class="up">涨 ${{p.p_up_pct}}%</span><span>${{p.direction}}</span><span class="dn">跌 ${{p.p_down_pct}}%</span>`;
+    const bf = p.bar_forecast;
+    const ml = (bf && bf.available) ? `ML:${{bf.pred_ret_pct>=0?'+':''}}${{bf.pred_ret_pct}}%(DA:${{bf.oos_da_pct}}%)` : '盘口微结构';
+    const hit = v.verified_n > 0 ? ` | 命中${{v.hit_rate_pct}}%` : '';
+    document.getElementById('foot').textContent = `${{ml}} | 微价:${{p.micro_price ?? '-'}}${{hit}} · 仅供参考`;
+  }} catch (e) {{}}
+}}
+async function setC() {{
+  const c = document.getElementById('wc').value.trim();
+  if (!/^\\d{{6}}$/.test(c)) return;
+  wCode = c;
+  await fetch(api('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:c}})}});
+  tick();
+}}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>"""
+
+
+class MobileWebServer:
+    """内置零额外依赖的手机端实时预测 Web 服务器（支持自动后台分析 + 同花顺悬浮窗视图）。"""
+
+    def __init__(self, service: AutoAnalysisService, host: str = "0.0.0.0",
+                 port: int = 8765, auth_token: str = ""):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlparse, parse_qs
+
+        self.service = service
+        self.host = host
+        self.port = int(port)
+        self.auth_token = str(auth_token or "").strip()
+        self._thread: Optional[threading.Thread] = None
+
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # 保持控制台整洁
+
+            def _check_auth(self, qs: Dict[str, List[str]]) -> bool:
+                if not parent.auth_token:
+                    return True
+                hdr = self.headers.get("X-Auth-Token", "").strip()
+                qtok = (qs.get("token") or [""])[0].strip()
+                return hdr == parent.auth_token or qtok == parent.auth_token
+
+            def _send(self, code: int, ctype: str, body: bytes):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                if not self._check_auth(qs):
+                    self._send(403, "application/json; charset=utf-8",
+                               json.dumps({"error": "需要有效 token"}).encode("utf-8"))
+                    return
+                tqs = f"?token={parent.auth_token}" if parent.auth_token else ""
+                if parsed.path in ("/", "/mobile"):
+                    self._send(200, "text/html; charset=utf-8",
+                               _render_mobile_app_html(tqs).encode("utf-8"))
+                elif parsed.path == "/widget":
+                    self._send(200, "text/html; charset=utf-8",
+                               _render_mobile_widget_html(tqs).encode("utf-8"))
+                elif parsed.path == "/api/state":
+                    code = (qs.get("code") or [""])[0].strip() or None
+                    state = parent.service.get_state(code)
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(state, ensure_ascii=False).encode("utf-8"))
+                elif parsed.path == "/api/ths_formula":
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(generate_ths_formula(), ensure_ascii=False).encode("utf-8"))
+                else:
+                    self._send(404, "application/json; charset=utf-8",
+                               json.dumps({"error": "not found"}).encode("utf-8"))
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                if not self._check_auth(qs):
+                    self._send(403, "application/json; charset=utf-8",
+                               json.dumps({"error": "需要有效 token"}).encode("utf-8"))
+                    return
+                length = min(65536, max(0, int(self.headers.get("Content-Length", "0") or 0)))
+                raw = self.rfile.read(length).decode("utf-8", errors="ignore") if length else "{}"
+                try:
+                    payload = json.loads(raw or "{}")
+                except Exception:
+                    payload = {}
+                try:
+                    if parsed.path == "/api/watch":
+                        if payload.get("code"):
+                            parent.service.add_or_select_code(payload["code"])
+                        if payload.get("bar_period") and payload.get("horizon_bars"):
+                            parent.service.set_bar_params(payload["bar_period"], int(payload["horizon_bars"]))
+                        if "paused" in payload:
+                            parent.service.paused = bool(payload["paused"])
+                        self._send(200, "application/json; charset=utf-8",
+                                   json.dumps({"ok": True, "active_code": parent.service.active_code},
+                                              ensure_ascii=False).encode("utf-8"))
+                    elif parsed.path == "/api/daily_analyze":
+                        code = str(payload.get("code") or parent.service.active_code).strip()
+                        res = parent.service.run_daily_analysis(code)
+                        self._send(200, "application/json; charset=utf-8",
+                                   json.dumps({"ok": True, "daily": res}, ensure_ascii=False).encode("utf-8"))
+                    else:
+                        self._send(404, "application/json; charset=utf-8",
+                                   json.dumps({"error": "not found"}).encode("utf-8"))
+                except Exception as exc:
+                    self._send(400, "application/json; charset=utf-8",
+                               json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8"))
+
+        self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.port = int(self.httpd.server_address[1])
+
+    def urls(self) -> Dict[str, str]:
+        ip = _get_lan_ip() if self.host in ("0.0.0.0", "") else self.host
+        tqs = f"?token={self.auth_token}" if self.auth_token else ""
+        base = f"http://{ip}:{self.port}"
+        return {
+            "mobile_url": f"{base}/{tqs}",
+            "widget_url": f"{base}/widget{tqs}",
+            "local_url": f"http://127.0.0.1:{self.port}/{tqs}",
+        }
+
+    def start(self, background: bool = True) -> Dict[str, str]:
+        self.service.start()
+        if background:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self.httpd.serve_forever, name="MobileWebHTTP", daemon=True)
+                self._thread.start()
+        else:
+            try:
+                self.httpd.serve_forever()
+            except KeyboardInterrupt:
+                self.stop()
+        return self.urls()
+
+    def stop(self) -> None:
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except Exception:
+            pass
+        self.service.stop()
+
+
+def start_mobile_web_server(
+    codes: Optional[List[str]] = None,
+    host: str = "0.0.0.0",
+    port: int = 8765,
+    interval: float = 10.0,
+    bar_period: str = "5",
+    horizon_bars: int = 3,
+    push_spec: str = "",
+    alert_prob: float = 64.0,
+    auth_token: str = "",
+    background: bool = False,
+) -> MobileWebServer:
+    """启动手机端自动分析 Web 服务与同花顺悬浮窗视图。"""
+    service = AutoAnalysisService(
+        codes=codes, interval_sec=interval, bar_period=bar_period,
+        horizon_bars=horizon_bars, push_spec=push_spec, alert_prob=alert_prob,
+    )
+    server = MobileWebServer(service, host=host, port=port, auth_token=auth_token)
+    server.start(background=background)
+    return server
+
+
 # ==================== 第八部分补充7：名词解释（大白话，给不懂金融/机器学习的用户） ====================
 GLOSSARY = {
     "金融名词（看盘/选股）": [
@@ -10999,6 +11729,11 @@ if HAS_PYSIDE6:
             self.mon_sincerity_btn = QPushButton("🔍 挂单量变化")
             self.mon_sincerity_btn.clicked.connect(self._on_order_sincerity)
             top.addWidget(self.mon_sincerity_btn)
+            self.mon_mobile_btn = QPushButton("📱 手机看板/同花顺浮窗")
+            self.mon_mobile_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2563eb; color:white;")
+            self.mon_mobile_btn.setToolTip("启动手机端自动分析网页服务 + 安卓小窗/分屏悬浮条 + 导出同花顺副图公式")
+            self.mon_mobile_btn.clicked.connect(self._on_open_mobile_portal)
+            top.addWidget(self.mon_mobile_btn)
             top.addStretch()
             layout.addLayout(top)
             self.mon_view = QTextBrowser()
@@ -11014,7 +11749,76 @@ if HAS_PYSIDE6:
             self._mon_tracker = IntradayPredictionTracker(horizon_sec=60.0)
             self._mon_bar_cache = None
             self._mon_bar_last_ts = 0.0
+            self._mobile_web_server = None
             return panel
+
+        def _on_open_mobile_portal(self):
+            """启动后台手机自动分析 Web 服务，并弹出手机访问地址、同花顺小窗地址与同花顺副图公式。"""
+            code = self.code_edit.text().strip()
+            codes = [code] if re.fullmatch(r"\d{6}", code) else []
+            for c in USER_WATCHLIST_CODES[:4]:
+                if c not in codes:
+                    codes.append(c)
+            period, hbars = self._mon_bar_params()
+            if getattr(self, "_mobile_web_server", None) is None:
+                try:
+                    self._mobile_web_server = start_mobile_web_server(
+                        codes=codes, host="0.0.0.0", port=8765,
+                        interval=10.0, bar_period=period, horizon_bars=hbars,
+                        background=True,
+                    )
+                except OSError:
+                    self._mobile_web_server = start_mobile_web_server(
+                        codes=codes, host="0.0.0.0", port=0,
+                        interval=10.0, bar_period=period, horizon_bars=hbars,
+                        background=True,
+                    )
+            elif re.fullmatch(r"\d{6}", code):
+                self._mobile_web_server.service.add_or_select_code(code)
+
+            urls = self._mobile_web_server.urls()
+            ths = generate_ths_formula()
+            dlg = QDialog(self)
+            dlg.setWindowTitle("手机实时看盘 & 同花顺屏幕显示方案")
+            dlg.resize(680, 560)
+            lay = QVBoxLayout(dlg)
+            info = QTextBrowser()
+            info.setOpenExternalLinks(True)
+            info.setHtml(
+                "<h3>1) 手机自动运行分析 + 悬浮在同花顺屏幕上方（推荐）</h3>"
+                f"<p>手机与本电脑连同一 Wi-Fi / 热点（或用手机 Termux 直接本地运行），打开：</p>"
+                f"<p>• <b>手机完整版看盘</b>：<a href='{urls['mobile_url']}'>{urls['mobile_url']}</a><br>"
+                f"• <b>同花顺悬浮窗/分屏极简条</b>：<a href='{urls['widget_url']}'>{urls['widget_url']}</a><br>"
+                f"• 本机调试：<a href='{urls['local_url']}'>{urls['local_url']}</a></p>"
+                "<p style='color:#555;font-size:12px'>安卓手机用系统分屏或浏览器“小窗模式”打开上面第二个链接，"
+                "即可直接浮在同花顺屏幕上实时显示 P(涨)/P(跌)/微价格/样本外DA；后台已自动每 10 秒轮询分析。</p>"
+                "<h3>2) 直接显示在同花顺 App 屏幕内（云公式副图）</h3>"
+                "<p style='color:#555;font-size:12px'>由于同花顺是闭源沙箱 App，外部 Python 无法直接篡改其界面；"
+                "但可将下方同花顺原生公式导入 PC 同花顺 → 开启【云同步公式】→ 手机同花顺打开 K 线副图即可直接显示：</p>"
+            )
+            lay.addWidget(info)
+            formula_box = QTextEdit()
+            formula_box.setReadOnly(True)
+            formula_box.setPlainText(ths["formula"])
+            lay.addWidget(formula_box, stretch=1)
+            btns = QHBoxLayout()
+            copy_btn = QPushButton("📋 复制同花顺公式")
+            copy_btn.clicked.connect(lambda: (QApplication.clipboard().setText(ths["formula"]),
+                                              QMessageBox.information(dlg, "已复制", "同花顺副图公式已复制到剪贴板。\n" + "\n".join(ths["guide"]))))
+            save_btn = QPushButton("💾 导出公式文本")
+            def _save_ths():
+                p, _ = QFileDialog.getSaveFileName(dlg, "保存同花顺公式", os.path.join(BASE_DIR, "SP_QUANT_同花顺副图.txt"), "Text (*.txt)")
+                if p:
+                    with open(p, "w", encoding="utf-8") as fh:
+                        fh.write(ths["formula"] + "\n\n" + "\n".join(ths["guide"]))
+                    QMessageBox.information(dlg, "保存成功", f"已保存至：\n{p}")
+            save_btn.clicked.connect(_save_ths)
+            close_btn = QPushButton("关闭（后台服务继续运行）")
+            close_btn.clicked.connect(dlg.accept)
+            btns.addWidget(copy_btn); btns.addWidget(save_btn); btns.addStretch(); btns.addWidget(close_btn)
+            lay.addLayout(btns)
+            self._oplog(f"已启动手机实时自动分析服务：{urls['mobile_url']} | 浮窗：{urls['widget_url']}")
+            dlg.exec()
 
         def _mon_bar_params(self) -> Tuple[str, int]:
             combo = getattr(self, "mon_bar_combo", None)
@@ -11158,6 +11962,10 @@ if HAS_PYSIDE6:
                                   + self._monitor_last_html)
 
         def closeEvent(self, event):
+            srv = getattr(self, "_mobile_web_server", None)
+            if srv is not None:
+                srv.stop()
+                self._mobile_web_server = None
             worker = getattr(self, "_monitor_worker", None)
             if worker is not None and worker.isRunning():
                 self._on_stop_monitor()
@@ -18214,6 +19022,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="盘中分钟级K线周期(分钟，默认5)")
     p.add_argument("--bar-horizon", type=int, default=3,
                    help="盘中分钟级预测前瞻K线数(默认3根，5m周期即未来15分钟)")
+    p.add_argument("--web", action="store_true",
+                   help="启动手机端实时看盘与自动后台分析 Web 服务（含 /widget 同花顺分屏/小窗悬浮条）")
+    p.add_argument("--web-host", default="0.0.0.0", help="Web 服务监听地址(默认 0.0.0.0 供局域网手机访问)")
+    p.add_argument("--web-port", type=int, default=8765, help="Web 服务端口(默认 8765)")
+    p.add_argument("--web-codes", default="", help="逗号分隔的自选盯盘代码列表(默认取 USER_WATCHLIST_CODES 前5只)")
+    p.add_argument("--web-interval", type=float, default=10.0, help="后台自动分析轮询间隔秒数(至少3秒)")
+    p.add_argument("--web-token", default="", help="可选访问口令(?token=... 或 X-Auth-Token)，公网暴露建议设置")
+    p.add_argument("--alert-prob", type=float, default=64.0,
+                   help="配合 --web --push 的概率阈值%%(默认64，即 P(涨)>=64%% 或 <=36%% 时推送提醒)")
+    p.add_argument("--export-ths", nargs="?", const="SP_QUANT_同花顺副图.txt", default=None,
+                   help="生成并导出可直接粘贴进同花顺 PC/手机云公式的副图指标源码")
     p.add_argument("--verify", action="store_true",
                    help="无界面自动验证到期预测(拉真实股价对比)，供定时任务每日调用")
     # ---- 全局池化训练 + 冻结/加载（第八部分补充8）----
@@ -18395,6 +19214,44 @@ def main():
             pass
 
     args = _build_arg_parser().parse_args()
+
+    if args.export_ths is not None:
+        ths = generate_ths_formula()
+        out_file = str(args.export_ths).strip()
+        if out_file:
+            with open(out_file, "w", encoding="utf-8") as fh:
+                fh.write(ths["formula"] + "\n\n" + "\n".join(ths["guide"]) + "\n")
+            print(f"[export-ths] 已导出同花顺副图公式 -> {out_file}")
+        print(ths["formula"])
+        print("\n".join(ths["guide"]))
+        return ths
+
+    if args.web:
+        codes = ([c.strip() for c in args.web_codes.split(",") if c.strip()]
+                 if args.web_codes.strip() else [args.code.strip()] + [c for c in USER_WATCHLIST_CODES[:4] if c != args.code.strip()])
+        srv = start_mobile_web_server(
+            codes=codes, host=args.web_host, port=args.web_port,
+            interval=args.web_interval, bar_period=args.bar_period,
+            horizon_bars=args.bar_horizon, push_spec=args.push,
+            alert_prob=args.alert_prob, auth_token=args.web_token,
+            background=True,
+        )
+        urls = srv.urls()
+        print("=" * 72)
+        print("📱 手机端实时自动分析服务已启动（按 Ctrl+C 停止）")
+        print(f"  手机完整版 : {urls['mobile_url']}")
+        print(f"  同花顺浮窗 : {urls['widget_url']}  （安卓小窗/分屏挂在同花顺上方）")
+        print(f"  本机访问   : {urls['local_url']}")
+        print(f"  自动盯盘   : {', '.join(srv.service.codes)}  (每 {srv.service.interval_sec:.0f}s 自动轮询分析)")
+        print("  ⚠ 仅供量化研究，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。")
+        print("=" * 72)
+        try:
+            srv.httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            srv.stop()
+        return urls
 
     if args.intraday_predict:
         code = args.intraday_predict.strip()
