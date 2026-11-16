@@ -434,3 +434,168 @@ def test_gui_monitor_is_async_and_discards_stopped_response(monkeypatch):
         if harness._monitor_worker is not None:
             harness._monitor_worker.wait(3000)
             app.processEvents()
+
+
+def test_ranking_returns_use_exit_price_not_future_average(monkeypatch):
+    ds, dates = _pooled_dataset()
+    ds = ds[ds["h"] == 5].copy()
+    ds["close"] = 10.0
+    ds["end_close_yuan"] = 10.0
+    monkeypatch.setattr(s, "build_multi_horizon_dataset", lambda *a, **k: ds.copy())
+    out = s.rank_stocks_cross_sectional(codes=["0"], horizon=5, algo="RidgeReg",
+        split_date=str(dates[35].date()), neutralize=False)
+    assert out["top_cagr_gross_pct"] == 0
+    assert out["ls_spread_pct"] == 0
+    years = (dates[70] - dates[35]).days / 365.25
+    expected = ((1 - 0.006) ** (out["n_rebalance"] / years) - 1) * 100
+    assert out["top_cagr_net_pct"] == pytest.approx(round(expected, 2))
+
+
+
+def test_return_mode_excludes_raw_price_levels_and_keeps_stationary_features():
+    raw = s.StockDataFetcher.generate_synthetic_data(n_days=220)
+    fe_ret = s.FeatureEngineer(window_size=10, horizon=1, target_mode="return")
+    X_ret, _, _ = fe_ret.build_supervised_samples(raw)
+    assert X_ret.shape[1] == 10 * len(fe_ret.feature_cols)
+    assert set(fe_ret.feature_cols).isdisjoint(s.FeatureEngineer._RAW_LEVEL_COLS)
+    for col in ("gap_ret", "intraday_ret", "natr14", "ret_5d", "macd_hist_norm", "obv_slope10"):
+        assert col in fe_ret.feature_cols
+
+    fe_px = s.FeatureEngineer(window_size=10, horizon=1, target_mode="price")
+    fe_px.build_supervised_samples(raw)
+    assert "close" in fe_px.feature_cols and "ma20" in fe_px.feature_cols
+
+
+def test_ensemble_model_and_tabular_slicing_run_end_to_end():
+    out = s.run_experiment(
+        synthetic=True, algos=["Ensemble", "RidgeReg", "ELM"],
+        hpo="关闭", forecast=True, add_naive_baseline=True, metrics=["R2", "RMSE", "DA"],
+    )
+    rows = {r["algo"]: r for r in out["results"]}
+    assert "Naive(前值)" in rows
+    for name in ("Ensemble", "RidgeReg", "ELM"):
+        assert rows[name]["error"] is None
+        assert np.isfinite(rows[name]["metrics"]["R2"])
+        assert 0.0 <= rows[name]["metrics"]["DA"] <= 100.0
+    assert out["forecast"] and len(out["forecast"]) == 3
+    assert all(np.isfinite(fc["pred_close"]) for fc in out["forecast"])
+
+
+def _synthetic_intraday_bars(n=180, seed=7):
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2026-11-10 09:35:00", periods=n, freq="5min")
+    rets = rng.normal(0.0002, 0.004, size=n)
+    close = 10.0 * np.cumprod(1.0 + rets)
+    open_ = np.r_[close[0], close[:-1]]
+    high = np.maximum(open_, close) * (1.0 + np.abs(rng.normal(0.001, 0.001, size=n)))
+    low = np.minimum(open_, close) * (1.0 - np.abs(rng.normal(0.001, 0.001, size=n)))
+    vol = rng.integers(500, 5000, size=n).astype(float)
+    return pd.DataFrame({
+        "datetime": ts, "open": open_, "close": close, "high": high, "low": low,
+        "volume": vol, "amount": close * vol * 100.0,
+    })
+
+
+def test_intraday_bar_features_are_causal_and_predict_purged_oos():
+    bars = _synthetic_intraday_bars(n=180)
+    f1 = s.build_intraday_bar_features(bars)
+    bars_mut = bars.copy()
+    bars_mut.loc[150:, ["close", "high", "low", "volume"]] *= 3.0
+    f2 = s.build_intraday_bar_features(bars_mut)
+    for col in s.INTRADAY_BAR_FEATURE_COLS:
+        s1 = f1[col].iloc[:150].fillna(-999)
+        s2 = f2[col].iloc[:150].fillna(-999)
+        assert np.allclose(s1, s2), f"{col} 受到未来K线篡改影响"
+
+    short_fc = s.predict_intraday_bars(bars.iloc[:30], horizon_bars=3)
+    assert short_fc["available"] is False
+
+    fc = s.predict_intraday_bars(bars, horizon_bars=3, live_price=float(bars["close"].iloc[-1]) * 1.003)
+    assert fc["available"] is True
+    assert 20.0 <= fc["p_up_pct"] <= 80.0
+    assert fc["p_up_pct"] + fc["p_down_pct"] == pytest.approx(100.0)
+    assert fc["pred_lo"] <= fc["pred_price"] <= fc["pred_hi"]
+    assert 0.0 <= fc["oos_da_pct"] <= 100.0
+    assert 50.0 <= fc["majority_baseline_pct"] <= 100.0
+
+
+def test_compute_intraday_realtime_prediction_and_tracker_verification():
+    bull_q = {
+        "price": 10.50, "avg": 10.10, "high": 10.55, "low": 9.95, "vol": 2000, "amount": 2.02e7,
+        "limit_up": 11.00, "limit_down": 9.00,
+        "bids": [(10.49 - i * 0.01, 800) for i in range(5)],
+        "asks": [(10.51 + i * 0.01, 100) for i in range(5)],
+    }
+    prev_q = dict(bull_q, price=10.35, vol=1200, main_net=1e6,
+                  bids=[(10.34 - i * 0.01, 300) for i in range(5)],
+                  asks=[(10.36 + i * 0.01, 400) for i in range(5)])
+    bull_pred = s.compute_intraday_realtime_prediction(
+        bull_q, snapshots=[prev_q, bull_q], fundflow={"main_net": 5e6, "main_pct": 8.0},
+        bar_forecast={"available": True, "horizon_bars": 3, "p_up_pct": 66.0,
+                      "pred_ret_pct": 0.4, "pred_price": 10.54, "pred_lo": 10.45,
+                      "pred_hi": 10.63, "band_pct": 0.85, "oos_da_pct": 58.0,
+                      "majority_baseline_pct": 52.0, "oos_excess_da_pct": 6.0, "oos_n": 30},
+    )
+    assert bull_pred["p_up_pct"] > 55.0
+    assert "偏多" in bull_pred["direction"]
+    assert bull_pred["micro_price"] > 10.50
+    assert "非投资建议" in bull_pred["disclaimer"] or "投资建议" in bull_pred["disclaimer"]
+
+    bear_q = {
+        "price": 9.60, "avg": 10.00, "high": 10.10, "low": 9.58, "limit_up": 11.00, "limit_down": 9.60,
+        "bids": [(9.59 - i * 0.01, 50) for i in range(5)],
+        "asks": [(9.61 + i * 0.01, 900) for i in range(5)],
+    }
+    bear_pred = s.compute_intraday_realtime_prediction(bear_q)
+    assert bear_pred["p_up_pct"] < 45.0
+    assert "偏空" in bear_pred["direction"]
+    assert "跌停" in bear_pred["limit_state"]
+    assert "⚡ 场内实时涨跌预测计算" in s.intraday_realtime_html(bull_pred)
+
+    tracker = s.IntradayPredictionTracker(horizon_sec=30.0)
+    st1 = tracker.update("600000", 10.0, 62.0, ts=1000.0)
+    assert st1["total_recorded"] == 1 and st1["verified_n"] == 0
+    st2 = tracker.update("600000", 10.2, 40.0, ts=1035.0)
+    assert st2["verified_n"] == 1 and st2["hit_n"] == 1 and st2["hit_rate_pct"] == 100.0
+
+
+def test_fetch_intraday_bars_transport_and_intraday_predict_cli(tmp_path, monkeypatch):
+    import requests
+    calls = []
+    bars = _synthetic_intraday_bars(n=100)
+    klines = [
+        f"{r.datetime.strftime('%Y-%m-%d %H:%M')},{r.open:.3f},{r.close:.3f},{r.high:.3f},{r.low:.3f},{int(r.volume)},{r.amount:.1f}"
+        for r in bars.itertuples()
+    ]
+    payload = {"data": {"code": "600000", "klines": klines}}
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return payload
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs)
+        return Resp()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    df = s.StockDataFetcher.fetch_intraday_bars("600000", period="5", bypass_proxy=False)
+    assert calls[0]["timeout"] == 8
+    assert calls[0]["params"]["klt"] == "5"
+    assert len(df) == 100
+
+    payload["data"]["code"] = "000001"
+    with pytest.raises(RuntimeError, match="不匹配"):
+        s.StockDataFetcher.fetch_intraday_bars("600000", period="5", bypass_proxy=False)
+
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime", lambda code: _quote())
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_fundflow", lambda code: {"main_net": 2e6, "main_pct": 4.5})
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_intraday_bars", lambda code, period="5": bars)
+    monkeypatch.setattr(s, "is_trading_now", lambda: (True, "盘中交易"))
+    out_path = tmp_path / "intraday.json"
+    monkeypatch.setattr(sys, "argv", ["stock_predictor.py", "--intraday-predict", "600000", "--json", str(out_path)])
+    res = s.main()
+    assert res["intraday_prediction"]["bar_forecast"]["available"] is True
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
+    assert saved["code"] == "600000" and "p_up_pct" in saved["intraday_prediction"]

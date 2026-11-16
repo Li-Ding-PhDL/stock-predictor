@@ -18,6 +18,17 @@
 
 ---
 
+## 2026-11-16：预测精度优化与场内实时涨跌计算
+
+- **平稳特征工程与防过拟合正则化**：在默认的 `return`（涨跌幅）模式下，`FeatureEngineer` 自动剔除不具平移平稳性的绝对价格/均线/成交量水平列，补充隔夜跳空(`gap_ret`)、日内实体(`intraday_ret`)、上下影线、归一化真实波幅(`natr14`)、波动率调整动量(`ret_z5`/`ret_z20`)、归一化 MACD(`macd_*_norm`)、均线比率、量价相关性(`pv_corr10`)及有向成交量流(`obv_slope10`)等纯因果平稳特征；表格模型（非序列神经网络）通过 `TrainConfig.tabular_tail_steps=3` 截断高维冗余滞后窗口，并强化 `RidgeReg` / `ELM` / `RF` / `ExtraTrees` / `GBRT` / `XGBoost` / `LightGBM` 默认正则化，新增时序内部验证加权集成模型 **`Ensemble`**。
+- **场内买卖实时涨跌预测计算**：
+  - 新增 `StockDataFetcher.fetch_intraday_bars`（1/5/15/30/60 分钟前复权 K 线，严格校验代码匹配与超时）、`build_intraday_bar_features` 与 `predict_intraday_bars`（严格因果分时 VWAP/日内区间位置、隔离跨界标签、训练集单独拟合缩放器、输出样本外 OOS DA 与多数类基准对照及 80% 波动区间）。
+  - 新增 `compute_intraday_realtime_prediction` 实时多因子引擎（加权五档失衡 `W-OBI`、微价格偏离 `MicroPrice`、连续快照 Tick 动量与主动量价流、挂单增减动量、边际主力资金脉冲 `Δmain_net`、分钟级 ML 模型及涨跌停封板流动性提示），输出保守概率区间 `[25%, 75%]`，缺失数据绝不伪造。
+  - 新增 `IntradayPredictionTracker` 盘中预测滚动自检器，到期自动对照最新真实价核算实盘命中率与同期上涨基准。
+  - **GUI「实时监控」页**：新增「⚡ 实时涨跌预测」开关、「短线周期」选择与「📊 重算盘中模型」按钮；**CLI**：新增 `python stock_predictor.py --intraday-predict 600519 --bar-period 5 --bar-horizon 3 --json intraday_pred.json`，`--monitor` 同步输出 `intraday_prediction` 与 `live_verification`。仍坚持诚实边界：盘中高频噪声极大，仅供量化研究参考，不构成买卖信号或投资建议、盈亏自负。
+
+---
+
 ## 2026-11-12：评估边界与盘中监控更新
 
 - 多期限数据集新增 `label_end_date`，训练标签必须在下一段锚定日期前结束；单股训练、CV、Walk-Forward、全局训练和横截面排序均隔离跨界标签。同日的池化样本不会被拆到调参训练与验证两侧。

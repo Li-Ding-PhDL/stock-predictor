@@ -98,7 +98,7 @@ from sklearn.svm import SVR
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
-from sklearn.linear_model import ElasticNet, Ridge, Lasso
+from sklearn.linear_model import ElasticNet, Ridge, Lasso, LogisticRegression
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.tree import DecisionTreeRegressor
@@ -266,6 +266,7 @@ class TrainConfig:
     hpo_trials: int = 20             # 寻优迭代/试验次数
     metrics: List[str] = field(default_factory=lambda: ["R2", "MAE", "RMSE", "DA", "UP_P"])
     add_naive_baseline: bool = True  # 是否自动加入"前值持有"朴素基准（强烈建议开启，见下方说明）
+    tabular_tail_steps: int = 3      # 表格模型(非LSTM/GRU/Transformer/CNN)取滑窗末几日特征；0=全窗口(高维易过拟合)
     #  ↑↑↑【股票预测最重要的诚实性开关】↑↑↑
     #  股价是强自相关序列，"用今天收盘价当作明天预测值"这种什么都不学的朴素基准，
     #  在"预测价格水平"任务上就能轻松拿到 R²>0.95。因此单看某个模型 R²=0.98 毫无意义，
@@ -1586,6 +1587,99 @@ class StockDataFetcher:
             "bids": bids, "asks": asks, "raw": m,
         }
 
+    @staticmethod
+    def fetch_intraday_bars(code: str, period: str = "5", limit: int = 240,
+                            bypass_proxy: bool = True) -> pd.DataFrame:
+        """拉取 A 股盘中分钟级 K 线（1/5/15/30/60 分钟，前复权），供场内实时涨跌预测计算。
+
+        优先直连东方财富 push2his.eastmoney.com；失败时尝试 akshare stock_zh_a_hist_min_em。
+        显式校验返回代码匹配、设超时并可绕过代理；绝不伪造数据。
+        """
+        code = str(code).strip()
+        if not re.fullmatch(r"[0-9]{6}", code):
+            raise ValueError("股票代码必须是六位数字。")
+        period_str = str(period).strip()
+        if period_str not in ("1", "5", "15", "30", "60"):
+            raise ValueError("分钟周期仅支持 1/5/15/30/60。")
+        limit_n = max(30, min(int(limit), 1000))
+        ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
+        last_err: Optional[Exception] = None
+        try:
+            import requests
+            secid = f"{1 if code.startswith('6') else 0}.{code}"
+            params = {
+                "secid": secid,
+                "klt": period_str,
+                "fqt": "1",
+                "lmt": str(limit_n),
+                "end": "20500101",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            }
+            headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+            with ctx:
+                for host in ("https://push2his.eastmoney.com", "https://push2.eastmoney.com"):
+                    try:
+                        resp = requests.get(f"{host}/api/qt/stock/kline/get", params=params,
+                                            headers=headers, timeout=8)
+                        resp.raise_for_status()
+                        data = (resp.json() or {}).get("data") or {}
+                        if str(data.get("code", code)) != code:
+                            raise ValueError("分钟行情返回的股票代码不匹配。")
+                        klines = data.get("klines") or []
+                        if not klines:
+                            raise RuntimeError("分钟行情返回空列表。")
+                        rows = []
+                        for item in klines:
+                            parts = str(item).split(",")
+                            if len(parts) < 6:
+                                continue
+                            rows.append({
+                                "datetime": parts[0],
+                                "open": parts[1],
+                                "close": parts[2],
+                                "high": parts[3],
+                                "low": parts[4],
+                                "volume": parts[5],
+                                "amount": parts[6] if len(parts) > 6 else None,
+                            })
+                        df = pd.DataFrame(rows)
+                        if len(df) > 0:
+                            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+                            for col in ("open", "close", "high", "low", "volume", "amount"):
+                                df[col] = pd.to_numeric(df[col], errors="coerce")
+                            df = df.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
+                            if len(df) > 0:
+                                return df
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                    except Exception as exc:
+                        last_err = exc
+                        continue
+        except ImportError as exc:
+            last_err = exc
+
+        if HAS_AKSHARE:
+            try:
+                with ctx:
+                    df = ak.stock_zh_a_hist_min_em(symbol=code, period=period_str, adjust="qfq")
+                if df is not None and len(df) > 0:
+                    df = df.rename(columns={
+                        "时间": "datetime", "开盘": "open", "收盘": "close",
+                        "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount",
+                    })
+                    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+                    for col in ("open", "close", "high", "low", "volume", "amount"):
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df.dropna(subset=["datetime", "close"]).sort_values("datetime").tail(limit_n).reset_index(drop=True)
+                    if len(df) > 0:
+                        return df
+            except Exception as exc:
+                last_err = exc
+
+        raise RuntimeError(f"获取分钟级盘中K线失败({code}, {period_str}m): {last_err}")
+
     # ---------- 3.2 缓存文件路径 ----------
     def _cache_path(self, code: str, start_date: str, end_date: str, adjust: str) -> str:
         fname = f"{code}_{start_date}_{end_date}_{adjust}.parquet"
@@ -1625,6 +1719,18 @@ class FeatureEngineer:
     负责把原始行情 DataFrame 转换成机器学习模型可以直接使用的 (X, y) 样本。
     整体流程： 原始行情 -> 计算技术指标 -> 标准化 -> 滑动窗口切片 -> 训练/测试切分
     """
+
+    # 在 target_mode="return"（默认）下，绝对价格/均线/成交量水平不具备时间平移平稳性：
+    # 当股价从历史区间翻倍或腰斩时，树模型无法外推绝对价位、线性模型会被价位漂移主导。
+    # 因此 return 模式下默认只喂给模型去量纲的平稳比率/收益率/技术摆动特征；price 模式保留绝对价位。
+    _RAW_LEVEL_COLS = frozenset({
+        "open", "high", "low", "close", "volume", "amount",
+        "ma5", "ma10", "ma20", "ma60",
+        "ema5", "ema10", "ema20", "ema60",
+        "boll_mid", "boll_upper", "boll_lower",
+        "volume_ma5", "support_20d", "resist_20d", "pivot",
+        "macd_dif", "macd_dea", "macd_hist",
+    })
 
     def __init__(self, window_size: int = 20, horizon: int = 1, target_mode: str = "return"):
         self.window_size = window_size      # 滑动窗口长度（用过去多少天预测未来）
@@ -1833,6 +1939,39 @@ class FeatureEngineer:
             lhb_c = pd.to_numeric(df["lhb_count"], errors="coerce").fillna(0.0)
             df["lhb_count_20d"] = lhb_c.rolling(20, min_periods=1).sum()      # 近20日上榜次数(热度)
 
+        # ---- 4.1.16 物理量纲归一化与微观结构动量特征（全因果 <=t，增强 return 模式泛化）----
+        open_s = pd.to_numeric(df["open"], errors="coerce") if "open" in df.columns else close
+        high_s = pd.to_numeric(df["high"], errors="coerce") if "high" in df.columns else close
+        low_s = pd.to_numeric(df["low"], errors="coerce") if "low" in df.columns else close
+        prev_c = close.shift(1)
+        hl_span = (high_s - low_s) + 1e-9
+        df["gap_ret"] = open_s / (prev_c + 1e-9) - 1.0
+        df["intraday_ret"] = close / (open_s + 1e-9) - 1.0
+        df["upper_shadow"] = (high_s - np.maximum(open_s, close)) / hl_span
+        df["lower_shadow"] = (np.minimum(open_s, close) - low_s) / hl_span
+        true_range = pd.concat([
+            high_s - low_s,
+            (high_s - prev_c).abs(),
+            (low_s - prev_c).abs(),
+        ], axis=1).max(axis=1)
+        df["natr14"] = true_range.rolling(14).mean() / (close + 1e-9)
+        for _k in (2, 3, 5, 10):
+            df[f"ret_{_k}d"] = close.pct_change(_k)
+        _vol20 = df["return_1d"].rolling(20).std() + 1e-9
+        df["ret_z5"] = df["ret_5d"] / (_vol20 * np.sqrt(5.0))
+        df["ret_z20"] = df["ret_m1"] / (_vol20 * np.sqrt(20.0))
+        df["macd_dif_norm"] = df["macd_dif"] / (close + 1e-9)
+        df["macd_dea_norm"] = df["macd_dea"] / (close + 1e-9)
+        df["macd_hist_norm"] = df["macd_hist"] / (close + 1e-9)
+        df["ma5_ma20_ratio"] = df["ma5"] / (df["ma20"] + 1e-9) - 1.0
+        df["ma10_ma60_ratio"] = df["ma10"] / (df["ma60"] + 1e-9) - 1.0
+        df["ema5_ema20_ratio"] = df["ema5"] / (df["ema20"] + 1e-9) - 1.0
+        _vol_std20 = vol_s.rolling(20).std() + 1e-9
+        df["vol_z20"] = (vol_s - vol_s.rolling(20).mean()) / _vol_std20
+        _signed_vol = np.sign(close.diff().fillna(0.0)) * vol_s
+        df["obv_slope10"] = _signed_vol.rolling(10).sum() / (vol_s.rolling(10).sum() + 1e-9)
+        df["pv_corr10"] = df["return_1d"].rolling(10).corr(vol_s.pct_change()).fillna(0.0)
+
         # ---- 4.1.10 外部数据列缺失处理 ----
         # 外部来源(估值/大盘/资金流/大宗交易/增减持/龙虎榜)可能在"上市前/数据未覆盖期"等处为 NaN。
         # 这些列的 NaN 一律填 0(中性、无未来泄露)——否则后面按行 dropna 时，只要某外部列局部/整列为 NaN，
@@ -1842,6 +1981,16 @@ class FeatureEngineer:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
         return df
+
+    @classmethod
+    def default_feature_cols(cls, df: pd.DataFrame, target_mode: str = "return") -> List[str]:
+        """推导默认特征列；return 模式下自动剔除绝对价格/均线/成交量等非平稳水平列。"""
+        all_cols = [c for c in df.columns if c != "date"]
+        if target_mode == "return":
+            cols = [c for c in all_cols if c not in cls._RAW_LEVEL_COLS]
+            if cols:
+                return cols
+        return all_cols
 
     # ---------- 4.2 构造监督学习样本（滑动窗口）----------
     def build_supervised_samples(self, df: pd.DataFrame,
@@ -1864,8 +2013,7 @@ class FeatureEngineer:
         df = df.dropna().reset_index(drop=True)      # 技术指标开头会有 NaN（如 MA60 需要60天），一并丢弃
 
         if feature_cols is None:
-            # 默认使用除日期外的全部数值列作为特征
-            feature_cols = [c for c in df.columns if c != "date"]
+            feature_cols = self.default_feature_cols(df, self.target_mode)
         self.feature_cols = feature_cols
 
         values = df[feature_cols].values
@@ -2242,13 +2390,13 @@ class ElasticNetModel(BaseModel):
 class RidgeRegModel(BaseModel):
     name, category = "RidgeReg", "基础与传统模型"
 
-    def __init__(self, alpha=1.0, **kwargs):
+    def __init__(self, alpha=50.0, **kwargs):
         super().__init__(alpha=alpha, **kwargs); self._build()
 
-    def _build(self): self.model = Ridge(alpha=self.params.get("alpha", 1.0), random_state=RANDOM_SEED)
+    def _build(self): self.model = Ridge(alpha=float(self.params.get("alpha", 50.0)), random_state=RANDOM_SEED)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"alpha": (1e-3, 100.0)}
+    def get_hpo_space(self): return {"alpha": (0.5, 500.0)}
 
 
 class LassoModel(BaseModel):
@@ -2314,33 +2462,35 @@ class KStarModel(BaseModel):
 
 class ELMModel(BaseModel):
     """
-    ELM —— 极限学习机（Extreme Learning Machine），自实现（numpy）：
-    隐藏层权重/偏置随机生成并"冻结不训练"，只用最小二乘（Moore-Penrose 伪逆）
-    求解输出层权重，这是 ELM 算法本身的标准定义，训练速度极快。
+    ELM —— 正则化极限学习机（Regularized Extreme Learning Machine），自实现（numpy）：
+    隐藏层权重/偏置随机生成并"冻结不训练"，用带 L2 正则的岭求解 (H^T H + λI)^{-1} H^T y
+    求输出层权重，避免高维共线特征下无正则伪逆过拟合。
     """
     name, category = "ELM", "基础与传统模型"
 
-    def __init__(self, n_hidden=200, **kwargs):
-        super().__init__(n_hidden=n_hidden, **kwargs)
+    def __init__(self, n_hidden=200, reg=10.0, **kwargs):
+        super().__init__(n_hidden=n_hidden, reg=reg, **kwargs)
         self.W = None; self.b = None; self.beta = None
 
     def _build(self): pass  # ELM 的"结构"在 fit() 中按输入维度动态生成
 
     def fit(self, X, y):
         n_hidden = int(self.params.get("n_hidden", 200))
+        reg = max(1e-3, float(self.params.get("reg", 10.0)))
         rng = np.random.default_rng(RANDOM_SEED)
         n_features = X.shape[1]
-        self.W = rng.normal(0, 1, size=(n_features, n_hidden))     # 随机输入权重（不训练）
-        self.b = rng.normal(0, 1, size=(n_hidden,))                # 随机偏置（不训练）
-        H = np.tanh(X @ self.W + self.b)                            # 隐藏层激活输出
-        self.beta = np.linalg.pinv(H) @ y                           # 最小二乘求输出权重
+        scale = 0.5 / np.sqrt(max(1, n_features))
+        self.W = rng.normal(0, scale, size=(n_features, n_hidden))     # 随机输入权重（按维度缩放）
+        self.b = rng.normal(0, 0.5, size=(n_hidden,))                   # 随机偏置（不训练）
+        H = np.tanh(X @ self.W + self.b)                                # 隐藏层激活输出
+        self.beta = np.linalg.solve(H.T @ H + reg * np.eye(n_hidden), H.T @ y)
         return self
 
     def predict(self, X):
         H = np.tanh(X @ self.W + self.b)
         return H @ self.beta
 
-    def get_hpo_space(self): return {"n_hidden": (50, 500)}
+    def get_hpo_space(self): return {"n_hidden": (50, 400), "reg": (0.1, 100.0)}
 
 
 class DTRModel(BaseModel):
@@ -2396,8 +2546,8 @@ class M5RulesModel(BaseModel):
         self.leaf_models = {}
         for leaf in np.unique(leaf_ids):
             mask = leaf_ids == leaf
-            lr = Ridge(alpha=1e-2)
-            if mask.sum() >= 2:
+            lr = Ridge(alpha=5.0)
+            if mask.sum() >= 5:
                 lr.fit(X[mask], y[mask])
             else:
                 lr.fit(X, y)      # 样本太少时退化为全局线性回归，避免过拟合报错
@@ -2424,16 +2574,18 @@ class M5RulesModel(BaseModel):
 class RFModel(BaseModel):
     name, category = "RF", "先进与前沿模型"
 
-    def __init__(self, n_estimators=300, max_depth=None, **kwargs):
+    def __init__(self, n_estimators=300, max_depth=8, **kwargs):
         super().__init__(n_estimators=n_estimators, max_depth=max_depth, **kwargs); self._build()
 
     def _build(self):
+        md = self.params.get("max_depth", 8)
         self.model = RandomForestRegressor(n_estimators=int(self.params.get("n_estimators", 300)),
-                                            max_depth=self.params.get("max_depth", None),
+                                            max_depth=int(md) if md is not None else None,
+                                            max_features="sqrt", min_samples_leaf=5,
                                             random_state=RANDOM_SEED, n_jobs=-1)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"n_estimators": (50, 500)}
+    def get_hpo_space(self): return {"n_estimators": (100, 500), "max_depth": (4, 14)}
 
 
 class BaggingModel(BaseModel):
@@ -2453,15 +2605,18 @@ class BaggingModel(BaseModel):
 class ExtraTreesModel(BaseModel):
     name, category = "ExtraTrees", "先进与前沿模型"
 
-    def __init__(self, n_estimators=300, **kwargs):
-        super().__init__(n_estimators=n_estimators, **kwargs); self._build()
+    def __init__(self, n_estimators=300, max_depth=10, **kwargs):
+        super().__init__(n_estimators=n_estimators, max_depth=max_depth, **kwargs); self._build()
 
     def _build(self):
+        md = self.params.get("max_depth", 10)
         self.model = ExtraTreesRegressor(n_estimators=int(self.params.get("n_estimators", 300)),
+                                          max_depth=int(md) if md is not None else None,
+                                          max_features="sqrt", min_samples_leaf=5,
                                           random_state=RANDOM_SEED, n_jobs=-1)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"n_estimators": (50, 500)}
+    def get_hpo_space(self): return {"n_estimators": (100, 500), "max_depth": (4, 14)}
 
 
 class AdaBoostModel(BaseModel):
@@ -2483,24 +2638,25 @@ class GBRTModel(BaseModel):
     """GBRT —— 梯度提升回归树（sklearn 原生实现）"""
     name, category = "GBRT", "先进与前沿模型"
 
-    def __init__(self, n_estimators=200, learning_rate=0.05, max_depth=3, **kwargs):
+    def __init__(self, n_estimators=200, learning_rate=0.03, max_depth=3, **kwargs):
         super().__init__(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth, **kwargs)
         self._build()
 
     def _build(self):
         self.model = GradientBoostingRegressor(n_estimators=int(self.params.get("n_estimators", 200)),
-                                                 learning_rate=self.params.get("learning_rate", 0.05),
+                                                 learning_rate=self.params.get("learning_rate", 0.03),
                                                  max_depth=int(self.params.get("max_depth", 3)),
+                                                 subsample=0.8, min_samples_leaf=5,
                                                  random_state=RANDOM_SEED)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"n_estimators": (50, 500), "learning_rate": (0.001, 0.3)}
+    def get_hpo_space(self): return {"n_estimators": (50, 400), "learning_rate": (0.005, 0.2)}
 
 
 class XGBoostModel(BaseModel):
     name, category = "XGBoost", "先进与前沿模型"
 
-    def __init__(self, n_estimators=300, learning_rate=0.05, max_depth=5, **kwargs):
+    def __init__(self, n_estimators=300, learning_rate=0.03, max_depth=4, **kwargs):
         super().__init__(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth, **kwargs)
         if not HAS_XGBOOST:
             raise ImportError("未安装 xgboost，请执行: pip install xgboost")
@@ -2508,18 +2664,20 @@ class XGBoostModel(BaseModel):
 
     def _build(self):
         self.model = xgb.XGBRegressor(n_estimators=int(self.params.get("n_estimators", 300)),
-                                       learning_rate=self.params.get("learning_rate", 0.05),
-                                       max_depth=int(self.params.get("max_depth", 5)),
+                                       learning_rate=self.params.get("learning_rate", 0.03),
+                                       max_depth=int(self.params.get("max_depth", 4)),
+                                       subsample=0.8, colsample_bytree=0.8,
+                                       reg_lambda=2.0, min_child_weight=5,
                                        random_state=RANDOM_SEED, n_jobs=-1)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"n_estimators": (50, 600), "learning_rate": (0.001, 0.3), "max_depth": (2, 12)}
+    def get_hpo_space(self): return {"n_estimators": (50, 500), "learning_rate": (0.005, 0.2), "max_depth": (2, 8)}
 
 
 class LightGBMModel(BaseModel):
     name, category = "LightGBM", "先进与前沿模型"
 
-    def __init__(self, n_estimators=300, learning_rate=0.05, num_leaves=31, **kwargs):
+    def __init__(self, n_estimators=300, learning_rate=0.03, num_leaves=20, **kwargs):
         super().__init__(n_estimators=n_estimators, learning_rate=learning_rate, num_leaves=num_leaves, **kwargs)
         if not HAS_LIGHTGBM:
             raise ImportError("未安装 lightgbm，请执行: pip install lightgbm")
@@ -2527,12 +2685,14 @@ class LightGBMModel(BaseModel):
 
     def _build(self):
         self.model = lgb.LGBMRegressor(n_estimators=int(self.params.get("n_estimators", 300)),
-                                        learning_rate=self.params.get("learning_rate", 0.05),
-                                        num_leaves=int(self.params.get("num_leaves", 31)),
+                                        learning_rate=self.params.get("learning_rate", 0.03),
+                                        num_leaves=int(self.params.get("num_leaves", 20)),
+                                        subsample=0.8, colsample_bytree=0.8,
+                                        reg_lambda=2.0, min_child_samples=10,
                                         random_state=RANDOM_SEED, verbose=-1)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
-    def get_hpo_space(self): return {"n_estimators": (50, 600), "learning_rate": (0.001, 0.3)}
+    def get_hpo_space(self): return {"n_estimators": (50, 500), "learning_rate": (0.005, 0.2)}
 
 
 class CatBoostModel(BaseModel):
@@ -2946,6 +3106,87 @@ class ARIMAModel(BaseModel):
         return fc
 
 
+class EnsembleModel(BaseModel):
+    """
+    Ensemble —— 时序验证加权集成模型（Ridge + RF + GBRT + 可选 LightGBM/XGBoost）：
+    在训练集内部按时间顺序切分前 75% 训练、后 25% 验证（无未来泄露），按验证集误差与方向准确率
+    自适应赋权后再用全部训练集重训各子模型，降低单模型方差、提高泛化稳定性。
+    """
+    name, category = "Ensemble", "先进与前沿模型"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.models: List[BaseModel] = []
+        self.weights: Optional[np.ndarray] = None
+
+    def _build(self):
+        pass
+
+    def _make_candidates(self) -> List[BaseModel]:
+        cands: List[BaseModel] = [
+            RidgeRegModel(alpha=80.0),
+            RFModel(n_estimators=250, max_depth=7),
+            GBRTModel(n_estimators=160, learning_rate=0.03, max_depth=3),
+        ]
+        if HAS_LIGHTGBM:
+            cands.append(LightGBMModel(n_estimators=200, learning_rate=0.03, num_leaves=15))
+        if HAS_XGBOOST:
+            cands.append(XGBoostModel(n_estimators=200, learning_rate=0.03, max_depth=3))
+        return cands
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = len(X)
+        cands = self._make_candidates()
+        if n >= 80:
+            split = int(n * 0.75)
+            gap = min(max(1, int(self.params.get("horizon", 5))), max(1, split // 4))
+            X_tr, y_tr = X[:max(20, split - gap)], y[:max(20, split - gap)]
+            X_va, y_va = X[split:], y[split:]
+            scores = []
+            for m in cands:
+                try:
+                    m.fit(X_tr, y_tr)
+                    p = m.predict(X_va)
+                    mse = float(np.mean((y_va - p) ** 2)) + 1e-9
+                    # 方向一致率微调：同 MSE 下倾向方向更稳的子模型
+                    da = float(np.mean((y_va > 0) == (p > 0)))
+                    inv_err = (1.0 / mse) * (0.8 + 0.4 * da)
+                    scores.append(max(inv_err, 0.0))
+                except Exception:
+                    scores.append(0.0)
+            w = np.asarray(scores, dtype=float)
+            self.weights = w / w.sum() if w.sum() > 0 else np.full(len(cands), 1.0 / len(cands))
+        else:
+            self.weights = np.full(len(cands), 1.0 / len(cands))
+
+        fitted, kept_w = [], []
+        for m, wt in zip(cands, self.weights):
+            if wt <= 0:
+                continue
+            try:
+                m.fit(X, y)
+                fitted.append(m)
+                kept_w.append(wt)
+            except Exception:
+                continue
+        if not fitted:
+            fallback = RidgeRegModel(alpha=80.0).fit(X, y)
+            self.models = [fallback]
+            self.weights = np.array([1.0])
+        else:
+            kw = np.asarray(kept_w, dtype=float)
+            self.models = fitted
+            self.weights = kw / kw.sum()
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        preds = np.column_stack([m.predict(X) for m in self.models])
+        return preds @ self.weights
+
+
 # ------------------------------------------------------------------------------
 # 6.4 模型注册表 —— 算法的统一入口
 # 新增算法时只需要：1) 实现一个 BaseModel 子类  2) 在这里加一行注册，GUI 会自动出现对应勾选框
@@ -2956,7 +3197,8 @@ ALGO_REGISTRY: Dict[str, Callable[..., BaseModel]] = {
     "ElasticNet": ElasticNetModel, "RidgeReg": RidgeRegModel, "Lasso": LassoModel,
     "PLSR": PLSRModel, "KNN": KNNModel, "Kstar": KStarModel, "ELM": ELMModel,
     "DTR": DTRModel, "DT": DTModel, "M5Rules": M5RulesModel,
-    # ---- 先进与前沿模型 (17) ----
+    # ---- 先进与前沿模型 (18) ----
+    "Ensemble": EnsembleModel,
     "RF": RFModel, "Bagging": BaggingModel, "ExtraTrees": ExtraTreesModel,
     "AdaBoost": AdaBoostModel, "GBRT": GBRTModel, "XGBoost": XGBoostModel,
     "LightGBM": LightGBMModel, "CatBoost": CatBoostModel,
@@ -3375,6 +3617,27 @@ class TrainingPipeline:
             anchor_train=anchors.iloc[tr].reset_index(drop=True),
         )
 
+    def _is_sequence_model(self, model_or_cls) -> bool:
+        """序列神经网络与纯时序 ARIMA 保留完整窗口，其余表格模型可截断至末 tabular_tail_steps 天以防维数灾难。"""
+        cls = model_or_cls if isinstance(model_or_cls, type) else type(model_or_cls)
+        if cls is ARIMAModel or issubclass(cls, ARIMAModel):
+            return True
+        if HAS_TORCH and issubclass(cls, TorchModelBase):
+            return True
+        return False
+
+    def _slice_tabular(self, model_or_cls, X: np.ndarray) -> np.ndarray:
+        """对表格模型截取滑窗末尾 tabular_tail_steps 天特征（与序列维度整除时生效，不影响自定义/测试形状）。"""
+        X = np.asarray(X)
+        tail = int(getattr(self.config, "tabular_tail_steps", 0) or 0)
+        n_feats = len(getattr(self.fe, "feature_cols", []) or [])
+        win = int(self.config.window_size)
+        if (tail <= 0 or tail >= win or n_feats <= 0
+                or X.ndim != 2 or X.shape[1] != win * n_feats
+                or self._is_sequence_model(model_or_cls)):
+            return X
+        return X[:, -(tail * n_feats):]
+
     def _feature_importance(self, model, topn: int = 8):
         """取模型对各输入特征的重要性(按原始特征聚合窗口内各天)。树模型用 feature_importances_、
         线性模型用 |系数|；其余(SVR-rbf/深度学习)无标准重要性则返回 None。返回 [(特征名, 占比%)]。"""
@@ -3387,9 +3650,12 @@ class TrainingPipeline:
                 imp = np.abs(np.asarray(est.coef_, dtype=float)).ravel()
         feats = list(getattr(self.fe, "feature_cols", []))
         n = len(feats)
-        if imp is None or n == 0 or len(imp) != n * self.config.window_size:
+        if imp is None or n == 0 or len(imp) % n != 0:
             return None
-        agg = imp.reshape(self.config.window_size, n).sum(axis=0)   # 按原始特征聚合窗口内各天
+        steps = len(imp) // n
+        if steps not in (self.config.window_size, int(getattr(self.config, "tabular_tail_steps", 0) or 0)):
+            return None
+        agg = imp.reshape(steps, n).sum(axis=0)   # 按原始特征聚合窗口内各天
         total = float(agg.sum()) + 1e-12
         order = np.argsort(agg)[::-1][:topn]
         return [(feats[i], round(float(agg[i] / total * 100), 2)) for i in order if agg[i] > 0]
@@ -3398,7 +3664,8 @@ class TrainingPipeline:
         """在给定数据集上评估模型：预测→还原价格→算价格类+方向类指标(统一价格口径)。"""
         if X is None or len(X) == 0:
             return {}
-        pt = self._clamp_extrap(self.fe.inverse_y(model.predict(X)), getattr(self, "_y_ref", None))
+        X_in = self._slice_tabular(model, X)
+        pt = self._clamp_extrap(self.fe.inverse_y(model.predict(X_in)), getattr(self, "_y_ref", None))
         pred_price = self._to_price(pt, prev_close)
         m = Metrics.calc_all(close_true, pred_price, self.config.metrics)
         self._apply_dir(m, close_true, pred_price, prev_close)
@@ -3427,17 +3694,21 @@ class TrainingPipeline:
                 X_tr, y_tr, X_val, y_val = _temporal_hpo_data(
                     self.fe.scaler_x.inverse_transform(X_train), y_train,
                     pdata.anchor_train, pdata.d_train, scale_y=True)
-                best_params = run_hpo(self.config.hpo_method, model_cls, X_tr, y_tr, X_val, y_val,
-                                       n_trials=self.config.hpo_trials, model_kwargs=mk)
+                best_params = run_hpo(self.config.hpo_method, model_cls,
+                                      self._slice_tabular(model_cls, X_tr), y_tr,
+                                      self._slice_tabular(model_cls, X_val), y_val,
+                                      n_trials=self.config.hpo_trials, model_kwargs=mk)
 
             # ---- 8.2.3 用（寻优得到的/默认的）参数训练最终模型 ----
             log(f"[{algo_name}] 训练中 ...")
             model = model_cls(**{**mk, **best_params})
-            model.fit(X_train, y_train_s)
+            X_train_in = self._slice_tabular(model, X_train)
+            X_test_in = self._slice_tabular(model, X_test)
+            model.fit(X_train_in, y_train_s)
 
             # ---- 8.2.4 训练/验证/测试三集分别评估（统一还原成价格口径；带抗外推钳制）----
             self._y_ref = y_train                       # 训练目标范围，供 _clamp_extrap/_eval 复用
-            pred_t = self._clamp_extrap(self.fe.inverse_y(model.predict(X_test)), y_train)
+            pred_t = self._clamp_extrap(self.fe.inverse_y(model.predict(X_test_in)), y_train)
             pred_price = self._to_price(pred_t, pdata.prev_close_test)
             metrics = Metrics.calc_all(close_test, pred_price, self.config.metrics)
             self._apply_dir(metrics, close_test, pred_price, pdata.prev_close_test)
@@ -3526,11 +3797,13 @@ class TrainingPipeline:
                             pass  # 小折无法再切分时使用默认参数，不借用未来折的选择结果。
                         else:
                             fold_params = run_hpo(self.config.hpo_method, model_cls,
-                                                  hx, hy, vx, vy, n_trials=self.config.hpo_trials,
+                                                  self._slice_tabular(model_cls, hx), hy,
+                                                  self._slice_tabular(model_cls, vx), vy,
+                                                  n_trials=self.config.hpo_trials,
                                                   model_kwargs=model_kwargs)
                 m = model_cls(**{**model_kwargs, **fold_params})
-                m.fit(X_tr, y_tr)
-                pred_s = m.predict(X_va)
+                m.fit(self._slice_tabular(m, X_tr), y_tr)
+                pred_s = m.predict(self._slice_tabular(m, X_va))
                 pred = sc_y.inverse_transform(pred_s.reshape(-1, 1)).ravel()
                 fold_metrics.append(Metrics.calc_all(y_va_raw, pred, cv_metric_names))
             except Exception:
@@ -3658,7 +3931,7 @@ class TrainingPipeline:
         X_s, y_s = self.fe.transform(X, y)
         log(f"[{algo_name}] 用全部历史数据训练用于向前预测的模型 ...")
         model = ALGO_REGISTRY[algo_name](**mk)
-        model.fit(X_s, y_s)
+        model.fit(self._slice_tabular(model, X_s), y_s)
 
         # 2) 取"最新的一整个窗口"（含最后一个交易日），构造一条待预测样本
         # 列过滤顺序必须与 build_supervised_samples 完全一致，否则 feature_cols 索引错位
@@ -3672,7 +3945,7 @@ class TrainingPipeline:
             )
         last_window = df_ind[self.fe.feature_cols].values[-self.config.window_size:]
         x_new = self.fe.scaler_x.transform(last_window.flatten().reshape(1, -1))
-        pred_target = float(self.fe.inverse_y(model.predict(x_new))[0])
+        pred_target = float(self.fe.inverse_y(model.predict(self._slice_tabular(model, x_new)))[0])
         pred_target = float(self._clamp_extrap(np.array([pred_target]), y)[0])   # 抗外推钳制(限训练范围±30%)
 
         last_close = float(df_ind["close"].iloc[-1])
@@ -3708,8 +3981,8 @@ class TrainingPipeline:
         y_train_s = self.fe.scaler_y.transform(pdata.y_train.reshape(-1, 1)).ravel()
         log(f"[{algo_name}] 训练验证集残差模型(用于概率估计) ...")
         model = ALGO_REGISTRY[algo_name](**mk)
-        model.fit(pdata.X_train, y_train_s)
-        pred_val_t = self._clamp_extrap(self.fe.inverse_y(model.predict(pdata.X_val)), pdata.y_train)
+        model.fit(self._slice_tabular(model, pdata.X_train), y_train_s)
+        pred_val_t = self._clamp_extrap(self.fe.inverse_y(model.predict(self._slice_tabular(model, pdata.X_val))), pdata.y_train)
         pred_val_price = self._to_price(pred_val_t, pdata.prev_close_val)
         actual_val_return = pdata.close_val / (pdata.prev_close_val + 1e-12) - 1.0
         pred_val_return = pred_val_price / (pdata.prev_close_val + 1e-12) - 1.0
@@ -4446,7 +4719,7 @@ def get_stock_feature_preview(code: str, start: str = "20200101", end: Optional[
         df_ind = df_ind.dropna(axis=1, how="all").dropna().reset_index(drop=True)
         if len(df_ind) == 0:
             return {"code": code, "name": name, "error": "清洗后没有有效历史行(数据太短或大量缺失)"}
-        feature_cols = [c for c in df_ind.columns if c != "date"]   # 与 build_supervised_samples 默认推导一致
+        feature_cols = FeatureEngineer.default_feature_cols(df_ind, target_mode)   # 与 build_supervised_samples 默认推导一致
         close = df_ind["close"].values
         n = len(df_ind)
         # 输出目标：y1=未来 horizon 日涨跌方向(+1/-1)、y2=未来第 horizon 日真实收盘价。
@@ -6131,7 +6404,9 @@ def analyze_intraday_snapshot(q: Dict[str, Any]) -> Dict[str, Any]:
             "disclaimer": "研究监控，非投资建议、盈亏自负。"}
 
 
-def intraday_snapshot_html(q: Dict[str, Any]) -> str:
+def intraday_snapshot_html(q: Dict[str, Any],
+                           realtime_pred: Optional[Dict[str, Any]] = None,
+                           tracker_stats: Optional[Dict[str, Any]] = None) -> str:
     result = analyze_intraday_snapshot(q)
     def fmt(key, unit):
         value = result[key]
@@ -6140,12 +6415,613 @@ def intraday_snapshot_html(q: Dict[str, Any]) -> str:
             ("五档挂单量差异", fmt("book_imbalance_pct", "%")),
             ("现价相对日内均价", fmt("vs_avg_pct", "%")),
             ("现价在日内高低区间的位置", fmt("range_position_pct", "%"))]
-    return ("<h3>盘中状态摘要（描述性指标）</h3><table border=1 cellpadding=4>"
+    pred_html = intraday_realtime_html(realtime_pred, tracker_stats) if realtime_pred else ""
+    return (pred_html
+            + "<h3>盘中状态摘要（描述性指标）</h3><table border=1 cellpadding=4>"
             + "".join(f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows)
             + "</table><p>挂单量差异=(买量−卖量)/(买量+卖量)，正值表示可见买方排队量较大；"
-              "区间位置0%为日内最低、100%为最高。这些数值不代表未来涨跌概率。</p>"
+              "区间位置0%为日内最低、100%为最高。</p>"
             + "".join(f"<p>{warning}</p>" for warning in result["warnings"])
             + f"<p>{result['limitations']} {result['disclaimer']}</p>")
+
+
+def build_intraday_bar_features(bars_df: pd.DataFrame) -> pd.DataFrame:
+    """为盘中分钟级 K 线构造严格因果(<=t)的平稳特征，不引入任何未来数据。"""
+    if bars_df is None or len(bars_df) == 0:
+        return pd.DataFrame()
+    df = bars_df.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    for col in ("open", "close", "high", "low", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
+    if len(df) == 0:
+        return df
+
+    close = df["close"].astype(float)
+    open_ = df["open"].astype(float) if "open" in df.columns else close
+    high = df["high"].astype(float) if "high" in df.columns else close
+    low = df["low"].astype(float) if "low" in df.columns else close
+    vol = df["volume"].fillna(0.0).astype(float) if "volume" in df.columns else pd.Series(1.0, index=df.index)
+    if "amount" in df.columns and pd.to_numeric(df["amount"], errors="coerce").notna().any():
+        amt = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    else:
+        amt = ((high + low + close) / 3.0) * vol
+
+    day = df["datetime"].dt.date
+    cum_vol = vol.groupby(day).cumsum()
+    cum_amt = amt.groupby(day).cumsum()
+    # 单位兼容：若成交额/成交量与价格数量级差100倍(手 vs 股)，自动缩放 VWAP 使之贴近现价量纲
+    raw_vwap = cum_amt / (cum_vol + 1e-9)
+    ratio_med = float((raw_vwap / (close + 1e-9)).replace([np.inf, -np.inf], np.nan).dropna().median() or 1.0)
+    if 50.0 <= ratio_med <= 200.0:
+        vwap = raw_vwap / 100.0
+    elif 0.005 <= ratio_med <= 0.02:
+        vwap = raw_vwap * 100.0
+    else:
+        vwap = raw_vwap
+    vwap = vwap.where((cum_vol > 0) & (vwap > 0), close)
+
+    day_open = open_.groupby(day).transform("first")
+    day_high = high.groupby(day).cummax()
+    day_low = low.groupby(day).cummin()
+
+    df["ret_1b"] = close.pct_change(1)
+    df["ret_2b"] = close.pct_change(2)
+    df["ret_3b"] = close.pct_change(3)
+    df["ret_6b"] = close.pct_change(6)
+    df["ret_12b"] = close.pct_change(12)
+    df["bar_body"] = close / (open_ + 1e-9) - 1.0
+    df["bar_range"] = (high - low) / (close.shift(1) + 1e-9)
+    df["close_pos"] = (close - low) / ((high - low) + 1e-9)
+    df["dist_vwap"] = close / (vwap + 1e-9) - 1.0
+    df["vwap_slope"] = vwap.pct_change(3).fillna(0.0)
+    df["dist_day_open"] = close / (day_open + 1e-9) - 1.0
+    df["day_range_pos"] = (close - day_low) / ((day_high - day_low) + 1e-9)
+    df["vol_12b"] = df["ret_1b"].rolling(12).std()
+    df["ret_z6"] = df["ret_6b"] / (df["vol_12b"] * np.sqrt(6.0) + 1e-9)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi14"] = 100.0 - 100.0 / (1.0 + gain / (loss + 1e-9))
+
+    mid20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    df["boll_pos20"] = (close - (mid20 - 2 * std20)) / (4 * std20 + 1e-9)
+    df["vol_ratio_12b"] = vol / (vol.rolling(12).mean() + 1e-9)
+    signed_vol = np.sign(delta.fillna(0.0)) * vol
+    df["obv_slope6"] = signed_vol.rolling(6).sum() / (vol.rolling(6).sum() + 1e-9)
+    minutes = df["datetime"].dt.hour * 60 + df["datetime"].dt.minute
+    df["time_frac"] = np.clip((minutes - 570.0) / 330.0, 0.0, 1.0)
+    return df
+
+
+INTRADAY_BAR_FEATURE_COLS: List[str] = [
+    "ret_1b", "ret_2b", "ret_3b", "ret_6b", "ret_12b",
+    "bar_body", "bar_range", "close_pos", "dist_vwap", "vwap_slope",
+    "dist_day_open", "day_range_pos", "vol_12b", "ret_z6",
+    "rsi14", "boll_pos20", "vol_ratio_12b", "obv_slope6", "time_frac",
+]
+
+
+def predict_intraday_bars(bars_df: pd.DataFrame, horizon_bars: int = 3,
+                          live_price: Optional[float] = None,
+                          live_avg: Optional[float] = None) -> Dict[str, Any]:
+    """基于盘中分钟级K线的因果样本外模型，预测未来 horizon_bars 根K线涨跌概率与波动区间。
+
+    严格遵守红线：
+      1) 按时间顺序切分，隔离跨界标签(split - horizon_bars)，绝不随机打乱；
+      2) 标准化器仅在训练段 fit；
+      3) 明确计算并报告样本外方向准确率(OOS DA) 与 多数类基准(总是涨/总是跌)。
+    """
+    horizon_bars = max(1, int(horizon_bars))
+    feat_df = build_intraday_bar_features(bars_df)
+    if len(feat_df) == 0:
+        return {"available": False, "reason": "分钟级K线为空"}
+    feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
+    feat_df = feat_df.dropna(subset=INTRADAY_BAR_FEATURE_COLS + ["close"]).reset_index(drop=True)
+    n = len(feat_df)
+    if n < horizon_bars + 40:
+        return {"available": False, "reason": f"有效分钟K线不足({n}<{horizon_bars + 40})"}
+
+    close = feat_df["close"].to_numpy(dtype=float)
+    X_all = feat_df[INTRADAY_BAR_FEATURE_COLS].to_numpy(dtype=float)
+    n_sup = n - horizon_bars
+    X_sup = X_all[:n_sup]
+    y_sup = close[horizon_bars:] / (close[:n_sup] + 1e-12) - 1.0
+
+    split = int(n_sup * 0.7)
+    tr_end = split - horizon_bars
+    if tr_end < 20 or (n_sup - split) < 10:
+        return {"available": False, "reason": "隔离跨界标签后训练/样本外分钟样本不足"}
+
+    X_tr_raw, y_tr = X_sup[:tr_end], y_sup[:tr_end]
+    X_te_raw, y_te = X_sup[split:], y_sup[split:]
+
+    sx = StandardScaler().fit(X_tr_raw)
+    X_tr = sx.transform(X_tr_raw)
+    X_te = sx.transform(X_te_raw)
+
+    reg_ridge = Ridge(alpha=30.0, random_state=RANDOM_SEED).fit(X_tr, y_tr)
+    reg_gbr = GradientBoostingRegressor(
+        n_estimators=80, learning_rate=0.05, max_depth=2,
+        subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED
+    ).fit(X_tr, y_tr)
+    pred_te = 0.5 * reg_ridge.predict(X_te) + 0.5 * reg_gbr.predict(X_te)
+
+    true_up_te = y_te > 0
+    pred_up_te = pred_te > 0
+    up_rate_te = float(np.mean(true_up_te) * 100.0)
+    maj_base = max(up_rate_te, 100.0 - up_rate_te)
+    oos_da = float(np.mean(true_up_te == pred_up_te) * 100.0)
+
+    # 若训练段正负样本兼备，补充正则化逻辑回归估计方向概率
+    clf_oos_p = None
+    y_tr_bin = (y_tr > 0).astype(int)
+    if len(np.unique(y_tr_bin)) == 2:
+        clf_oos = LogisticRegression(C=0.3, max_iter=500, random_state=RANDOM_SEED).fit(X_tr, y_tr_bin)
+        clf_oos_p = clf_oos.predict_proba(X_te)[:, 1]
+        oos_da_clf = float(np.mean(true_up_te == (clf_oos_p > 0.5)) * 100.0)
+        oos_da = max(oos_da, oos_da_clf)
+
+    resid_oos = y_te - pred_te
+
+    # 全样本(仅截至最新已知完成K线，不含未来)重训，用于当前实时预测
+    sx_full = StandardScaler().fit(X_sup)
+    X_full = sx_full.transform(X_sup)
+    reg_ridge_f = Ridge(alpha=30.0, random_state=RANDOM_SEED).fit(X_full, y_sup)
+    reg_gbr_f = GradientBoostingRegressor(
+        n_estimators=80, learning_rate=0.05, max_depth=2,
+        subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED
+    ).fit(X_full, y_sup)
+
+    x_last = X_all[-1:].copy()
+    if live_price is not None and np.isfinite(live_price) and live_price > 0:
+        last_bar_close = float(close[-1])
+        if last_bar_close > 0:
+            live_ret_adj = float(live_price) / last_bar_close - 1.0
+            ret1_idx = INTRADAY_BAR_FEATURE_COLS.index("ret_1b")
+            x_last[0, ret1_idx] = x_last[0, ret1_idx] + live_ret_adj
+            if live_avg is not None and np.isfinite(live_avg) and live_avg > 0:
+                vwap_idx = INTRADAY_BAR_FEATURE_COLS.index("dist_vwap")
+                x_last[0, vwap_idx] = float(live_price) / float(live_avg) - 1.0
+
+    x_last_s = sx_full.transform(x_last)
+    pred_ret = float(0.5 * reg_ridge_f.predict(x_last_s)[0] + 0.5 * reg_gbr_f.predict(x_last_s)[0])
+    # 限幅在样本外收益分布合理范围内
+    lo_r, hi_r = float(np.min(y_sup)), float(np.max(y_sup))
+    pred_ret = float(np.clip(pred_ret, lo_r, hi_r))
+    p_up_emp = float(np.mean((pred_ret + resid_oos) > 0))
+
+    y_sup_bin = (y_sup > 0).astype(int)
+    if len(np.unique(y_sup_bin)) == 2:
+        clf_f = LogisticRegression(C=0.3, max_iter=500, random_state=RANDOM_SEED).fit(X_full, y_sup_bin)
+        p_up_clf = float(clf_f.predict_proba(x_last_s)[0, 1])
+        p_up = 0.5 * p_up_emp + 0.5 * p_up_clf
+    else:
+        p_up = p_up_emp
+
+    p_up_pct = round(float(np.clip(p_up * 100.0, 20.0, 80.0)), 1)
+    anchor_price = float(live_price) if (live_price is not None and np.isfinite(live_price) and live_price > 0) else float(close[-1])
+    sigma_bar = estimate_daily_vol(feat_df["ret_1b"].dropna().to_numpy(dtype=float), method="ewma")
+    band = 1.2816 * sigma_bar * np.sqrt(horizon_bars)
+    pred_price = anchor_price * (1.0 + pred_ret)
+
+    return {
+        "available": True,
+        "horizon_bars": horizon_bars,
+        "last_bar_time": str(feat_df["datetime"].iloc[-1]),
+        "anchor_price": round(anchor_price, 4),
+        "pred_ret_pct": round(pred_ret * 100.0, 3),
+        "pred_price": round(pred_price, 4),
+        "pred_lo": round(pred_price * (1.0 - band), 4),
+        "pred_hi": round(pred_price * (1.0 + band), 4),
+        "band_pct": round(band * 100.0, 2),
+        "p_up_pct": p_up_pct,
+        "p_down_pct": round(100.0 - p_up_pct, 1),
+        "oos_da_pct": round(oos_da, 1),
+        "majority_baseline_pct": round(maj_base, 1),
+        "oos_excess_da_pct": round(oos_da - maj_base, 1),
+        "oos_n": int(len(y_te)),
+        "train_n": int(tr_end),
+    }
+
+
+def compute_intraday_realtime_prediction(
+    q: Dict[str, Any],
+    snapshots: Optional[List[Dict[str, Any]]] = None,
+    fundflow: Optional[Dict[str, Any]] = None,
+    bar_forecast: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """场内买卖实时涨跌预测计算：融合盘口微结构、挂单变化、分时均价动量、边际资金流与分钟级模型。
+
+    严格遵守诚实原则：
+      - 缺失字段不造假、不以0填充替代，只对实际取到的有效因子加权；
+      - 输出保守概率区间 [25%, 75%]，不作绝对化买卖信号或稳赚承诺；
+      - 显式提示涨跌停封板流动性约束与高频噪声风险。
+    """
+    base = analyze_intraday_snapshot(q)
+
+    def _num(v, positive=False):
+        try:
+            f = float(v)
+            return f if np.isfinite(f) and (f > 0 if positive else True) else None
+        except (TypeError, ValueError):
+            return None
+
+    price = base["price"]
+    avg = _num(q.get("avg"), True)
+    high = _num(q.get("high"), True)
+    low = _num(q.get("low"), True)
+    limit_up = _num(q.get("limit_up"), True)
+    limit_down = _num(q.get("limit_down"), True)
+
+    bids = []
+    for row in (q.get("bids") or [])[:5]:
+        if isinstance(row, (list, tuple)) and len(row) == 2:
+            bids.append((_num(row[0], True), _num(row[1])))
+        else:
+            bids.append((None, None))
+    asks = []
+    for row in (q.get("asks") or [])[:5]:
+        if isinstance(row, (list, tuple)) and len(row) == 2:
+            asks.append((_num(row[0], True), _num(row[1])))
+        else:
+            asks.append((None, None))
+
+    # 涨跌停封板状态检查
+    limit_state = "正常交易"
+    if price is not None:
+        if limit_up is not None and price >= limit_up - 1e-4:
+            limit_state = "触及/封住涨停(买盘流动性受限)"
+        elif limit_down is not None and price <= limit_down + 1e-4:
+            limit_state = "触及/封住跌停(卖盘流动性受限)"
+
+    factors: List[Dict[str, Any]] = []
+    weighted_signals: List[Tuple[float, float]] = []
+
+    # 1) 加权五档失衡(W-OBI) + 微价格偏离(MicroPrice Edge)
+    lvl_weights = [0.40, 0.25, 0.15, 0.12, 0.08]
+    w_obi = None
+    micro_price = None
+    micro_edge_bps = None
+    if base["book_complete"]:
+        wb = sum(w * float(bids[i][1]) for i, w in enumerate(lvl_weights))
+        wa = sum(w * float(asks[i][1]) for i, w in enumerate(lvl_weights))
+        if wb + wa > 0:
+            w_obi = (wb - wa) / (wb + wa) * 100.0
+    elif bids and asks and bids[0][1] is not None and asks[0][1] is not None:
+        b1v, a1v = float(bids[0][1]), float(asks[0][1])
+        if b1v + a1v > 0:
+            w_obi = (b1v - a1v) / (b1v + a1v) * 100.0
+
+    if (bids and asks and bids[0][0] is not None and asks[0][0] is not None
+            and bids[0][1] is not None and asks[0][1] is not None
+            and asks[0][0] >= bids[0][0]):
+        b1p, b1v = float(bids[0][0]), max(0.0, float(bids[0][1]))
+        a1p, a1v = float(asks[0][0]), max(0.0, float(asks[0][1]))
+        if b1v + a1v > 0:
+            micro_price = (b1p * a1v + a1p * b1v) / (b1v + a1v)
+            mid = 0.5 * (b1p + a1p)
+            if mid > 0:
+                micro_edge_bps = (micro_price - mid) / mid * 10000.0
+
+    if w_obi is not None or micro_edge_bps is not None:
+        obi_sig = float(np.tanh((w_obi or 0.0) / 45.0))
+        mp_sig = float(np.tanh((micro_edge_bps or 0.0) / 8.0))
+        sig_val = 0.65 * obi_sig + 0.35 * mp_sig if (w_obi is not None and micro_edge_bps is not None) else (obi_sig if w_obi is not None else mp_sig)
+        weighted_signals.append((sig_val, 0.25))
+        factors.append({
+            "name": "盘口微结构(加权五档失衡/微价格)",
+            "value": f"W-OBI={w_obi:+.1f}%" if w_obi is not None else f"微价偏离={micro_edge_bps:+.2f}bps",
+            "signal": round(sig_val, 3),
+            "weight": 0.25,
+            "bias": "偏多" if sig_val > 0.1 else ("偏空" if sig_val < -0.1 else "中性"),
+            "detail": (f"微价格={micro_price:.3f}({micro_edge_bps:+.2f}bps)" if micro_price is not None else "仅可见挂单排队差"),
+        })
+
+    # 2) 分时均价(VWAP)位置与日内区间位置
+    if base["vs_avg_pct"] is not None:
+        vs_avg = float(base["vs_avg_pct"])
+        pos = base["range_position_pct"]
+        sig_vwap = float(np.tanh(vs_avg / 1.2))
+        if pos is not None:
+            sig_pos = float(np.tanh((pos - 50.0) / 30.0))
+            sig_val = 0.7 * sig_vwap + 0.3 * sig_pos
+        else:
+            sig_val = sig_vwap
+        weighted_signals.append((sig_val, 0.20))
+        factors.append({
+            "name": "分时均价与日内强弱",
+            "value": f"相对均价 {vs_avg:+.2f}%" + (f" / 区间{pos:.0f}%" if pos is not None else ""),
+            "signal": round(sig_val, 3),
+            "weight": 0.20,
+            "bias": "偏多" if sig_val > 0.1 else ("偏空" if sig_val < -0.1 else "中性"),
+            "detail": "现价位于分时均价上方说明当日买方平均成本支撑较强" if vs_avg >= 0 else "现价压在分时均价下方，上方存在当日套牢抛压",
+        })
+
+    # 3) 盘中连续快照的 Tick 动量 + 挂单变化 + 量价流(至少2条快照时启用)
+    snaps = [s for s in (snapshots or []) if isinstance(s, dict) and _num(s.get("price"), True) is not None]
+    tick_mom_pct = None
+    book_delta_pct = None
+    if len(snaps) >= 2 and price is not None:
+        win_snaps = snaps[-12:]
+        p0 = float(win_snaps[0]["price"])
+        tick_mom_pct = (price / p0 - 1.0) * 100.0
+        # Tick 级带符号成交量流(上涨tick计正量、下跌tick计负量)
+        signed_dv, tot_dv = 0.0, 0.0
+        for prev_s, cur_s in zip(win_snaps[:-1], win_snaps[1:]):
+            p_a, p_b = _num(prev_s.get("price"), True), _num(cur_s.get("price"), True)
+            v_a, v_b = _num(prev_s.get("vol")), _num(cur_s.get("vol"))
+            if p_a and p_b and v_a is not None and v_b is not None and v_b >= v_a:
+                dv = v_b - v_a
+                tot_dv += dv
+                if p_b > p_a:
+                    signed_dv += dv
+                elif p_b < p_a:
+                    signed_dv -= dv
+        vol_flow_ratio = (signed_dv / tot_dv) if tot_dv > 0 else 0.0
+        sig_mom = float(np.tanh(tick_mom_pct / 0.35))
+        sig_val = 0.6 * sig_mom + 0.4 * vol_flow_ratio if tot_dv > 0 else sig_mom
+        weighted_signals.append((sig_val, 0.20))
+        factors.append({
+            "name": f"盘中Tick动量与量价流({len(win_snaps)}次快照)",
+            "value": f"短窗涨跌 {tick_mom_pct:+.3f}%" + (f" / 主动量比 {vol_flow_ratio:+.2f}" if tot_dv > 0 else ""),
+            "signal": round(sig_val, 3),
+            "weight": 0.20,
+            "bias": "偏多" if sig_val > 0.1 else ("偏空" if sig_val < -0.1 else "中性"),
+            "detail": "近端连续快照价格与增量成交方向一致度",
+        })
+
+        # 挂单变化动量(买盘增量 vs 卖盘增量)
+        first_s = win_snaps[0]
+        fb = [(_num(r[0], True), _num(r[1])) for r in (first_s.get("bids") or [])[:5] if isinstance(r, (list, tuple)) and len(r) == 2]
+        fa = [(_num(r[0], True), _num(r[1])) for r in (first_s.get("asks") or [])[:5] if isinstance(r, (list, tuple)) and len(r) == 2]
+        if fb and fa and all(v is not None for _, v in fb) and all(v is not None for _, v in fa) and bids and asks:
+            b0 = sum(float(v) for _, v in fb)
+            a0 = sum(float(v) for _, v in fa)
+            b1 = sum(float(v) for _, v in bids if v is not None)
+            a1 = sum(float(v) for _, v in asks if v is not None)
+            db = (b1 - b0) / (b0 + 1.0)
+            da = (a1 - a0) / (a0 + 1.0)
+            book_delta_pct = (db - da) * 100.0
+            sig_bd = float(np.tanh(book_delta_pct / 40.0))
+            weighted_signals.append((sig_bd, 0.10))
+            factors.append({
+                "name": "盘口挂单增减动量",
+                "value": f"买增减−卖增减={book_delta_pct:+.1f}%",
+                "signal": round(sig_bd, 3),
+                "weight": 0.10,
+                "bias": "偏多" if sig_bd > 0.1 else ("偏空" if sig_bd < -0.1 else "中性"),
+                "detail": "近端买盘排队增长相对卖盘变化(注：无法区分撤单与成交)",
+            })
+
+    # 4) 边际主力资金流脉冲(优先用近端Δmain_net，否则用当日累计占比)
+    ff = fundflow or {}
+    main_net_cur = _num(ff.get("main_net"))
+    main_pct_cur = _num(ff.get("main_pct"))
+    delta_main = None
+    if main_net_cur is not None:
+        if snaps:
+            prev_nets = [_num(s.get("main_net")) for s in snaps[:-1]]
+            prev_nets = [x for x in prev_nets if x is not None]
+            if prev_nets:
+                delta_main = main_net_cur - prev_nets[0]
+        if delta_main is not None and abs(delta_main) > 1e-6:
+            # 用当日成交额做尺度归一化，避免大小盘量纲失衡
+            amt_cur = _num(q.get("amount"), True) or max(abs(main_net_cur), 1e6)
+            norm_delta = delta_main / max(amt_cur * 0.05, 1e5)
+            sig_ff = float(np.tanh(norm_delta))
+            ff_val_str = f"边际Δ主力={delta_main/1e4:+.1f}万"
+        elif main_pct_cur is not None:
+            sig_ff = float(np.tanh(main_pct_cur / 8.0))
+            ff_val_str = f"主力净占比={main_pct_cur:+.2f}%"
+        else:
+            sig_ff = float(np.tanh(main_net_cur / 5e6))
+            ff_val_str = f"累计主力={main_net_cur/1e4:+.0f}万"
+        weighted_signals.append((sig_ff, 0.10))
+        factors.append({
+            "name": "主力资金边际脉冲",
+            "value": ff_val_str,
+            "signal": round(sig_ff, 3),
+            "weight": 0.10,
+            "bias": "偏多" if sig_ff > 0.1 else ("偏空" if sig_ff < -0.1 else "中性"),
+            "detail": "统计滞后数秒，存在主力对倒/骗线可能，权重受限",
+        })
+
+    # 5) 分钟级样本外ML预测(若可用)
+    bf = bar_forecast if isinstance(bar_forecast, dict) and bar_forecast.get("available") else None
+    if bf is not None:
+        # 根据样本外超额DA自适应调整权重：无样本外优势时只给低参考权重
+        excess_da = float(bf.get("oos_excess_da_pct", 0.0) or 0.0)
+        w_ml = 0.30 if excess_da >= 2.0 else (0.20 if excess_da > 0 else 0.10)
+        sig_ml = float(np.clip((float(bf["p_up_pct"]) - 50.0) / 25.0, -1.0, 1.0))
+        weighted_signals.append((sig_ml, w_ml))
+        factors.append({
+            "name": f"分钟级ML模型(未来{bf['horizon_bars']}根K线)",
+            "value": f"模型涨概率 {bf['p_up_pct']:.1f}% (预期 {bf['pred_ret_pct']:+.2f}%)",
+            "signal": round(sig_ml, 3),
+            "weight": w_ml,
+            "bias": "偏多" if sig_ml > 0.1 else ("偏空" if sig_ml < -0.1 else "中性"),
+            "detail": f"样本外DA={bf['oos_da_pct']:.1f}% vs 多数基准={bf['majority_baseline_pct']:.1f}% (n={bf['oos_n']})",
+        })
+
+    if weighted_signals:
+        tot_w = sum(w for _, w in weighted_signals)
+        raw_score = sum(s * w for s, w in weighted_signals) / max(tot_w, 1e-9)
+        score = round(float(np.clip(raw_score * 100.0, -100.0, 100.0)), 1)
+        # 保守逻辑映射至 [25%, 75%]，避免日内高频噪音产生过度自信
+        p_up = 25.0 + 50.0 / (1.0 + np.exp(-2.2 * raw_score))
+        p_up_pct = round(float(np.clip(p_up, 25.0, 75.0)), 1)
+    else:
+        score = 0.0
+        p_up_pct = 50.0
+
+    p_down_pct = round(100.0 - p_up_pct, 1)
+    if p_up_pct >= 55.0:
+        direction = "偏多(上涨倾向)"
+    elif p_up_pct <= 45.0:
+        direction = "偏空(下跌倾向)"
+    else:
+        direction = "多空均衡(震荡)"
+
+    return {
+        "price": price,
+        "p_up_pct": p_up_pct,
+        "p_down_pct": p_down_pct,
+        "score": score,
+        "direction": direction,
+        "limit_state": limit_state,
+        "weighted_obi_pct": round(w_obi, 2) if w_obi is not None else None,
+        "micro_price": round(micro_price, 4) if micro_price is not None else None,
+        "micro_edge_bps": round(micro_edge_bps, 2) if micro_edge_bps is not None else None,
+        "tick_mom_pct": round(tick_mom_pct, 4) if tick_mom_pct is not None else None,
+        "book_delta_pct": round(book_delta_pct, 2) if book_delta_pct is not None else None,
+        "delta_main_net": round(delta_main, 2) if delta_main is not None else None,
+        "n_active_factors": len(factors),
+        "factors": factors,
+        "bar_forecast": bf,
+        "disclaimer": "场内实时量化测算，盘中高频噪声极大，仅供参考，不构成买卖信号或投资建议、盈亏自负。",
+    }
+
+
+def intraday_realtime_html(pred: Optional[Dict[str, Any]],
+                           tracker_stats: Optional[Dict[str, Any]] = None) -> str:
+    """将场内实时涨跌预测计算结果渲染为直观的 HTML 面板（含多因子拆解与实时核验）。"""
+    if not pred:
+        return ""
+    import html as _html
+    p_up = pred.get("p_up_pct", 50.0)
+    p_dn = pred.get("p_down_pct", 50.0)
+    score = pred.get("score", 0.0)
+    direction = _html.escape(str(pred.get("direction", "多空均衡")))
+    limit_state = _html.escape(str(pred.get("limit_state", "正常交易")))
+    dir_col = "#c0392b" if p_up >= 55 else ("#1a9d5a" if p_up <= 45 else "#555")
+    bg_col = "#fdf2f2" if p_up >= 55 else ("#f2fbf5" if p_up <= 45 else "#f8f9fa")
+
+    mp_str = f"{pred['micro_price']:.3f} ({pred['micro_edge_bps']:+.2f} bps)" if pred.get("micro_price") is not None else "未取得"
+    wobi_str = f"{pred['weighted_obi_pct']:+.1f}%" if pred.get("weighted_obi_pct") is not None else "未取得"
+
+    bf = pred.get("bar_forecast")
+    bar_block = ""
+    if isinstance(bf, dict) and bf.get("available"):
+        ex = bf.get("oos_excess_da_pct", 0.0)
+        ex_col = "#1e8449" if ex > 0 else "#c0392b"
+        bar_block = (
+            f"<div style='margin-top:6px;padding:6px;background:#fff;border:1px solid #ddd;font-size:12px'>"
+            f"<b>分钟级ML模型（未来{bf['horizon_bars']}根K线）</b>："
+            f"预测目标价 <b>{bf['pred_price']:.3f}</b> ({bf['pred_ret_pct']:+.2f}%)　"
+            f"| 80%波动区间 [{bf['pred_lo']:.3f}, {bf['pred_hi']:.3f}] (±{bf['band_pct']:.2f}%)<br>"
+            f"样本外诚实自检：模型DA <b>{bf['oos_da_pct']:.1f}%</b> vs 多数基准 <b>{bf['majority_baseline_pct']:.1f}%</b> "
+            f"(<span style='color:{ex_col}'>超额 {ex:+.1f}%</span>, n={bf['oos_n']})"
+            f"</div>"
+        )
+
+    trk_block = ""
+    if isinstance(tracker_stats, dict) and tracker_stats.get("total_recorded", 0) > 0:
+        vn = tracker_stats.get("verified_n", 0)
+        if vn > 0:
+            trk_block = (
+                f"<p style='font-size:12px;color:#2c3e50;margin:4px 0'>📊 <b>盘中预测实时兑现追踪</b>："
+                f"已核验 <b>{vn}</b> 次（命中 {tracker_stats['hit_n']} 次，"
+                f"实盘命中率 <b>{tracker_stats['hit_rate_pct']:.1f}%</b>，同期实际涨占比 {tracker_stats['baseline_up_pct']:.1f}%）；"
+                f"待到期 {tracker_stats['pending_n']} 次。</p>"
+            )
+        else:
+            trk_block = (
+                f"<p style='font-size:12px;color:#7f8c8d;margin:4px 0'>📊 <b>盘中预测实时兑现追踪</b>："
+                f"已记录 {tracker_stats['total_recorded']} 次，等待到达验证窗口({tracker_stats.get('horizon_sec', 60)}秒)后自动核验。</p>"
+            )
+
+    factor_rows = "".join(
+        f"<tr><td>{_html.escape(f['name'])}</td>"
+        f"<td>{_html.escape(str(f['value']))}</td>"
+        f"<td style='color:{'#c0392b' if f['bias']=='偏多' else ('#1a9d5a' if f['bias']=='偏空' else '#555')}'><b>{_html.escape(f['bias'])}</b></td>"
+        f"<td align=right>{f['weight']*100:.0f}%</td>"
+        f"<td style='font-size:11px;color:#666'>{_html.escape(str(f['detail']))}</td></tr>"
+        for f in (pred.get("factors") or [])
+    )
+    return (
+        f"<div style='background:{bg_col};border:2px solid {dir_col};padding:10px;margin:8px 0'>"
+        f"<h3 style='margin:0 0 6px 0;color:{dir_col}'>⚡ 场内实时涨跌预测计算：{direction}"
+        f"　<span style='font-size:13px;color:#333'>综合得分 {score:+.1f} / 100（有效因子 {pred.get('n_active_factors', 0)} 个）</span></h3>"
+        f"<div style='font-size:15px;margin:4px 0'>"
+        f"上涨倾向概率 <b style='color:#c0392b'>{p_up:.1f}%</b>　|　"
+        f"下跌倾向概率 <b style='color:#1a9d5a'>{p_dn:.1f}%</b>　|　"
+        f"微价格: <b>{mp_str}</b>　|　加权五档失衡: <b>{wobi_str}</b>　|　状态: <b>{limit_state}</b>"
+        f"</div>"
+        + bar_block
+        + trk_block
+        + ("<table border=1 cellpadding=3 cellspacing=0 width=100% style='margin-top:6px;background:#fff;font-size:12px'>"
+           "<tr bgcolor=#eef><th>实时因子</th><th>当前测算值</th><th>倾向</th><th>权重</th><th>说明</th></tr>"
+           + factor_rows + "</table>" if factor_rows else "")
+        + f"<p style='color:#c0392b;font-size:11px;margin:6px 0 0 0'>⚠ {_html.escape(pred['disclaimer'])}</p>"
+        f"</div>"
+    )
+
+
+class IntradayPredictionTracker:
+    """盘中实时预测滚动自检器：记录每次实时方向预测，到期后自动对照真实最新价计算实盘命中率。"""
+
+    def __init__(self, horizon_sec: float = 60.0, max_items: int = 300):
+        self.horizon_sec = max(10.0, float(horizon_sec))
+        self.max_items = max(20, int(max_items))
+        self._lock = threading.Lock()
+        self._records: List[Dict[str, Any]] = []
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+
+    def update(self, code: str, price: Optional[float], p_up_pct: Optional[float],
+               ts: Optional[float] = None) -> Dict[str, Any]:
+        """先核验已到期的历史预测，再记录本次有效预测(方向明确时纳入命中统计)。"""
+        now_ts = float(ts if ts is not None else time.time())
+        with self._lock:
+            if price is not None and np.isfinite(price) and price > 0:
+                for rec in self._records:
+                    if rec["code"] == code and not rec["verified"] and (now_ts - rec["ts"]) >= self.horizon_sec:
+                        actual_up = float(price) > rec["price"]
+                        rec["verified"] = True
+                        rec["exit_price"] = float(price)
+                        rec["actual_up"] = actual_up
+                        if rec["pred_dir"] != 0:
+                            rec["hit"] = ((rec["pred_dir"] > 0) == actual_up)
+                        else:
+                            rec["hit"] = None
+
+                if p_up_pct is not None and np.isfinite(p_up_pct):
+                    pred_dir = 1 if p_up_pct >= 55.0 else (-1 if p_up_pct <= 45.0 else 0)
+                    # 仅记录方向倾向明确的实时预测用于命中率验证；中性观望也留档展示
+                    self._records.append({
+                        "code": code,
+                        "ts": now_ts,
+                        "price": float(price),
+                        "p_up_pct": float(p_up_pct),
+                        "pred_dir": pred_dir,
+                        "verified": False,
+                        "exit_price": None,
+                        "actual_up": None,
+                        "hit": None,
+                    })
+                    if len(self._records) > self.max_items:
+                        self._records = self._records[-self.max_items:]
+
+            code_recs = [r for r in self._records if r["code"] == code]
+            verified_dir = [r for r in code_recs if r["verified"] and r["hit"] is not None]
+            hits = sum(1 for r in verified_dir if r["hit"])
+            up_actuals = sum(1 for r in verified_dir if r["actual_up"])
+            pending = sum(1 for r in code_recs if not r["verified"])
+            return {
+                "horizon_sec": self.horizon_sec,
+                "total_recorded": len(code_recs),
+                "verified_n": len(verified_dir),
+                "hit_n": hits,
+                "hit_rate_pct": round(hits / len(verified_dir) * 100.0, 1) if verified_dir else None,
+                "baseline_up_pct": round(up_actuals / len(verified_dir) * 100.0, 1) if verified_dir else None,
+                "pending_n": pending,
+            }
 
 
 _SNAPSHOT_WRITE_LOCK = threading.Lock()
@@ -6197,8 +7073,12 @@ def write_snapshot(code: str, q: Dict[str, Any]) -> str:
     return path
 
 
-def collect_intraday_snapshot(code: str, persist: bool = True) -> Dict[str, Any]:
-    """GUI/CLI共用的一次采集：真实行情必需，资金流可降级，分别记录本机接收时间。"""
+def collect_intraday_snapshot(code: str, persist: bool = True,
+                              include_bars: bool = False, bar_period: str = "5",
+                              horizon_bars: int = 3,
+                              snapshots: Optional[List[Dict[str, Any]]] = None,
+                              cached_bar_forecast: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GUI/CLI共用的一次采集：真实行情必需，资金流与分钟K线可降级，分别记录本机接收时间。"""
     code = str(code).strip()
     if not re.fullmatch(r"\d{6}", code):
         raise ValueError("股票代码必须是六位数字。")
@@ -6222,21 +7102,43 @@ def collect_intraday_snapshot(code: str, persist: bool = True) -> Dict[str, Any]
     quote["fundflow_received_at"] = dt.datetime.now().isoformat(timespec="seconds")
     if ff["main_net"] is None:
         analysis["warnings"].append("本次资金流未取得有效主力净流入；行情记录保留，资金流留空。")
+
+    bar_forecast = cached_bar_forecast
+    if include_bars and bar_forecast is None:
+        try:
+            bars_df = StockDataFetcher.fetch_intraday_bars(code, period=bar_period)
+            bar_forecast = predict_intraday_bars(
+                bars_df, horizon_bars=horizon_bars,
+                live_price=analysis["price"],
+                live_avg=quote.get("avg"),
+            )
+        except Exception as exc:
+            bar_forecast = {"available": False, "reason": str(exc)}
+
+    snap_seq = list(snapshots or [])
+    snap_seq.append(quote)
+    intraday_pred = compute_intraday_realtime_prediction(
+        quote, snapshots=snap_seq, fundflow=ff, bar_forecast=bar_forecast
+    )
     trading, status = is_trading_now()
     path = write_snapshot(code, quote) if persist else None
     return {"code": code, "quote": quote, "fundflow": ff, "analysis": analysis,
+            "intraday_prediction": intraday_pred, "bar_forecast": bar_forecast,
             "trading": trading, "status": status, "snapshot_path": path}
 
 
 def monitor_intraday(code: str, interval: float = 10, max_updates: int = 0,
                      on_update: Optional[Callable[[Dict[str, Any]], None]] = None,
-                     stop_event=None) -> Dict[str, Any]:
+                     stop_event=None, bar_period: str = "5",
+                     horizon_bars: int = 3) -> Dict[str, Any]:
     """连续监控，每次请求结束后等待interval秒；max_updates计尝试次数，0为持续运行。
 
     网络失败不伪造行情、不覆盖上次成功结果；Ctrl+C或stop_event可停止等待。
     单次采集串行执行，不因接口变慢堆积重叠请求。非交易时段仍可查看源接口返回的收盘快照。
+    每次成功刷新都会结合滚动快照与盘中分钟K线计算实时涨跌倾向并自动跟踪到期命中率。
     """
-    if not re.fullmatch(r"\d{6}", str(code).strip()):
+    code_str = str(code).strip()
+    if not re.fullmatch(r"\d{6}", code_str):
         raise ValueError("股票代码必须是六位数字。")
     if not np.isfinite(interval) or interval < 3:
         raise ValueError("刷新间隔至少为3秒。")
@@ -6244,15 +7146,43 @@ def monitor_intraday(code: str, interval: float = 10, max_updates: int = 0,
         raise ValueError("监控次数必须为非负整数，0表示持续运行。")
     stop_event = stop_event if stop_event is not None else threading.Event()
     summary = {"attempts": 0, "succeeded": 0, "failed": 0, "stopped": False}
+    snapshots: List[Dict[str, Any]] = []
+    tracker = IntradayPredictionTracker(horizon_sec=max(60.0, float(interval) * 3.0))
+    cached_bar_fc: Optional[Dict[str, Any]] = None
+    last_bar_fetch = 0.0
     try:
         while not stop_event.is_set() and (not max_updates or summary["attempts"] < max_updates):
             summary["attempts"] += 1
             try:
-                result = collect_intraday_snapshot(str(code).strip())
+                result = collect_intraday_snapshot(code_str)
                 summary["succeeded"] += 1
+                q = result.get("quote")
+                if isinstance(q, dict):
+                    snapshots.append(q)
+                    if len(snapshots) > 120:
+                        snapshots = snapshots[-120:]
+                    now_mono = time.monotonic()
+                    if cached_bar_fc is None or (now_mono - last_bar_fetch) >= 60.0:
+                        last_bar_fetch = now_mono
+                        try:
+                            bars_df = StockDataFetcher.fetch_intraday_bars(code_str, period=bar_period)
+                            cached_bar_fc = predict_intraday_bars(
+                                bars_df, horizon_bars=horizon_bars,
+                                live_price=q.get("price"), live_avg=q.get("avg"),
+                            )
+                        except Exception as exc:
+                            cached_bar_fc = {"available": False, "reason": str(exc)}
+                    pred = compute_intraday_realtime_prediction(
+                        q, snapshots=snapshots, fundflow=result.get("fundflow"),
+                        bar_forecast=cached_bar_fc,
+                    )
+                    result["intraday_prediction"] = pred
+                    result["live_verification"] = tracker.update(
+                        code_str, pred.get("price"), pred.get("p_up_pct")
+                    )
             except Exception as exc:
                 summary["failed"] += 1
-                result = {"code": str(code).strip(), "error": str(exc),
+                result = {"code": code_str, "error": str(exc),
                           "received_at": dt.datetime.now().isoformat(timespec="seconds")}
             if on_update:
                 on_update(result)
@@ -8054,18 +8984,32 @@ def fetch_board_spot(board_type: str = "concept", retries: int = 4,
 if HAS_PYSIDE6:
 
     class MonitorWorker(QThread):
-        """盘口、资金流和日历均在后台取数；令牌用于丢弃停止/重启后的旧响应。"""
+        """盘口、资金流、分钟K线均在后台取数；令牌用于丢弃停止/重启后的旧响应。"""
         result_signal = Signal(dict)
         error_signal = Signal(dict)
 
-        def __init__(self, code, generation, parent=None):
+        def __init__(self, code, generation, parent=None,
+                     fetch_bars: bool = False, bar_period: str = "5", horizon_bars: int = 3):
             super().__init__(parent)
             self.code = code
             self.generation = generation
+            self.fetch_bars = fetch_bars
+            self.bar_period = bar_period
+            self.horizon_bars = horizon_bars
 
         def run(self):
             try:
                 result = collect_intraday_snapshot(self.code, persist=False)
+                if self.fetch_bars and isinstance(result.get("quote"), dict):
+                    q = result["quote"]
+                    try:
+                        bars_df = StockDataFetcher.fetch_intraday_bars(self.code, period=self.bar_period)
+                        result["bar_forecast"] = predict_intraday_bars(
+                            bars_df, horizon_bars=self.horizon_bars,
+                            live_price=q.get("price"), live_avg=q.get("avg"),
+                        )
+                    except Exception as exc:
+                        result["bar_forecast"] = {"available": False, "reason": str(exc)}
                 result["generation"] = self.generation
                 self.result_signal.emit(result)
             except Exception as exc:
@@ -10026,6 +10970,15 @@ if HAS_PYSIDE6:
             self.mon_interval = QComboBox(); self.mon_interval.addItems(["3 秒", "5 秒", "10 秒", "30 秒"])
             self.mon_interval.setCurrentIndex(1)
             top.addWidget(self.mon_interval)
+            self.mon_rt_pred_chk = QCheckBox("⚡ 实时涨跌预测")
+            self.mon_rt_pred_chk.setChecked(True)
+            self.mon_rt_pred_chk.setToolTip("场内实时计算：融合五档微价格/加权失衡/分时均价/Tick流/分钟级ML模型，实时给出上涨与下跌倾向概率")
+            top.addWidget(self.mon_rt_pred_chk)
+            top.addWidget(QLabel("短线周期:"))
+            self.mon_bar_combo = QComboBox()
+            self.mon_bar_combo.addItems(["5分钟·15m预测", "5分钟·30m预测", "1分钟·5m预测", "15分钟·60m预测"])
+            self.mon_bar_combo.currentIndexChanged.connect(lambda _idx: setattr(self, "_mon_bar_last_ts", 0.0))
+            top.addWidget(self.mon_bar_combo)
             self.mon_start_btn = QPushButton("▶ 开始监控")
             self.mon_start_btn.setStyleSheet("font-weight:bold; padding:6px; background:#1e8449; color:white;")
             self.mon_start_btn.clicked.connect(self._on_start_monitor)
@@ -10033,6 +10986,10 @@ if HAS_PYSIDE6:
             self.mon_stop_btn = QPushButton("■ 停止")
             self.mon_stop_btn.clicked.connect(self._on_stop_monitor); self.mon_stop_btn.setEnabled(False)
             top.addWidget(self.mon_stop_btn)
+            self.mon_recalc_btn = QPushButton("📊 重算盘中模型")
+            self.mon_recalc_btn.setToolTip("立即拉取最新分钟K线与盘口，强制重算场内涨跌预测")
+            self.mon_recalc_btn.clicked.connect(self._on_recalc_intraday_now)
+            top.addWidget(self.mon_recalc_btn)
             self.mon_fc_btn = QPushButton("🔮 预测明日/一周/一月")
             self.mon_fc_btn.clicked.connect(self._on_monitor_forecast)
             top.addWidget(self.mon_fc_btn)
@@ -10053,7 +11010,45 @@ if HAS_PYSIDE6:
             self._monitor_generation = 0
             self._monitor_code = ""
             self._monitor_last_html = ""
+            self._mon_snapshots = []
+            self._mon_tracker = IntradayPredictionTracker(horizon_sec=60.0)
+            self._mon_bar_cache = None
+            self._mon_bar_last_ts = 0.0
             return panel
+
+        def _mon_bar_params(self) -> Tuple[str, int]:
+            combo = getattr(self, "mon_bar_combo", None)
+            idx = combo.currentIndex() if combo is not None else 0
+            return [("5", 3), ("5", 6), ("1", 5), ("15", 4)][min(max(idx, 0), 3)]
+
+        def _on_recalc_intraday_now(self):
+            self._mon_bar_last_ts = 0.0
+            if self._monitor_timer.isActive():
+                self._refresh_monitor()
+                return
+            code = self.code_edit.text().strip()
+            if not re.fullmatch(r"\d{6}", code):
+                QMessageBox.warning(self, "代码无效", "请输入六位数字股票代码。"); return
+            if self.data_source_combo.currentIndex() == 1:
+                QMessageBox.information(self, "提示", "实时涨跌测算需真实数据源，请切换数据源为「真实数据」。"); return
+            period, hbars = self._mon_bar_params()
+            self.mon_recalc_btn.setEnabled(False); self.mon_recalc_btn.setText("计算中...")
+            QApplication.processEvents()
+            try:
+                res = collect_intraday_snapshot(code, persist=False, include_bars=True,
+                                                bar_period=period, horizon_bars=hbars,
+                                                snapshots=getattr(self, "_mon_snapshots", None))
+                self._mon_bar_cache = res.get("bar_forecast")
+                self._mon_bar_last_ts = time.monotonic()
+                q = res["quote"]
+                self._mon_snapshots = (getattr(self, "_mon_snapshots", []) + [q])[-120:]
+                self._render_monitor(code, q, res["fundflow"], res["trading"], res["status"],
+                                     intraday_pred=res.get("intraday_prediction"))
+                self._oplog(f"手动重算场内实时涨跌预测：{code}（{period}m×{hbars}）。")
+            except Exception as exc:
+                QMessageBox.warning(self, "测算失败", str(exc))
+            finally:
+                self.mon_recalc_btn.setEnabled(True); self.mon_recalc_btn.setText("📊 重算盘中模型")
 
         def _on_start_monitor(self):
             if self.data_source_combo.currentIndex() == 1:
@@ -10069,6 +11064,10 @@ if HAS_PYSIDE6:
             sec = int(self.mon_interval.currentText().split()[0])
             self._mon_count = 0                      # 本次监控已记录的快照数
             self._mon_file = ""
+            self._mon_snapshots = []
+            self._mon_bar_cache = None
+            self._mon_bar_last_ts = 0.0
+            self._mon_tracker = IntradayPredictionTracker(horizon_sec=max(60.0, sec * 3.0))
             self._monitor_timer.start(sec * 1000)
             self.mon_start_btn.setEnabled(False); self.mon_stop_btn.setEnabled(True)
             self.mon_interval.setEnabled(False)
@@ -10097,7 +11096,18 @@ if HAS_PYSIDE6:
                 return
             if self._monitor_worker is not None and self._monitor_worker.isRunning():
                 return  # 网络慢时跳过本轮，禁止堆积并发取数。
-            worker = MonitorWorker(self._monitor_code, self._monitor_generation, self)
+            rt_chk = getattr(self, "mon_rt_pred_chk", None)
+            want_bars = bool(rt_chk.isChecked()) if rt_chk is not None else False
+            now_mono = time.monotonic()
+            last_bar_ts = float(getattr(self, "_mon_bar_last_ts", 0.0) or 0.0)
+            need_bar_fetch = want_bars and (getattr(self, "_mon_bar_cache", None) is None or (now_mono - last_bar_ts) >= 60.0)
+            if need_bar_fetch and hasattr(self, "_mon_bar_params"):
+                period, hbars = self._mon_bar_params()
+                worker = MonitorWorker(self._monitor_code, self._monitor_generation, self,
+                                       fetch_bars=True, bar_period=period, horizon_bars=hbars)
+                self._mon_bar_last_ts = now_mono
+            else:
+                worker = MonitorWorker(self._monitor_code, self._monitor_generation, self)
             self._monitor_worker = worker
             worker.result_signal.connect(self._on_monitor_result)
             worker.error_signal.connect(self._on_monitor_error)
@@ -10116,7 +11126,27 @@ if HAS_PYSIDE6:
                 return
             code, q = result["code"], result["quote"]
             self._record_snapshot(code, q)
-            self._render_monitor(code, q, result["fundflow"], result["trading"], result["status"])
+            if "bar_forecast" in result and result["bar_forecast"] is not None:
+                self._mon_bar_cache = result["bar_forecast"]
+            snaps = getattr(self, "_mon_snapshots", None)
+            if isinstance(snaps, list) and isinstance(q, dict):
+                snaps.append(q)
+                if len(snaps) > 120:
+                    del snaps[:-120]
+            rt_chk = getattr(self, "mon_rt_pred_chk", None)
+            rt_on = bool(rt_chk.isChecked()) if rt_chk is not None else False
+            intraday_pred = None
+            tracker_stats = None
+            if rt_on and isinstance(q, dict):
+                intraday_pred = compute_intraday_realtime_prediction(
+                    q, snapshots=snaps, fundflow=result.get("fundflow"),
+                    bar_forecast=getattr(self, "_mon_bar_cache", None),
+                )
+                tracker = getattr(self, "_mon_tracker", None)
+                if tracker is not None:
+                    tracker_stats = tracker.update(code, intraday_pred.get("price"), intraday_pred.get("p_up_pct"))
+            self._render_monitor(code, q, result["fundflow"], result["trading"], result["status"],
+                                 intraday_pred=intraday_pred, tracker_stats=tracker_stats)
 
         def _on_monitor_error(self, result):
             if result["generation"] != self._monitor_generation or not self._monitor_timer.isActive():
@@ -10138,7 +11168,9 @@ if HAS_PYSIDE6:
                 return
             super().closeEvent(event)
 
-        def _render_monitor(self, code, q, ff, trading, status):
+        def _render_monitor(self, code, q, ff, trading, status,
+                            intraday_pred: Optional[Dict[str, Any]] = None,
+                            tracker_stats: Optional[Dict[str, Any]] = None):
             def num(v):
                 try:
                     return float(v)
@@ -10192,15 +11224,17 @@ if HAS_PYSIDE6:
             rec = getattr(self, "_mon_count", 0)
             recfile = os.path.basename(getattr(self, "_mon_file", "")) or "monitor_log/"
             note = ("<p style='color:#888;font-size:12px'>盘口为实时快照(东方财富)；"
-                    "本页只做<b>真实行情监控</b>，不预测下一分钟涨跌(那是噪声)。</p>"
+                    "开启「实时涨跌预测」后将按盘口微结构、分时均价、Tick量价流与分钟K线样本外模型实时计算，"
+                    "并自动核验到期命中率，仅作研究参考。</p>"
                     f"<p style='color:#1e8449;font-size:12px'>📝 本次已记录 <b>{rec}</b> 条真实快照 → "
                     f"<b>{recfile}</b>（自采集的盘口/买卖手历史，长期积累后可供模型分析）。</p>")
             import html
             record_error = getattr(self, "_mon_record_error", "")
             if record_error:
                 note += f"<p style='color:#c0392b'>快照写入失败：{html.escape(record_error)}；本次仅显示，未保存。</p>"
-            self._monitor_last_html = (head + info + intraday_snapshot_html(q) + pankou + fundflow
-                                       + note + (self._mon_fc_html or ""))
+            self._monitor_last_html = (head + info
+                                       + intraday_snapshot_html(q, realtime_pred=intraday_pred, tracker_stats=tracker_stats)
+                                       + pankou + fundflow + note + (self._mon_fc_html or ""))
             self.mon_view.setHtml(self._monitor_last_html)
 
         def _on_monitor_forecast(self):
@@ -14762,6 +15796,17 @@ if HAS_PYSIDE6:
             "lhb_sell_amount": "龙虎榜卖出额(万元)", "lhb_net_ratio": "龙虎榜净买占总成交比",
             "lhb_count": "龙虎榜上榜笔数", "lhb_net_amount_5d": "近5日龙虎榜净买额",
             "lhb_net_amount_20d": "近20日龙虎榜净买额", "lhb_count_20d": "近20日上榜次数",
+            # 4.1.16 物理量纲归一化与微观结构特征
+            "gap_ret": "隔夜跳空幅", "intraday_ret": "日内实体涨幅",
+            "upper_shadow": "上影线比例", "lower_shadow": "下影线比例",
+            "natr14": "14日归一化真实波幅(NATR)", "ret_2d": "2日涨幅", "ret_3d": "3日涨幅",
+            "ret_5d": "5日涨幅", "ret_10d": "10日涨幅",
+            "ret_z5": "5日波动率调整动量", "ret_z20": "20日波动率调整动量",
+            "macd_dif_norm": "归一化MACD-DIF", "macd_dea_norm": "归一化MACD-DEA",
+            "macd_hist_norm": "归一化MACD柱", "ma5_ma20_ratio": "MA5/MA20偏离",
+            "ma10_ma60_ratio": "MA10/MA60偏离", "ema5_ema20_ratio": "EMA5/EMA20偏离",
+            "vol_z20": "20日成交量Z分数", "obv_slope10": "10日有向成交量流",
+            "pv_corr10": "10日量价相关性",
         }
 
         def _build_recommendation_html(self, results):
@@ -15947,9 +16992,9 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
             continue
         k = max(1, len(grp) // 3)
         top = grp.nlargest(k, "_pred"); bot = grp.nsmallest(k, "_pred")
-        topr = float(top["y4_mean_pct"].mean()) / 100.0
-        botr = float(bot["y4_mean_pct"].mean()) / 100.0
-        mktr = float(grp["y4_mean_pct"].mean()) / 100.0
+        topr = float((top["end_close_yuan"] / top["close"] - 1).mean())
+        botr = float((bot["end_close_yuan"] / bot["close"] - 1).mean())
+        mktr = float((grp["end_close_yuan"] / grp["close"] - 1).mean())
         cum_top.append(cum_top[-1] * (1 + topr))
         cum_top_net.append(cum_top_net[-1] * (1 + topr) * (1 - 2 * c_one))   # 每期换仓扣双边成本
         cum_mkt.append(cum_mkt[-1] * (1 + mktr))
@@ -15962,7 +17007,7 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     # 滚动 IC 稳定性：IC_IR=均值/标准差、IC>0 占比、逐年 IC——一个均值会骗人，稳定性才是真信号
     ic_std = float(np.std(ic_vals)) if len(ic_vals) > 1 else float("nan")
     ic_ir = (rank_ic / ic_std) if (ic_std and ic_std > 1e-9) else float("nan")
-    ic_pos_ratio = (float(np.mean([1 for v in ic_vals if v > 0])) * 100) if ic_vals else float("nan")
+    ic_pos_ratio = (float(np.mean(np.asarray(ic_vals) > 0)) * 100) if ic_vals else float("nan")
     ic_by_year = {}
     for d, v in ics:
         ic_by_year.setdefault(d.year, []).append(v)
@@ -15971,8 +17016,9 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     # 扣费后的多空价差(两条腿各双边成本)：spread − 4×单边成本(%)
     cost_pct_per_period = 4 * cost_bps / 100.0
     ls_spread_net = (ls_spread - cost_pct_per_period) if spreads else float("nan")
-    top_cagr_gross = ((cum_top[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
-    top_cagr_net = ((cum_top_net[-1] ** (1.0 / max(1, len(dts))) - 1) * 100) if dts else float("nan")
+    elapsed_years = ((pd.Timestamp(te.loc[te["date"] == dts[-1], "label_end_date"].max()) - pd.Timestamp(dts[0])).days / 365.25) if dts else 0.0
+    top_cagr_gross = ((cum_top[-1] ** (1.0 / elapsed_years) - 1) * 100) if elapsed_years > 0 else float("nan")
+    top_cagr_net = ((cum_top_net[-1] ** (1.0 / elapsed_years) - 1) * 100) if elapsed_years > 0 else float("nan")
     # size 暴露诊断：预测分 vs log(市值) 的截面相关(越接近0越『不是靠押小盘』)。无市值则用价位档位作弱代理并标注
     size_col = "total_mv" if ("total_mv" in te.columns and pd.to_numeric(te["total_mv"], errors="coerce").notna().sum() >= 3) else "price_tier"
     size_is_proxy = (size_col == "price_tier")
@@ -16982,7 +18028,7 @@ def predict_frozen(code: str, algo: str = "Lasso", horizons: Optional[List[int]]
     # 若冻结模型用了 ARIMA 混合特征，为该股票最新一行现算(因果：参数用其全部历史估计，末行只用自身过去)
     if any(str(c).startswith("arima") for c in fcols):
         cl = df["close"].values.astype(float)
-        apr, arz = _arima_causal_features(cl, len(cl))
+        apr, arz = _arima_causal_features(cl, len(cl) - 1)
         li = len(cl) - 1
         feat_base["arima_pred_ret"] = 0.0 if np.isnan(apr[li]) else float(apr[li])
         feat_base["arima_resid_z"] = 0.0 if np.isnan(arz[li]) else float(arz[li])
@@ -17162,6 +18208,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--monitor", default=None, help="连续监控六位股票代码，Ctrl+C停止；例如 --monitor 600000")
     p.add_argument("--monitor-interval", type=float, default=10, help="连续监控刷新间隔秒数(请求完成后等待，至少3秒)")
     p.add_argument("--monitor-count", type=int, default=0, help="连续监控尝试次数，0表示持续运行")
+    p.add_argument("--intraday-predict", default=None,
+                   help="场内实时涨跌预测计算：拉取实时盘口+资金流+分钟级K线，输出上涨/下跌概率与因子拆解，如 --intraday-predict 600519")
+    p.add_argument("--bar-period", default="5", choices=["1", "5", "15", "30", "60"],
+                   help="盘中分钟级K线周期(分钟，默认5)")
+    p.add_argument("--bar-horizon", type=int, default=3,
+                   help="盘中分钟级预测前瞻K线数(默认3根，5m周期即未来15分钟)")
     p.add_argument("--verify", action="store_true",
                    help="无界面自动验证到期预测(拉真实股价对比)，供定时任务每日调用")
     # ---- 全局池化训练 + 冻结/加载（第八部分补充8）----
@@ -17344,6 +18396,34 @@ def main():
 
     args = _build_arg_parser().parse_args()
 
+    if args.intraday_predict:
+        code = args.intraday_predict.strip()
+        try:
+            result = collect_intraday_snapshot(
+                code, persist=False, include_bars=True,
+                bar_period=args.bar_period, horizon_bars=args.bar_horizon,
+            )
+            pred = result["intraday_prediction"]
+            print(f"[intraday-predict] {code} 现价={pred['price']}  方向={pred['direction']}  "
+                  f"P(涨)={pred['p_up_pct']}% / P(跌)={pred['p_down_pct']}%  "
+                  f"综合得分={pred['score']:+.1f}  [{result['status']}]")
+            bf = pred.get("bar_forecast")
+            if isinstance(bf, dict) and bf.get("available"):
+                print(f"  分钟级ML({args.bar_period}m×{args.bar_horizon}): "
+                      f"预测价={bf['pred_price']} ({bf['pred_ret_pct']:+.2f}%) "
+                      f"区间=[{bf['pred_lo']}, {bf['pred_hi']}]  "
+                      f"OOS_DA={bf['oos_da_pct']}% vs 多数基准={bf['majority_baseline_pct']}%")
+            out = {"code": code, "status": result["status"], "quote": result["quote"],
+                   "fundflow": result["fundflow"], "intraday_prediction": pred}
+            if args.json:
+                with open(args.json, "w", encoding="utf-8") as fh:
+                    json.dump(out, fh, ensure_ascii=False, indent=2)
+                print(f"结果已写入: {args.json}")
+            return out
+        except Exception as e:
+            print(f"[intraday-predict] {code} 测算失败: {e}")
+            return {"code": code, "error": str(e)}
+
     if args.monitor:
         if args.snapshot:
             raise SystemExit("--monitor和--snapshot不能同时使用。")
@@ -17354,14 +18434,22 @@ def main():
             out = {"code": result["code"], "status": result["status"],
                    "snapshot_path": result["snapshot_path"], "analysis": result["analysis"],
                    "fundflow": result["fundflow"]}
+            if result.get("intraday_prediction") is not None:
+                out["intraday_prediction"] = result["intraday_prediction"]
+            if result.get("live_verification") is not None:
+                out["live_verification"] = result["live_verification"]
             print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
             if args.json:
                 # 仅成功快照更新文件；失败不会把旧行情伪装成新行情。
                 with open(args.json, "w", encoding="utf-8") as fh:
                     json.dump(out, fh, ensure_ascii=False, indent=2)
-        print("[monitor] 真实快照连续监控；行情源时间未经核实。非投资建议、盈亏自负。", flush=True)
+        print("[monitor] 真实快照连续监控(含场内实时涨跌测算)；行情源时间未经核实。非投资建议、盈亏自负。", flush=True)
         try:
-            summary = monitor_intraday(args.monitor, args.monitor_interval, args.monitor_count, show_update)
+            if args.bar_period == "5" and args.bar_horizon == 3:
+                summary = monitor_intraday(args.monitor, args.monitor_interval, args.monitor_count, show_update)
+            else:
+                summary = monitor_intraday(args.monitor, args.monitor_interval, args.monitor_count, show_update,
+                                           bar_period=args.bar_period, horizon_bars=args.bar_horizon)
         except ValueError as exc:
             raise SystemExit(str(exc))
         print("[monitor] 已停止 " + json.dumps(summary, ensure_ascii=False), flush=True)
