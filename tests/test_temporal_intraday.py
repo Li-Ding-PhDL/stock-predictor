@@ -1023,3 +1023,41 @@ def test_exchange_routing_watchlist_and_batch_scan(monkeypatch):
         assert 'id="wsel"' in w_html and 'id="bookGrid"' in w_html and 'id="widx"' in w_html
     finally:
         srv.stop()
+
+
+def test_real_orderbook_wall_trap_seal_ratio_and_outer_inner():
+    # 1) 买一单档大托单(>58%)但内盘抛压重(外盘<48.5%) -> 触发诱多托单警示，折算资金金额与委比准确
+    q_trap = {
+        "price": 8.32, "open": 8.85, "high": 9.03, "low": 8.25, "prev": 9.14, "avg": 8.53,
+        "vol": 322365.0, "amount": 2.75e8, "outer_vol": 150000.0, "inner_vol": 172365.0,
+        "limit_up": 10.05, "limit_down": 8.23, "book_volume_unit": "手",
+        "bids": [(8.31, 3213), (8.30, 120), (8.29, 80), (8.28, 70), (8.27, 60)],
+        "asks": [(8.32, 199), (8.33, 299), (8.34, 68), (8.35, 110), (8.36, 23)],
+    }
+    res_trap = s.compute_intraday_realtime_prediction(q_trap)
+    assert res_trap["weibi_pct"] > 50.0
+    assert res_trap["buy_total_wan"] > 280.0 and res_trap["sell_total_wan"] > 50.0
+    assert res_trap["active_buy_pct"] < 48.0 and res_trap["bid_wall_ratio_pct"] > 80.0
+    assert res_trap["price_pos_pct"] < 15.0
+    assert res_trap["book_alert"] and "诱多" in res_trap["book_alert"]
+
+    # 2) 涨停封单占成交额 < 2% -> 提醒封板偏弱防开板
+    q_zt = {
+        "price": 3.74, "open": 3.65, "high": 3.74, "low": 3.50, "prev": 3.40, "avg": 3.66,
+        "vol": 10825081.0, "amount": 39.57e8, "outer_vol": 5423747.0, "inner_vol": 5401333.0,
+        "limit_up": 3.74, "limit_down": 3.06, "book_volume_unit": "手",
+        "bids": [(3.74, 77032), (3.73, 10912), (3.72, 2210), (3.71, 924), (3.70, 5648)],
+        "asks": [(0.0, 0), (0.0, 0), (0.0, 0), (0.0, 0), (0.0, 0)],
+    }
+    res_zt = s.compute_intraday_realtime_prediction(q_zt)
+    assert "涨停" in res_zt["limit_state"]
+    assert 2800.0 <= res_zt["seal_amount_wan"] <= 2900.0
+    assert 0.5 <= res_zt["seal_to_amount_pct"] <= 1.0
+    assert res_zt["book_alert"] and "防开板" in res_zt["book_alert"]
+
+    # 3) 连续快照增量内外盘 Δouter > Δinner 增强偏多评分
+    q_prev = dict(q_trap, outer_vol=150000.0, inner_vol=172000.0)
+    q_next = dict(q_trap, outer_vol=158000.0, inner_vol=172200.0, price=8.36)
+    res_mom = s.compute_intraday_realtime_prediction(q_next, snapshots=[q_prev, q_next])
+    names = {f["name"]: f for f in res_mom["factors"]}
+    assert "内外盘主动买卖比" in names and names["内外盘主动买卖比"]["bias"] == "偏多"

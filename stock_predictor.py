@@ -1550,6 +1550,7 @@ class StockDataFetcher:
             "price": price, "pct": tp(32), "chg": tp(31),
             "open": tp(5), "high": tp(33), "low": tp(34), "prev": tp(4),
             "avg": tp(51), "vol": tp(6), "amount": amt,
+            "outer_vol": tp(7), "inner_vol": tp(8),
             "turnover": tp(38), "vol_ratio": tp(49),
             "limit_up": tp(47), "limit_down": tp(48), "book_volume_unit": "手",
             "received_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -1658,7 +1659,7 @@ class StockDataFetcher:
             raise RuntimeError("实时行情需要requests，请安装：pip install requests") from exc
         fields = ("f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,"
                   "f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,"
-                  "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f71,f168,f169,f170,f530")
+                  "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f57,f58,f60,f71,f161,f168,f169,f170,f530")
         em_px, tx_px = StockDataFetcher._exchange_market(code)
         def request():
             response = requests.get("https://push2.eastmoney.com/api/qt/stock/get",
@@ -1712,6 +1713,7 @@ class StockDataFetcher:
             "price": g("f43"), "pct": g("f170"), "chg": g("f169"),
             "open": g("f46"), "high": g("f44"), "low": g("f45"), "prev": g("f60"),
             "avg": g("f71"), "vol": g("f47"), "amount": g("f48"),
+            "outer_vol": g("f49"), "inner_vol": g("f161"),
             "turnover": g("f168"), "vol_ratio": g("f50"),
             "limit_up": g("f51"), "limit_down": g("f52"), "book_volume_unit": "手",
             "received_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -6962,6 +6964,71 @@ def compute_intraday_realtime_prediction(
             "detail": "统计滞后数秒，存在主力对倒/骗线可能，权重受限",
         })
 
+    # 4b) 内外盘主动买卖脉冲(真实主动吃单：外盘 vs 内盘，仅当行情包含 outer_vol/inner_vol 时启用)
+    outer_v = _num(q.get("outer_vol"))
+    inner_v = _num(q.get("inner_vol"))
+    active_buy_pct = None
+    if outer_v is not None and inner_v is not None and (outer_v + inner_v) > 0:
+        active_buy_pct = outer_v / (outer_v + inner_v) * 100.0
+        # 若有连续快照且内外盘单调递增，优先看边际增量 Δouter vs Δinner
+        delta_ab = None
+        if snaps:
+            prev_oi = [(_num(s.get("outer_vol")), _num(s.get("inner_vol"))) for s in snaps[:-1]]
+            prev_oi = [(o, iv) for o, iv in prev_oi if o is not None and iv is not None]
+            if prev_oi:
+                do = outer_v - prev_oi[0][0]
+                di = inner_v - prev_oi[0][1]
+                if do >= 0 and di >= 0 and (do + di) > 0:
+                    delta_ab = (do - di) / (do + di)
+        if delta_ab is not None:
+            sig_oi = float(np.clip(delta_ab, -1.0, 1.0))
+            oi_str = f"边际主动买 {(delta_ab + 1.0) * 50.0:.1f}% (累计外盘{active_buy_pct:.1f}%)"
+        else:
+            # 当日累计内外盘，温和缩放避免尾盘僵化
+            sig_oi = float(np.tanh((active_buy_pct - 50.0) / 15.0))
+            oi_str = f"外盘{outer_v:.0f}手 vs 内盘{inner_v:.0f}手 (买占{active_buy_pct:.1f}%)"
+        weighted_signals.append((sig_oi, 0.12))
+        factors.append({
+            "name": "内外盘主动买卖比",
+            "value": oi_str,
+            "signal": round(sig_oi, 3),
+            "weight": 0.12,
+            "bias": "偏多" if sig_oi > 0.1 else ("偏空" if sig_oi < -0.1 else "中性"),
+            "detail": "按主动成交外盘(买一上吃)与内盘(卖一下砸)识别真成交方向",
+        })
+
+    # 真实五档资金额(万元)、委比/委差、单档大托单/压单集中度、涨跌停封单稳固度
+    b_hands = [float(v) for p_v, v in bids if p_v is not None and v is not None and v >= 0]
+    a_hands = [float(v) for p_v, v in asks if p_v is not None and v is not None and v >= 0]
+    buy_total_hands = sum(b_hands)
+    sell_total_hands = sum(a_hands)
+    weicha_hands = buy_total_hands - sell_total_hands
+    weibi_pct = (weicha_hands / (buy_total_hands + sell_total_hands) * 100.0) if (buy_total_hands + sell_total_hands) > 0 else None
+    buy_total_wan = sum(float(p_v) * float(v) * 100.0 / 10000.0 for p_v, v in bids if p_v is not None and v is not None and v >= 0)
+    sell_total_wan = sum(float(p_v) * float(v) * 100.0 / 10000.0 for p_v, v in asks if p_v is not None and v is not None and v >= 0)
+    bid_wall_ratio_pct = (max(b_hands) / buy_total_hands * 100.0) if buy_total_hands > 0 else None
+    ask_wall_ratio_pct = (max(a_hands) / sell_total_hands * 100.0) if sell_total_hands > 0 else None
+
+    amt_tot = _num(q.get("amount"), True)
+    seal_amount_wan = None
+    seal_to_amount_pct = None
+    if bids and bids[0][0] is not None and bids[0][1] is not None and "涨停" in limit_state:
+        seal_amount_wan = float(bids[0][0]) * float(bids[0][1]) * 100.0 / 10000.0
+        if amt_tot:
+            seal_to_amount_pct = seal_amount_wan * 10000.0 / amt_tot * 100.0
+    elif asks and asks[0][0] is not None and asks[0][1] is not None and "跌停" in limit_state:
+        seal_amount_wan = float(asks[0][0]) * float(asks[0][1]) * 100.0 / 10000.0
+        if amt_tot:
+            seal_to_amount_pct = seal_amount_wan * 10000.0 / amt_tot * 100.0
+
+    book_alert = None
+    if "涨停" in limit_state and seal_to_amount_pct is not None and seal_to_amount_pct < 2.0:
+        book_alert = f"涨停封单 {seal_amount_wan:.0f}万，仅占成交额 {seal_to_amount_pct:.2f}% (<2%)，封板偏弱需防开板"
+    elif bid_wall_ratio_pct is not None and bid_wall_ratio_pct >= 58.0 and active_buy_pct is not None and active_buy_pct < 48.5:
+        book_alert = f"买盘单档巨量托单(占五档 {bid_wall_ratio_pct:.0f}%)，但外盘主动买仅 {active_buy_pct:.1f}%，谨防大托单撤单诱多"
+    elif ask_wall_ratio_pct is not None and ask_wall_ratio_pct >= 58.0 and active_buy_pct is not None and active_buy_pct > 52.5:
+        book_alert = f"卖盘单档集中压单(占五档 {ask_wall_ratio_pct:.0f}%)，但外盘主动吃单占优({active_buy_pct:.1f}%)"
+
     # 5) 分钟级样本外ML预测(若可用)
     bf = bar_forecast if isinstance(bar_forecast, dict) and bar_forecast.get("available") else None
     if bf is not None:
@@ -7011,6 +7078,19 @@ def compute_intraday_realtime_prediction(
         "tick_mom_pct": round(tick_mom_pct, 4) if tick_mom_pct is not None else None,
         "book_delta_pct": round(book_delta_pct, 2) if book_delta_pct is not None else None,
         "delta_main_net": round(delta_main, 2) if delta_main is not None else None,
+        "weibi_pct": round(weibi_pct, 2) if weibi_pct is not None else None,
+        "weicha_hands": round(weicha_hands, 0),
+        "buy_total_wan": round(buy_total_wan, 2),
+        "sell_total_wan": round(sell_total_wan, 2),
+        "outer_vol": round(outer_v, 0) if outer_v is not None else None,
+        "inner_vol": round(inner_v, 0) if inner_v is not None else None,
+        "active_buy_pct": round(active_buy_pct, 1) if active_buy_pct is not None else None,
+        "bid_wall_ratio_pct": round(bid_wall_ratio_pct, 1) if bid_wall_ratio_pct is not None else None,
+        "ask_wall_ratio_pct": round(ask_wall_ratio_pct, 1) if ask_wall_ratio_pct is not None else None,
+        "seal_amount_wan": round(seal_amount_wan, 2) if seal_amount_wan is not None else None,
+        "seal_to_amount_pct": round(seal_to_amount_pct, 2) if seal_to_amount_pct is not None else None,
+        "price_pos_pct": round(float(base["range_position_pct"]), 1) if base["range_position_pct"] is not None else None,
+        "book_alert": book_alert,
         "n_active_factors": len(factors),
         "factors": factors,
         "bar_forecast": bf,
@@ -7288,6 +7368,7 @@ def write_snapshot(code: str, q: Dict[str, Any]) -> str:
             p, v = level if isinstance(level, (list, tuple)) and len(level) == 2 else (None, None)
             row[f"{prefix}{i}_p"], row[f"{prefix}{i}_v"] = p, v
     row.update({key: q.get(key) for key in ("received_at", "open", "high", "low", "prev", "avg", "vol", "amount",
+                                         "outer_vol", "inner_vol",
                                          "main_net", "main_pct", "xl_net", "l_net", "m_net", "s_net",
                                          "fundflow_received_at", "book_volume_unit")})
     with _SNAPSHOT_WRITE_LOCK:
@@ -7561,6 +7642,8 @@ def _parse_snapshot_csv_rows(path: str) -> Tuple[List[Dict[str, Any]], int]:
                 "vs_avg_pct": ((price / avg - 1.0) * 100.0) if avg else None,
                 "vol": _fnum(r.get("vol")),
                 "amount": _fnum(r.get("amount")),
+                "outer_vol": _fnum(r.get("outer_vol")),
+                "inner_vol": _fnum(r.get("inner_vol")),
                 "main_net": _fnum(r.get("main_net")),
                 "main_pct": _fnum(r.get("main_pct")),
                 "book_volume_unit": "手",
@@ -7665,6 +7748,7 @@ def evaluate_orderbook_accuracy(
                 "micro_edge_bps": pred.get("micro_edge_bps"),
                 "book_delta_pct": pred.get("book_delta_pct"),
                 "vs_avg_pct": cur.get("vs_avg_pct"),
+                "active_buy_pct": pred.get("active_buy_pct"),
             })
 
     n_pairs = len(paired_events)
@@ -7724,6 +7808,7 @@ def evaluate_orderbook_accuracy(
         ("微价格偏离(MicroPrice)", lambda e: 1 if (e["micro_edge_bps"] is not None and e["micro_edge_bps"] > 0) else (-1 if (e["micro_edge_bps"] is not None and e["micro_edge_bps"] < 0) else 0)),
         ("挂单增减动量(BookDelta)", lambda e: 1 if (e["book_delta_pct"] is not None and e["book_delta_pct"] > 0) else (-1 if (e["book_delta_pct"] is not None and e["book_delta_pct"] < 0) else 0)),
         ("分时均价偏离(vs_avg)", lambda e: 1 if (e["vs_avg_pct"] is not None and e["vs_avg_pct"] > 0) else (-1 if (e["vs_avg_pct"] is not None and e["vs_avg_pct"] < 0) else 0)),
+        ("内外盘主动买比(Outer-Inner)", lambda e: 1 if (e["active_buy_pct"] is not None and e["active_buy_pct"] > 50.0) else (-1 if (e["active_buy_pct"] is not None and e["active_buy_pct"] < 50.0) else 0)),
     ]
     signals = [_eval_signal(lbl, fn) for lbl, fn in signal_specs]
 
@@ -8310,6 +8395,7 @@ class AutoAnalysisService:
                 "price": q.get("price"), "pct": q.get("pct"), "chg": q.get("chg"),
                 "open": q.get("open"), "high": q.get("high"), "low": q.get("low"),
                 "prev": q.get("prev"), "avg": q.get("avg"), "vol": q.get("vol"),
+                "amount": q.get("amount"), "outer_vol": q.get("outer_vol"), "inner_vol": q.get("inner_vol"),
                 "turnover": q.get("turnover"), "vol_ratio": q.get("vol_ratio"),
                 "bids": q.get("bids"), "asks": q.get("asks"),
             },
@@ -8826,6 +8912,15 @@ function renderActive(d) {{
     }}
   }}
   const traceHtml = sparkSvg(liveTrace[a.code], q.avg);
+  const wbTxt = p.weibi_pct != null ? `${{p.weibi_pct>=0?'+':''}}${{p.weibi_pct}}%` : '--';
+  const abTxt = p.active_buy_pct != null ? `${{p.active_buy_pct}}%` : '--';
+  const posTxt = p.price_pos_pct != null ? `${{p.price_pos_pct}}%` : '--';
+  const bookMetricsHtml = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px;font-size:11px;text-align:center">` +
+    `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">五档委比</div><b class="${{(p.weibi_pct||0)>=0?'up':'dn'}}">${{wbTxt}}</b></div>` +
+    `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">买/卖五档(万)</div><b>${{p.buy_total_wan ?? '-'}}/${{p.sell_total_wan ?? '-'}}</b></div>` +
+    `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">外盘主动买</div><b class="${{(p.active_buy_pct||50)>=50?'up':'dn'}}">${{abTxt}}</b></div>` +
+    `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">价位指数</div><b>${{posTxt}}</b></div>` +
+    `</div>` + (p.book_alert ? `<div style="margin-top:6px;padding:6px 8px;border-radius:8px;background:#451a03;color:#fde68a;font-size:12px">⚠ ${{p.book_alert}}</div>` : '');
 
   box.innerHTML = `
     <div class="row">
@@ -8848,6 +8943,7 @@ function renderActive(d) {{
       <span class="muted">微价 ${{p.micro_price ?? '-'}} | 失衡 ${{p.weighted_obi_pct ?? '-'}}%</span>
       <b class="dn">P(跌) ${{p.p_down_pct}}%</b>
     </div>
+    ${{bookMetricsHtml}}
     ${{traceHtml}}
     ${{bfHtml}}
     ${{verHtml}}
@@ -9091,19 +9187,37 @@ async function tick() {{
     document.getElementById('foot').textContent = `${{ml}}${{obi}} | 微价:${{p.micro_price ?? '-'}}${{hit}}`;
 
     const bids = (q.bids || []).slice(0, 5), asks = (q.asks || []).slice(0, 5);
+    const fmtAmt = (pr, h) => {{
+      const p0 = Number(pr), h0 = Number(h);
+      if (!p0 || !h0 || !isFinite(p0) || !isFinite(h0)) return '0';
+      const yuan = p0 * h0 * 100.0;
+      if (yuan >= 1e8) return (yuan / 1e8).toFixed(2) + '亿';
+      if (yuan >= 1e4) return (yuan / 1e4).toFixed(1) + '万';
+      return Math.round(yuan) + '元';
+    }};
     const maxV = Math.max(1, ...bids.map(x => Number(x[1])||0), ...asks.map(x => Number(x[1])||0));
+    const maxBV = Math.max(0, ...bids.map(x => Number(x[1])||0));
+    const maxAV = Math.max(0, ...asks.map(x => Number(x[1])||0));
     if (bids.length || asks.length) {{
       document.getElementById('bookWrap').style.display = 'block';
-      document.getElementById('vwapInfo').textContent = q.avg != null ? `均价 ${{Number(q.avg).toFixed(3)}}` : '';
-      const bCol = bids.map((r, idx) => {{
-        const w = Math.round(((Number(r[1])||0) / maxV) * 100);
-        return `<div class="brow" style="background:linear-gradient(90deg, rgba(214,48,49,0.22) ${{w}}%, #0f172a ${{w}}%)"><span class="up">买${{idx+1}} ${{r[0] ?? '-'}}</span><b>${{r[1] ?? 0}}</b></div>`;
+      const wbS = p.weibi_pct != null ? `委比${{p.weibi_pct>=0?'+':''}}${{p.weibi_pct}}%` : '';
+      const abS = p.active_buy_pct != null ? ` | 外盘${{p.active_buy_pct}}%` : '';
+      const posS = p.price_pos_pct != null ? ` | 价位${{p.price_pos_pct}}%` : '';
+      document.getElementById('vwapInfo').textContent = (q.avg != null ? `均价${{Number(q.avg).toFixed(3)}} ` : '') + wbS + abS + posS;
+      const askLadder = [4, 3, 2, 1, 0].filter(i => i < asks.length).map(i => {{
+        const r = asks[i], v = Number(r[1])||0, w = Math.round((v / maxV) * 100);
+        const hi = v > 0 && v === maxAV ? 'background:rgba(0,184,148,0.28);padding:0 3px;border-radius:3px' : '';
+        return `<div class="brow" style="background:linear-gradient(270deg, rgba(0,184,148,0.20) ${{w}}%, #0f172a ${{w}}%)"><span class="dn">卖${{i+1}} ${{r[0] ?? '-'}}</span><span style="${{hi}}"><b>${{fmtAmt(r[0], v)}}</b> <span class="mu">(${{v}}手)</span></span></div>`;
       }}).join('');
-      const aCol = asks.map((r, idx) => {{
-        const w = Math.round(((Number(r[1])||0) / maxV) * 100);
-        return `<div class="brow" style="background:linear-gradient(270deg, rgba(0,184,148,0.22) ${{w}}%, #0f172a ${{w}}%)"><span class="dn">卖${{idx+1}} ${{r[0] ?? '-'}}</span><b>${{r[1] ?? 0}}</b></div>`;
+      const midRow = `<div class="top" style="margin:4px 0;padding:3px 6px;background:#1e293b;border-radius:6px;font-size:11px"><span class="${{cls}}">现价 ${{q.price ?? '-'}}</span><span class="mu">买五 ${{p.buy_total_wan ?? '-'}}万 / 卖五 ${{p.sell_total_wan ?? '-'}}万</span></div>`;
+      const bidLadder = [0, 1, 2, 3, 4].filter(i => i < bids.length).map(i => {{
+        const r = bids[i], v = Number(r[1])||0, w = Math.round((v / maxV) * 100);
+        const hi = v > 0 && v === maxBV ? 'background:rgba(214,48,49,0.32);padding:0 3px;border-radius:3px' : '';
+        return `<div class="brow" style="background:linear-gradient(90deg, rgba(214,48,49,0.20) ${{w}}%, #0f172a ${{w}}%)"><span class="up">买${{i+1}} ${{r[0] ?? '-'}}</span><span style="${{hi}}"><b>${{fmtAmt(r[0], v)}}</b> <span class="mu">(${{v}}手)</span></span></div>`;
       }}).join('');
-      document.getElementById('bookGrid').innerHTML = `<div>${{bCol}}</div><div>${{aCol}}</div>`;
+      const alertHtml = p.book_alert ? `<div style="margin-top:4px;padding:4px 6px;border-radius:6px;background:#451a03;color:#fde68a;font-size:11px">⚠ ${{p.book_alert}}</div>` : '';
+      document.getElementById('bookGrid').style.display = 'block';
+      document.getElementById('bookGrid').innerHTML = askLadder + midRow + bidLadder + alertHtml;
     }}
   }} catch (e) {{}}
 }}

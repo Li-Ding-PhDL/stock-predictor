@@ -29,6 +29,10 @@
 - **手机端实时看板 + 同花顺屏幕显示 + 盘口实测复盘方案**：
   - 新增零额外依赖内置手机 Web 服务（`python stock_predictor.py --web --web-port 8765`，手机浏览器访问完整版 `/` 或安卓分屏/小窗打开同花顺悬浮条 `/widget`，后台 `AutoAnalysisService` 自动定时轮询计算——**默认自动把五档买手/卖手快照落盘到 `monitor_log/monitor_{code}_{day}.csv`（可用 `--no-persist` 关闭）、休市自动降频待机防刷接口、支持股票中文简称 `f58`、手机端支持暂停/立即刷新与一键日线预测后台异步执行、到期盘中预测自动落盘到 `monitor_log/intraday_verify_*.csv` 并支持分档校准统计 `/api/intraday_calibration`**，可选 `--push` 阈值推送；安卓手机亦可通过 `scripts/termux_mobile_start.sh` 在 Termux 本机直接运行）。
   - **买手/卖手盘口实盘效果回放检验（因果防泄露）**：新增 `evaluate_orderbook_accuracy` 与命令行 `python stock_predictor.py --eval-orderbook --eval-horizon 60 --json monitor_log/orderbook_eval.json`（及手机网页 `/orderbook_eval`、自动化脚本 `scripts/盘中自动收集与收盘复盘.bat`），严格按时间顺序回放已收集的买一~买五/卖一~卖五快照（过滤缺失“手”单位的旧记录），拆解 **综合实时评分 / 加权五档失衡(W-OBI) / 微价格偏离(MicroPrice) / 挂单增减动量(BookDelta) / 分时均价偏离** 对未来 60 秒真实涨跌的方向准确率，强制对比**多数类基准(`总是涨`/`总是跌`)**与显著性检验，并分 `强买盘 / 偏多 / 均衡 / 偏空 / 强卖盘` 展示实际涨占比与均值(bps)。
+  - **真实 Level-1/2 买手卖手实盘风控特征与盘口阶梯**（借鉴同花顺个股实盘五档视图）：
+    - 解析东财（`f49`/`f161`）与腾讯（`outer_vol`/`inner_vol`）真实**外盘主动买 vs 内盘主动卖**手数，纳入盘中多因子打分与 `--eval-orderbook` 回放对比。
+    - 计算**五档委比/委差、买/卖五档委托资金额（万元/亿元）、分时价位指数(0~100%)、单档异常大托/压单集中度**与**涨停封单金额占成交额%**；当出现「买盘单档高集中大托单但外盘主动买偏弱」或「涨停封单不足成交额 2%」时主动给出**诱多/防开板**风控提醒。
+    - 悬浮窗 `/widget` 升级为同花顺式上下垂直 **卖5→卖1 / 现价均价委比分界条 / 买1→买5** 真实盘口阶梯（同时展示折合资金额 `万/亿`、手数及最大挂单档高亮）。
   - **Agent Skill 与 A 股情绪温度计 + 可视化看板增强**（借鉴同花顺 Skill 广场/低估定投/涨停复盘的结构化长处，剔除夸大涨停概率营销）：
     - 新增 [skills/stock-monitor/SKILL.md](skills/stock-monitor/SKILL.md) Agent Skill，可直接在兼容 `SKILL.md` 的 AI 助手里调度盘中采集、买手/卖手因果回放、估值温度体检与情绪复盘。
     - 新增 `fetch_market_sentiment_snapshot`、`--market-mood` CLI 与 `/api/market_mood`（基于东方财富涨停/炸板/昨涨停池实时统计：**连板高度阶梯、涨停与封板率、昨日涨停今平均溢价、涨停聚集热点行业 Top4**，纯描述统计）。
