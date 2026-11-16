@@ -606,16 +606,25 @@ def test_generate_ths_formula_and_export_cli(tmp_path, monkeypatch):
     ths = s.generate_ths_formula("MY_THS")
     assert ths["name"] == "MY_THS"
     assert "MA(CLOSE, 5)" in ths["formula"]
-    assert "量化多空分" in ths["formula"]
+    assert "涨倾向" in ths["formula"]
+    assert "盘中涨分" in ths["intraday_formula"]
+    assert "POINTDOT" in ths["formula"]
     assert "非买卖信号" in ths["formula"]
     assert len(ths["guide"]) >= 4
+
+    # 带入历史行情时进行样本外校验并输出数据校准权重
+    raw = s.StockDataFetcher.generate_synthetic_data(n_days=220)
+    ths_fit = s.generate_ths_formula("FIT_THS", df=raw, horizon=1)
+    assert ths_fit["oos_eval"] is not None
+    assert 0.0 <= ths_fit["oos_eval"]["oos_da_pct"] <= 100.0
+    assert "样本外DA=" in ths_fit["formula"]
 
     out_txt = tmp_path / "ths.txt"
     monkeypatch.setattr(sys, "argv", ["stock_predictor.py", "--export-ths", str(out_txt)])
     res = s.main()
     assert res["name"] == "SP_QUANT"
     content = out_txt.read_text(encoding="utf-8")
-    assert "量化多空分" in content and "云同步" in content
+    assert "涨倾向" in content and "盘中涨分" in content and "云同步" in content
 
 
 def test_mobile_web_server_and_auto_analysis_service(monkeypatch):
@@ -654,7 +663,7 @@ def test_mobile_web_server_and_auto_analysis_service(monkeypatch):
         assert state["active"]["intraday_prediction"]["p_up_pct"] > 0
 
         ths_api = json.loads(urllib.request.urlopen(f"{base}/api/ths_formula?token=secret42", timeout=3).read().decode("utf-8"))
-        assert "量化多空分" in ths_api["formula"]
+        assert "涨倾向" in ths_api["formula"] and "盘中涨分" in ths_api["intraday_formula"]
 
         # POST /api/watch 动态切换/添加监控代码
         req = urllib.request.Request(

@@ -7254,17 +7254,99 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
 
 
 # ==================== 第八部分补充6b：手机移动端自动分析服务 + 同花顺浮窗/副图公式 ====================
-def generate_ths_formula(name: str = "SP_QUANT") -> Dict[str, Any]:
-    """生成可直接粘贴进【同花顺 PC/手机云公式】的副图技术指标源码。
+def _ths_fit_linear_weights(df: Optional[pd.DataFrame], horizon: int = 1) -> Tuple[Dict[str, float], Optional[Dict[str, Any]]]:
+    """用因果时间序列切分与 Ridge 回归，为同花顺公式的 6 个平稳量价特征拟合数据校准权重。
 
-    诚实边界：同花顺原生公式引擎只支持量价序列与内置函数，不能直接运行 Python sklearn/GBRT 或
-    实时五档盘口机器学习；本公式将本平台已验证的平稳量价特征（均线偏离、波幅调整动量、有向成交量流、
-    归一化MACD、超跌首阳）翻译为同花顺副图语法，配合同花顺「云同步公式」即可直接在手机同花顺 K 线/
-    分时副图屏幕上显示。如需完整五档+分钟ML实时计算，请同时开启 `--web` 的 `/widget` 悬浮窗页面。
+    仅在传入有效 df (>=120 行) 时拟合，并严格报告样本外 OOS DA 与多数类基准对照；
+    样本不足或未传 df 时返回均衡默认权重。
     """
+    defaults = {"ma_dev": 5.0, "ema_dev": 6.0, "ret_z5": 16.0, "obv_flow": 0.35, "macd_n": 2.2, "pos20": 0.35}
+    if df is None or len(df) < max(120, horizon + 80):
+        return defaults, None
+    try:
+        work = df.copy()
+        cl = pd.to_numeric(work["close"], errors="coerce").astype(float)
+        hi = pd.to_numeric(work["high"], errors="coerce").astype(float)
+        lo = pd.to_numeric(work["low"], errors="coerce").astype(float)
+        vol = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0).astype(float)
+        ma5 = cl.rolling(5).mean()
+        ma20 = cl.rolling(20).mean()
+        ema5 = cl.ewm(span=5, adjust=False).mean()
+        ema20 = cl.ewm(span=20, adjust=False).mean()
+        dif = cl.ewm(span=12, adjust=False).mean() - cl.ewm(span=26, adjust=False).mean()
+        dea = dif.ewm(span=9, adjust=False).mean()
+        macdh = (dif - dea) * 2.0
+        ret1 = (cl / (cl.shift(1) + 1e-9) - 1.0) * 100.0
+        ret5 = (cl / (cl.shift(5) + 1e-9) - 1.0) * 100.0
+        volat = ret1.rolling(20).std() + 0.01
+        sgn_v = np.sign(cl.diff().fillna(0.0)) * vol
+        hh20 = hi.rolling(20).max()
+        ll20 = lo.rolling(20).min()
+
+        feats = pd.DataFrame({
+            "ma_dev": (ma5 / (ma20 + 1e-9) - 1.0) * 100.0,
+            "ema_dev": (ema5 / (ema20 + 1e-9) - 1.0) * 100.0,
+            "ret_z5": ret5 / (volat * np.sqrt(5.0)),
+            "obv_flow": sgn_v.rolling(10).sum() / (vol.rolling(10).sum() + 1e-9) * 100.0,
+            "macd_n": macdh / (cl + 1e-9) * 1000.0,
+            "pos20": ((cl - ll20) / (hh20 - ll20 + 1e-9) - 0.5) * 100.0,
+            "fwd_ret": cl.shift(-horizon) / (cl + 1e-9) - 1.0,
+        }).replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+
+        if len(feats) < 80:
+            return defaults, None
+        cols = ["ma_dev", "ema_dev", "ret_z5", "obv_flow", "macd_n", "pos20"]
+        X = feats[cols].to_numpy(dtype=float)
+        y = feats["fwd_ret"].to_numpy(dtype=float)
+        split = int(len(X) * 0.7)
+        tr_end = split - max(1, int(horizon))
+        if tr_end < 40 or (len(X) - split) < 20:
+            return defaults, None
+
+        sx = StandardScaler().fit(X[:tr_end])
+        X_tr = sx.transform(X[:tr_end])
+        X_te = sx.transform(X[split:])
+        y_tr, y_te = y[:tr_end], y[split:]
+        model = Ridge(alpha=100.0, random_state=RANDOM_SEED).fit(X_tr, y_tr)
+        pred_te = model.predict(X_te)
+        up_rate = float(np.mean(y_te > 0) * 100.0)
+        maj = max(up_rate, 100.0 - up_rate)
+        oos_da = float(np.mean((y_te > 0) == (pred_te > 0)) * 100.0)
+
+        # 用全量样本拟合后的系数还原到原始特征量纲，再缩放到合理的分数尺度 [-100, +100]
+        sx_all = StandardScaler().fit(X)
+        m_all = Ridge(alpha=100.0, random_state=RANDOM_SEED).fit(sx_all.transform(X), y)
+        raw_coef = m_all.coef_ / np.maximum(sx_all.scale_, 1e-6)
+        raw_score_std = float(np.std(X @ raw_coef)) + 1e-9
+        scale = 35.0 / raw_score_std
+        calibrated = {c: round(float(np.clip(raw_coef[i] * scale, -30.0, 30.0)), 3) for i, c in enumerate(cols)}
+        eval_info = {
+            "n_train": int(tr_end), "n_oos": int(len(y_te)),
+            "oos_da_pct": round(oos_da, 2), "majority_baseline_pct": round(maj, 2),
+            "excess_da_pct": round(oos_da - maj, 2),
+        }
+        return calibrated, eval_info
+    except Exception:
+        return defaults, None
+
+
+def generate_ths_formula(name: str = "SP_QUANT", df: Optional[pd.DataFrame] = None,
+                         horizon: int = 1) -> Dict[str, Any]:
+    """生成可直接粘贴进【同花顺 PC/手机云公式】的副图技术指标源码（含通用K线版 + 盘中超短线版）。
+
+    诚实边界：同花顺原生公式引擎只支持量价序列与内置函数，不能直接运行 Python GBRT/RF 或
+    实时五档盘口机器学习；本公式使用 100% 兼容同花顺手机端云同步的语法，将平稳量价特征映射为
+    [25, 75] 的 `涨倾向` 参考线（50 为多空分界），传入 df 时可附带 Ridge 数据校准权重与样本外 DA。
+    """
+    w, oos_eval = _ths_fit_linear_weights(df, horizon=horizon)
+    calib_note = (
+        f"{{ 数据校准权重(样本外DA={oos_eval['oos_da_pct']}% vs 多数基准={oos_eval['majority_baseline_pct']}%) }}"
+        if oos_eval else "{ 通用均衡平稳权重 }"
+    )
     formula_code = (
-        "{ " + str(name) + " · 量化平稳动量与量价副图（仅供研究参考，非买卖信号，盈亏自负） }\n"
-        "{ 适用：同花顺 PC端 公式管理 -> 新建技术指标(副图) -> 开启云同步 -> 手机同花顺直接显示 }\n"
+        "{ " + str(name) + " · 通用K线量化涨跌倾向副图（日线/5分钟/1分钟全适用，仅供研究，非买卖信号，盈亏自负） }\n"
+        "{ 导入路径：同花顺PC端 Ctrl+F 公式管理 -> 技术指标 -> 新建(画线方法:副图) -> 云同步 -> 手机同花顺直接显示 }\n"
+        + calib_note + "\n"
         "MA5 := MA(CLOSE, 5);\n"
         "MA20 := MA(CLOSE, 20);\n"
         "EMA5 := EMA(CLOSE, 5);\n"
@@ -7283,37 +7365,72 @@ def generate_ths_formula(name: str = "SP_QUANT") -> Dict[str, Any]:
         "VOLAT := STD(RET1, 20) + 0.01;\n"
         "RET_Z5 := RET5 / (VOLAT * SQRT(5));\n"
         "\n"
-        "{ 3) 10期有向成交量流 OBV_SLOPE }\n"
-        "SGN_VOL := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));\n"
-        "OBV_FLOW := SUM(SGN_VOL, 10) / (SUM(VOL, 10) + 0.0001) * 100;\n"
+        "{ 3) 10期有向成交量流 OBV_FLOW }\n"
+        "SGN_V := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));\n"
+        "OBV_FLOW := SUM(SGN_V, 10) / (SUM(VOL, 10) + 0.0001) * 100;\n"
         "\n"
-        "{ 4) 归一化 MACD 柱 }\n"
+        "{ 4) 归一化 MACD 柱 与 20期区间位置 }\n"
         "MACD_N := MACDH / (CLOSE + 0.0001) * 1000;\n"
+        "HH20 := HHV(HIGH, 20);\n"
+        "LL20 := LLV(LOW, 20);\n"
+        "POS20 := ((CLOSE - LL20) / (HH20 - LL20 + 0.0001) - 0.5) * 100;\n"
         "\n"
-        "{ 合成平稳量化得分 [-100, +100] }\n"
-        "RAW_SCORE := 8 * MA_DEV + 8 * EMA_DEV + 22 * RET_Z5 + 0.45 * OBV_FLOW + 3 * MACD_N;\n"
-        "量化多空分 : MAX(-100, MIN(100, RAW_SCORE)), COLORWHITE, LINETHICK2;\n"
-        "零轴 : 0, COLORGRAY, DOTLINE;\n"
-        "偏多阈值 : 20, COLORRED, DOTLINE;\n"
-        "偏空阈值 : -20, COLORGREEN, DOTLINE;\n"
-        "STICKLINE(量化多空分 >= 0, 0, 量化多空分, 3, 0), COLORRED;\n"
-        "STICKLINE(量化多空分 < 0, 0, 量化多空分, 3, 0), COLORGREEN;\n"
+        "{ 5) 合成涨跌倾向分 [25, 75]，50 为多空平衡线 }\n"
+        f"RAW_S := ({w['ma_dev']}) * MA_DEV + ({w['ema_dev']}) * EMA_DEV + ({w['ret_z5']}) * RET_Z5 + ({w['obv_flow']}) * OBV_FLOW + ({w['macd_n']}) * MACD_N + ({w['pos20']}) * POS20;\n"
+        "SCORE := MAX(-100, MIN(100, RAW_S));\n"
+        "涨倾向 : MAX(25, MIN(75, 50 + 0.25 * SCORE)), COLORWHITE, LINETHICK2;\n"
+        "中轴 : 50, COLORGRAY, POINTDOT;\n"
+        "偏多线 : 58, COLORRED, POINTDOT;\n"
+        "偏空线 : 42, COLORGREEN, POINTDOT;\n"
+        "STICKLINE(涨倾向 >= 50, 50, 涨倾向, 3, 0), COLORRED;\n"
+        "STICKLINE(涨倾向 < 50, 50, 涨倾向, 3, 0), COLORGREEN;\n"
         "\n"
-        "{ 5) 暴跌超卖首阳研究标记（近10期>=8期跌且末期翻红） }\n"
+        "{ 6) 暴跌超卖首阳研究标记（近10期>=8期跌且末期翻红） }\n"
         "DOWN_CNT := COUNT(CLOSE < REF(CLOSE, 1), 10);\n"
         "FIRST_UP := REF(DOWN_CNT, 1) >= 8 AND CLOSE > REF(CLOSE, 1);\n"
-        "DRAWTEXT(FIRST_UP, -85, '超跌首阳(研究)'), COLORYELLOW;\n"
+        "DRAWTEXT(FIRST_UP, 30, '超跌首阳'), COLORYELLOW;\n"
     )
+
+    intraday_code = (
+        "{ SP_INTRADAY · 同花顺盘中1分钟/5分钟场内短线副图（仅供研究，非买卖信号，盈亏自负） }\n"
+        "{ 用法：在手机同花顺切换至 1分钟 或 5分钟 K线图，副图选本指标，盘中逐根K线实时跳动计算 }\n"
+        "E3 := EMA(CLOSE, 3);\n"
+        "E12 := EMA(CLOSE, 12);\n"
+        "E_DEV := (E3 / (E12 + 0.0001) - 1) * 100;\n"
+        "R1 := (CLOSE / (REF(CLOSE, 1) + 0.0001) - 1) * 100;\n"
+        "R3 := (CLOSE / (REF(CLOSE, 3) + 0.0001) - 1) * 100;\n"
+        "V12 := STD(R1, 12) + 0.01;\n"
+        "MOM_Z := R3 / (V12 * SQRT(3));\n"
+        "SV6 := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));\n"
+        "FLOW6 := SUM(SV6, 6) / (SUM(VOL, 6) + 0.0001) * 100;\n"
+        "VR := VOL / (MA(VOL, 12) + 0.0001);\n"
+        "H12 := HHV(HIGH, 12);\n"
+        "L12 := LLV(LOW, 12);\n"
+        "POS12 := ((CLOSE - L12) / (H12 - L12 + 0.0001) - 0.5) * 100;\n"
+        "FAST_S := MAX(-100, MIN(100, 12 * E_DEV + 18 * MOM_Z + 0.45 * FLOW6 + 0.25 * POS12));\n"
+        "盘中涨分 : MAX(25, MIN(75, 50 + 0.25 * FAST_S)), COLORWHITE, LINETHICK2;\n"
+        "中轴 : 50, COLORGRAY, POINTDOT;\n"
+        "偏多线 : 58, COLORRED, POINTDOT;\n"
+        "偏空线 : 42, COLORGREEN, POINTDOT;\n"
+        "STICKLINE(盘中涨分 >= 50, 50, 盘中涨分, 3, 0), COLORRED;\n"
+        "STICKLINE(盘中涨分 < 50, 50, 盘中涨分, 3, 0), COLORGREEN;\n"
+        "放量冲 := VR > 2.0 AND CLOSE > REF(CLOSE, 1);\n"
+        "DRAWTEXT(放量冲, 70, '放量↑'), COLORRED;\n"
+    )
+
     guide = [
-        "1. 打开同花顺电脑版 → 按 Ctrl+F 打开【公式管理】→ 选【技术指标】→ 点【新建】；",
-        f"2. 公式名称填 {name}，画线方式选【副图】，将上方代码完整粘贴进去，点【测试公式】通过后保存；",
-        "3. 登录同一同花顺账号，在公式管理器中开启【云同步/同步到云端】；",
-        "4. 打开手机同花顺 App → 任意股票 K 线图（或 5分钟/1分钟 K 线）→ 点击副图指标名称切换为【" + name + "】，即可直接在同花顺屏幕上查看！",
-        "5. 诚实提示：同花顺公式仅含平稳技术量价因子；如需五档盘口微结构 + 分钟级 ML 实时涨跌概率，请用手机小窗/分屏打开本软件的 `/widget` 悬浮窗页面。",
+        "1. 打开电脑端【同花顺】→ 按 Ctrl+F 打开【公式管理】→ 左侧选【技术指标公式】→ 点击【新建】；",
+        f"2. 公式名称填 {name}（建议再建一个 SP_INTRADAY 盘中短线版），画线方法选【副图】，把代码完整粘贴进去，点【测试公式】显示“测试通过”后保存；",
+        "3. 在同花顺公式管理器顶部/右上角确保开启【公式云同步】（登录与手机同花顺相同的账号）；",
+        "4. 打开手机【同花顺 App】→ 任意股票 K 线页面（日线/5分钟/1分钟均可）→ 点击副图指标名称（如 MACD/KDJ）→ 在自定义/云公式里选择【" + name + "】或【SP_INTRADAY】，即可直接在同花顺屏幕内实时显示红绿柱与涨倾向曲线！",
+        "5. 诚实提示：同花顺公式引擎只支持量价计算，不包含五档盘口微结构与 GBRT/RF 集成；如需五档+分钟ML实时概率，可配合安卓小窗打开 `--web` 的 `/widget` 页面。",
     ]
     return {
         "name": name,
         "formula": formula_code,
+        "intraday_formula": intraday_code,
+        "weights": w,
+        "oos_eval": oos_eval,
         "guide": guide,
         "disclaimer": "仅供研究学习，不构成买卖信号或投资建议，盈亏自负。",
     }
@@ -7643,7 +7760,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
 <script>
 const TQ = {json.dumps(token_qs)};
 const THS = {ths_json};
-document.getElementById('thsPre').textContent = THS.formula;
+document.getElementById('thsPre').textContent = THS.formula + '\\n\\n' + (THS.intraday_formula || '');
 let curCode = new URLSearchParams(location.search).get('code') || '';
 
 function apiUrl(p, extra='') {{
@@ -7754,7 +7871,8 @@ async function runDaily() {{
   }}
 }}
 function copyThs() {{
-  navigator.clipboard.writeText(THS.formula).then(() => alert('已复制同花顺副图公式！')).catch(() => alert('请长按下方代码块手动全选复制'));
+  const txt = THS.formula + '\\n\\n' + (THS.intraday_formula || '');
+  navigator.clipboard.writeText(txt).then(() => alert('已复制同花顺副图公式（通用版+盘中短线版）！')).catch(() => alert('请长按下方代码块手动全选复制'));
 }}
 refresh();
 setInterval(refresh, 4000);
@@ -11777,45 +11895,50 @@ if HAS_PYSIDE6:
                 self._mobile_web_server.service.add_or_select_code(code)
 
             urls = self._mobile_web_server.urls()
-            ths = generate_ths_formula()
+            ths = generate_ths_formula(df=getattr(self, "raw_df", None))
             dlg = QDialog(self)
             dlg.setWindowTitle("手机实时看盘 & 同花顺屏幕显示方案")
-            dlg.resize(680, 560)
+            dlg.resize(700, 620)
             lay = QVBoxLayout(dlg)
             info = QTextBrowser()
             info.setOpenExternalLinks(True)
+            oos_txt = (
+                f"<p style='color:#1e8449;font-size:12px'>已按当前已加载数据校准公式权重（样本外DA={ths['oos_eval']['oos_da_pct']}% vs 多数基准={ths['oos_eval']['majority_baseline_pct']}%）。</p>"
+                if ths.get("oos_eval") else ""
+            )
             info.setHtml(
-                "<h3>1) 手机自动运行分析 + 悬浮在同花顺屏幕上方（推荐）</h3>"
-                f"<p>手机与本电脑连同一 Wi-Fi / 热点（或用手机 Termux 直接本地运行），打开：</p>"
+                "<h3>1) 直接显示在同花顺 App 屏幕内（云公式副图）</h3>"
+                "<p style='color:#555;font-size:12px'>以下两套公式均使用 100% 兼容同花顺手机端云同步的语法：导入 PC 同花顺 → 开启【云同步公式】→ 手机同花顺 K 线/1分钟/5分钟副图即可直接显示：</p>"
+                + oos_txt
+                + "<h3>2) 手机端全自动实时看盘 + 同花顺浮窗（含五档+分钟ML）</h3>"
                 f"<p>• <b>手机完整版看盘</b>：<a href='{urls['mobile_url']}'>{urls['mobile_url']}</a><br>"
                 f"• <b>同花顺悬浮窗/分屏极简条</b>：<a href='{urls['widget_url']}'>{urls['widget_url']}</a><br>"
                 f"• 本机调试：<a href='{urls['local_url']}'>{urls['local_url']}</a></p>"
-                "<p style='color:#555;font-size:12px'>安卓手机用系统分屏或浏览器“小窗模式”打开上面第二个链接，"
-                "即可直接浮在同花顺屏幕上实时显示 P(涨)/P(跌)/微价格/样本外DA；后台已自动每 10 秒轮询分析。</p>"
-                "<h3>2) 直接显示在同花顺 App 屏幕内（云公式副图）</h3>"
-                "<p style='color:#555;font-size:12px'>由于同花顺是闭源沙箱 App，外部 Python 无法直接篡改其界面；"
-                "但可将下方同花顺原生公式导入 PC 同花顺 → 开启【云同步公式】→ 手机同花顺打开 K 线副图即可直接显示：</p>"
             )
             lay.addWidget(info)
             formula_box = QTextEdit()
             formula_box.setReadOnly(True)
-            formula_box.setPlainText(ths["formula"])
+            both_text = ths["formula"] + "\n\n" + ths["intraday_formula"]
+            formula_box.setPlainText(both_text)
             lay.addWidget(formula_box, stretch=1)
             btns = QHBoxLayout()
-            copy_btn = QPushButton("📋 复制同花顺公式")
+            copy_btn = QPushButton("📋 复制通用副图(SP_QUANT)")
             copy_btn.clicked.connect(lambda: (QApplication.clipboard().setText(ths["formula"]),
-                                              QMessageBox.information(dlg, "已复制", "同花顺副图公式已复制到剪贴板。\n" + "\n".join(ths["guide"]))))
+                                              QMessageBox.information(dlg, "已复制", "SP_QUANT 通用副图公式已复制。\n" + "\n".join(ths["guide"]))))
+            copy_fast_btn = QPushButton("⚡ 复制盘中短线(SP_INTRADAY)")
+            copy_fast_btn.clicked.connect(lambda: (QApplication.clipboard().setText(ths["intraday_formula"]),
+                                                   QMessageBox.information(dlg, "已复制", "SP_INTRADAY 盘中1m/5m副图公式已复制。")))
             save_btn = QPushButton("💾 导出公式文本")
             def _save_ths():
                 p, _ = QFileDialog.getSaveFileName(dlg, "保存同花顺公式", os.path.join(BASE_DIR, "SP_QUANT_同花顺副图.txt"), "Text (*.txt)")
                 if p:
                     with open(p, "w", encoding="utf-8") as fh:
-                        fh.write(ths["formula"] + "\n\n" + "\n".join(ths["guide"]))
+                        fh.write(both_text + "\n\n" + "\n".join(ths["guide"]))
                     QMessageBox.information(dlg, "保存成功", f"已保存至：\n{p}")
             save_btn.clicked.connect(_save_ths)
             close_btn = QPushButton("关闭（后台服务继续运行）")
             close_btn.clicked.connect(dlg.accept)
-            btns.addWidget(copy_btn); btns.addWidget(save_btn); btns.addStretch(); btns.addWidget(close_btn)
+            btns.addWidget(copy_btn); btns.addWidget(copy_fast_btn); btns.addWidget(save_btn); btns.addStretch(); btns.addWidget(close_btn)
             lay.addLayout(btns)
             self._oplog(f"已启动手机实时自动分析服务：{urls['mobile_url']} | 浮窗：{urls['widget_url']}")
             dlg.exec()
@@ -19216,13 +19339,22 @@ def main():
     args = _build_arg_parser().parse_args()
 
     if args.export_ths is not None:
-        ths = generate_ths_formula()
+        df_fit = None
+        if getattr(args, "synthetic", False):
+            df_fit = StockDataFetcher.generate_synthetic_data()
+        elif args.code and "--code" in sys.argv:
+            try:
+                df_fit = StockDataFetcher().fetch(args.code.strip(), args.start, args.end)
+            except Exception as exc:
+                print(f"[export-ths] 拉取 {args.code} 数据失败，改用均衡权重: {exc}")
+        ths = generate_ths_formula(df=df_fit, horizon=args.horizon)
+        full_txt = ths["formula"] + "\n\n" + ths["intraday_formula"]
         out_file = str(args.export_ths).strip()
         if out_file:
             with open(out_file, "w", encoding="utf-8") as fh:
-                fh.write(ths["formula"] + "\n\n" + "\n".join(ths["guide"]) + "\n")
-            print(f"[export-ths] 已导出同花顺副图公式 -> {out_file}")
-        print(ths["formula"])
+                fh.write(full_txt + "\n\n" + "\n".join(ths["guide"]) + "\n")
+            print(f"[export-ths] 已导出同花顺副图公式(含 SP_QUANT + SP_INTRADAY) -> {out_file}")
+        print(full_txt)
         print("\n".join(ths["guide"]))
         return ths
 

@@ -1,0 +1,78 @@
+{ SP_QUANT · 通用K线量化涨跌倾向副图（日线/5分钟/1分钟全适用，仅供研究，非买卖信号，盈亏自负） }
+{ 导入路径：同花顺PC端 Ctrl+F 公式管理 -> 技术指标 -> 新建(画线方法:副图) -> 云同步 -> 手机同花顺直接显示 }
+{ 通用均衡平稳权重 }
+MA5 := MA(CLOSE, 5);
+MA20 := MA(CLOSE, 20);
+EMA5 := EMA(CLOSE, 5);
+EMA20 := EMA(CLOSE, 20);
+DIF := EMA(CLOSE, 12) - EMA(CLOSE, 26);
+DEA := EMA(DIF, 9);
+MACDH := (DIF - DEA) * 2;
+
+{ 1) 均线偏离趋势 }
+MA_DEV := (MA5 / (MA20 + 0.0001) - 1) * 100;
+EMA_DEV := (EMA5 / (EMA20 + 0.0001) - 1) * 100;
+
+{ 2) 波动率调整5期动量 }
+RET1 := (CLOSE / (REF(CLOSE, 1) + 0.0001) - 1) * 100;
+RET5 := (CLOSE / (REF(CLOSE, 5) + 0.0001) - 1) * 100;
+VOLAT := STD(RET1, 20) + 0.01;
+RET_Z5 := RET5 / (VOLAT * SQRT(5));
+
+{ 3) 10期有向成交量流 OBV_FLOW }
+SGN_V := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));
+OBV_FLOW := SUM(SGN_V, 10) / (SUM(VOL, 10) + 0.0001) * 100;
+
+{ 4) 归一化 MACD 柱 与 20期区间位置 }
+MACD_N := MACDH / (CLOSE + 0.0001) * 1000;
+HH20 := HHV(HIGH, 20);
+LL20 := LLV(LOW, 20);
+POS20 := ((CLOSE - LL20) / (HH20 - LL20 + 0.0001) - 0.5) * 100;
+
+{ 5) 合成涨跌倾向分 [25, 75]，50 为多空平衡线 }
+RAW_S := (5.0) * MA_DEV + (6.0) * EMA_DEV + (16.0) * RET_Z5 + (0.35) * OBV_FLOW + (2.2) * MACD_N + (0.35) * POS20;
+SCORE := MAX(-100, MIN(100, RAW_S));
+涨倾向 : MAX(25, MIN(75, 50 + 0.25 * SCORE)), COLORWHITE, LINETHICK2;
+中轴 : 50, COLORGRAY, POINTDOT;
+偏多线 : 58, COLORRED, POINTDOT;
+偏空线 : 42, COLORGREEN, POINTDOT;
+STICKLINE(涨倾向 >= 50, 50, 涨倾向, 3, 0), COLORRED;
+STICKLINE(涨倾向 < 50, 50, 涨倾向, 3, 0), COLORGREEN;
+
+{ 6) 暴跌超卖首阳研究标记（近10期>=8期跌且末期翻红） }
+DOWN_CNT := COUNT(CLOSE < REF(CLOSE, 1), 10);
+FIRST_UP := REF(DOWN_CNT, 1) >= 8 AND CLOSE > REF(CLOSE, 1);
+DRAWTEXT(FIRST_UP, 30, '超跌首阳'), COLORYELLOW;
+
+
+{ SP_INTRADAY · 同花顺盘中1分钟/5分钟场内短线副图（仅供研究，非买卖信号，盈亏自负） }
+{ 用法：在手机同花顺切换至 1分钟 或 5分钟 K线图，副图选本指标，盘中逐根K线实时跳动计算 }
+E3 := EMA(CLOSE, 3);
+E12 := EMA(CLOSE, 12);
+E_DEV := (E3 / (E12 + 0.0001) - 1) * 100;
+R1 := (CLOSE / (REF(CLOSE, 1) + 0.0001) - 1) * 100;
+R3 := (CLOSE / (REF(CLOSE, 3) + 0.0001) - 1) * 100;
+V12 := STD(R1, 12) + 0.01;
+MOM_Z := R3 / (V12 * SQRT(3));
+SV6 := IF(CLOSE > REF(CLOSE, 1), VOL, IF(CLOSE < REF(CLOSE, 1), -VOL, 0));
+FLOW6 := SUM(SV6, 6) / (SUM(VOL, 6) + 0.0001) * 100;
+VR := VOL / (MA(VOL, 12) + 0.0001);
+H12 := HHV(HIGH, 12);
+L12 := LLV(LOW, 12);
+POS12 := ((CLOSE - L12) / (H12 - L12 + 0.0001) - 0.5) * 100;
+FAST_S := MAX(-100, MIN(100, 12 * E_DEV + 18 * MOM_Z + 0.45 * FLOW6 + 0.25 * POS12));
+盘中涨分 : MAX(25, MIN(75, 50 + 0.25 * FAST_S)), COLORWHITE, LINETHICK2;
+中轴 : 50, COLORGRAY, POINTDOT;
+偏多线 : 58, COLORRED, POINTDOT;
+偏空线 : 42, COLORGREEN, POINTDOT;
+STICKLINE(盘中涨分 >= 50, 50, 盘中涨分, 3, 0), COLORRED;
+STICKLINE(盘中涨分 < 50, 50, 盘中涨分, 3, 0), COLORGREEN;
+放量冲 := VR > 2.0 AND CLOSE > REF(CLOSE, 1);
+DRAWTEXT(放量冲, 70, '放量↑'), COLORRED;
+
+
+1. 打开电脑端【同花顺】→ 按 Ctrl+F 打开【公式管理】→ 左侧选【技术指标公式】→ 点击【新建】；
+2. 公式名称填 SP_QUANT（建议再建一个 SP_INTRADAY 盘中短线版），画线方法选【副图】，把代码完整粘贴进去，点【测试公式】显示“测试通过”后保存；
+3. 在同花顺公式管理器顶部/右上角确保开启【公式云同步】（登录与手机同花顺相同的账号）；
+4. 打开手机【同花顺 App】→ 任意股票 K 线页面（日线/5分钟/1分钟均可）→ 点击副图指标名称（如 MACD/KDJ）→ 在自定义/云公式里选择【SP_QUANT】或【SP_INTRADAY】，即可直接在同花顺屏幕内实时显示红绿柱与涨倾向曲线！
+5. 诚实提示：同花顺公式引擎只支持量价计算，不包含五档盘口微结构与 GBRT/RF 集成；如需五档+分钟ML实时概率，可配合安卓小窗打开 `--web` 的 `/widget` 页面。
