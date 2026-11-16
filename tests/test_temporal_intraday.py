@@ -314,6 +314,44 @@ def test_realtime_transport_has_timeout_and_preserves_hand_units(monkeypatch):
         s.StockDataFetcher.fetch_realtime("600000", bypass_proxy=False)
 
 
+def test_fetch_realtime_tencent_fallback_on_eastmoney_disconnect(monkeypatch):
+    import requests
+
+    parts = [""] * 55
+    parts[1], parts[2], parts[3], parts[4], parts[5], parts[6] = "贵州茅台", "600519", "1453.90", "1435.26", "1426.30", "39967"
+    parts[9], parts[10], parts[11], parts[12] = "1453.50", "1", "1453.00", "5"
+    parts[19], parts[20], parts[21], parts[22] = "1453.90", "2", "1453.96", "3"
+    parts[31], parts[32], parts[33], parts[34] = "18.64", "1.30", "1454.93", "1425.00"
+    parts[35], parts[38], parts[47], parts[48], parts[49], parts[51] = "1453.90/39967/5767305714", "0.32", "1578.79", "1291.73", "1.23", "1443.02"
+    tx_body = ('v_sh600519="' + "~".join(parts) + '";').encode("gbk")
+
+    class Resp:
+        content = tx_body
+        text = tx_body.decode("gbk")
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        if "eastmoney.com" in url:
+            raise requests.ConnectionError("RemoteDisconnected")
+        return Resp()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(s.StockDataFetcher, "_retry", lambda fn, **kwargs: fn())
+    q = s.StockDataFetcher.fetch_realtime("600519", bypass_proxy=False)
+    assert q["source"] == "tencent"
+    assert q["name"] == "贵州茅台"
+    assert q["price"] == 1453.90 and q["avg"] == 1443.02
+    assert q["book_volume_unit"] == "手" and q["vol"] == 39967
+    assert q["bids"][0] == (1453.50, 1.0) and q["asks"][0] == (1453.90, 2.0)
+
+    parts[2] = "000001"
+    tx_bad = ('v_sh600519="' + "~".join(parts) + '";').encode("gbk")
+    Resp.content = tx_bad
+    with pytest.raises(RuntimeError, match="不匹配"):
+        s.StockDataFetcher.fetch_realtime("600519", bypass_proxy=False)
+
+
 def test_order_comparison_excludes_legacy_unknown_units(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "MONITOR_DIR", str(tmp_path))
     old = _quote()

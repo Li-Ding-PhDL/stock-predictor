@@ -1554,7 +1554,8 @@ class StockDataFetcher:
             response = requests.get("https://push2.eastmoney.com/api/qt/stock/get",
                                     params={"fltt": "2", "invt": "2", "fields": fields,
                                             "secid": f"{1 if code.startswith('6') else 0}.{code}"},
-                                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+                                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/",
+                                             "Connection": "close"},
                                     timeout=8)
             response.raise_for_status()
             data = response.json().get("data")
@@ -1563,9 +1564,68 @@ class StockDataFetcher:
             if str(data.get("f57", code)) != code:
                 raise RuntimeError("实时行情返回的股票代码不匹配。")
             return data
+
+        def request_tencent():
+            ex = "sh" if code.startswith(("6", "9")) else ("bj" if code.startswith(("8", "4")) else "sz")
+            resp = requests.get(f"https://qt.gtimg.cn/q={ex}{code}",
+                                headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
+                                timeout=6)
+            resp.raise_for_status()
+            txt = resp.content.decode("gbk", errors="ignore") if resp.content else (resp.text or "")
+            parts = txt.split("~")
+            if len(parts) < 40:
+                raise RuntimeError("腾讯实时行情返回字段不足。")
+            if str(parts[2]).strip() != code:
+                raise RuntimeError("实时行情返回的股票代码不匹配。")
+
+            def tp(idx):
+                if idx >= len(parts):
+                    return None
+                val = str(parts[idx]).strip()
+                if not val or val == "-":
+                    return None
+                try:
+                    num = float(val)
+                    return num if np.isfinite(num) else None
+                except (TypeError, ValueError):
+                    return None
+
+            price = tp(3)
+            if price is None or price <= 0:
+                raise RuntimeError("腾讯实时行情价格无效。")
+            amt = None
+            if len(parts) > 35 and "/" in parts[35]:
+                try:
+                    amt = float(parts[35].split("/")[-1])
+                except (TypeError, ValueError):
+                    amt = None
+            if amt is None and tp(37) is not None:
+                amt = float(tp(37)) * 10000.0
+            bids_t = [(tp(9 + 2 * i), tp(10 + 2 * i)) for i in range(5)]
+            asks_t = [(tp(19 + 2 * i), tp(20 + 2 * i)) for i in range(5)]
+            nm = str(parts[1]).strip() if len(parts) > 1 and str(parts[1]).strip() else None
+            return {
+                "name": nm,
+                "price": price, "pct": tp(32), "chg": tp(31),
+                "open": tp(5), "high": tp(33), "low": tp(34), "prev": tp(4),
+                "avg": tp(51), "vol": tp(6), "amount": amt,
+                "turnover": tp(38), "vol_ratio": tp(49),
+                "limit_up": tp(47), "limit_down": tp(48), "book_volume_unit": "手",
+                "received_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "bids": bids_t, "asks": asks_t, "source": "tencent",
+            }
+
         ctx = _no_proxy() if bypass_proxy else contextlib.nullcontext()
         with ctx:
-            m = StockDataFetcher._retry(request, tries=2, delay=0.8)
+            try:
+                m = StockDataFetcher._retry(request, tries=2, delay=0.8)
+            except Exception as em_err:
+                if "不匹配" in str(em_err):
+                    raise
+                try:
+                    return request_tencent()
+                except Exception as tx_err:
+                    raise RuntimeError(f"东财与腾讯实时盘口均不可用: {em_err} / {tx_err}") from em_err
         def g(key):
             value = m.get(key)
             if value in ("", "-", None):
@@ -8195,7 +8255,7 @@ class AutoAnalysisService:
                 with self._lock:
                     self._cycle_count += 1
                     self._last_cycle_at = dt.datetime.now().strftime("%H:%M:%S")
-                    all_fetched = all(c in self._latest_by_code for c in self.codes)
+                    all_fetched = all((c in self._latest_by_code or c in self._errors_by_code) for c in self.codes)
                 try:
                     trading_now, _ = is_trading_now()
                 except Exception:
@@ -8531,7 +8591,14 @@ async function tick() {{
     const r = await fetch(api('/api/state', wCode ? 'code='+encodeURIComponent(wCode) : ''));
     const d = await r.json();
     if (!wCode) wCode = d.active_code;
-    const a = d.active; if (!a) return;
+    const a = d.active;
+    if (!a) {{
+      if (d.active_error) {{
+        document.getElementById('hdr').innerHTML = `<b>${{wCode || ''}}</b> <span class="dn">行情重连中</span>`;
+        document.getElementById('sub').innerHTML = `<span class="mu">${{String(d.active_error).slice(0, 42)}}</span>`;
+      }}
+      return;
+    }}
     const q = a.quote, p = a.intraday_prediction, v = a.live_verification || {{}};
     const cls = (q.pct || 0) >= 0 ? 'up' : 'dn';
     const pct = q.pct != null ? (q.pct >= 0 ? '+' : '') + Number(q.pct).toFixed(2) + '%' : '--';
