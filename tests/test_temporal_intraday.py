@@ -678,3 +678,68 @@ def test_mobile_web_server_and_auto_analysis_service(monkeypatch):
         assert "token=secret42" in urls["widget_url"]
     finally:
         srv.stop()
+
+
+
+def test_intraday_tracker_persistence_and_calibration_summary(tmp_path):
+    tracker = s.IntradayPredictionTracker(horizon_sec=20.0, persist_dir=str(tmp_path))
+    tracker.update("600519", 100.0, 62.0, ts=1000.0)
+    tracker.update("600519", 102.0, 38.0, ts=1025.0)
+    st = tracker.update("600519", 101.0, 50.0, ts=1050.0)
+    assert st["verified_n"] == 2 and st["hit_n"] == 2 and st["hit_rate_pct"] == 100.0
+    assert st["hist_verified_n"] == 2 and st["hist_hit_rate_pct"] == 100.0
+
+    cal = s.intraday_calibration_summary(code="600519", persist_dir=str(tmp_path))
+    assert cal["verified_n"] == 2 and cal["hit_rate_pct"] == 100.0
+    bucket_names = {b["bucket"] for b in cal["buckets"]}
+    assert "高看涨(>=58%)" in bucket_names and "高看跌(<=42%)" in bucket_names
+
+
+def test_auto_service_async_daily_and_name_propagation(tmp_path, monkeypatch):
+    import urllib.request
+
+    bars = _synthetic_intraday_bars(n=100)
+    q_named = dict(_quote(), name="贵州茅台")
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime", lambda code: q_named)
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_fundflow", lambda code: {"main_net": 1.0e6, "main_pct": 2.0})
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_intraday_bars", lambda code, period="5": bars)
+    monkeypatch.setattr(s, "is_trading_now", lambda: (False, "休市"))
+    monkeypatch.setattr(s, "run_experiment", lambda **kw: {
+        "results": [{"algo": "Ensemble", "metrics": {"DA": 60.0, "UP_P": 62.0, "RMSE": 1.1}, "error": None}],
+        "forecast": [{"algo": "Ensemble", "last_date": "2026-11-16", "last_close": 100.0, "pred_close": 101.0}],
+        "trust_gate": {"n_passed": 1, "n_models": 1},
+    })
+
+    svc = s.AutoAnalysisService(codes=["600519"], interval_sec=5.0, persist_dir=str(tmp_path))
+    entry = svc.analyze_code_once("600519")
+    assert entry["name"] == "贵州茅台"
+
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
+    srv.start(background=True)
+    try:
+        base = f"http://127.0.0.1:{srv.port}"
+        req = urllib.request.Request(
+            f"{base}/api/daily_analyze",
+            data=json.dumps({"code": "600519"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            assert resp.status == 202
+            ack = json.loads(resp.read().decode("utf-8"))
+            assert ack["ok"] is True
+
+        deadline = time.monotonic() + 3.0
+        state = {}
+        while time.monotonic() < deadline:
+            state = json.loads(urllib.request.urlopen(f"{base}/api/state", timeout=3).read().decode("utf-8"))
+            if state.get("daily") and not state.get("daily_running"):
+                break
+            time.sleep(0.05)
+        assert state["daily"]["models"][0]["algo"] == "Ensemble"
+        assert state["watchlist_summary"][0]["name"] == "贵州茅台"
+
+        cal = json.loads(urllib.request.urlopen(f"{base}/api/intraday_calibration?code=600519", timeout=3).read().decode("utf-8"))
+        assert cal["verified_n"] == 0
+    finally:
+        srv.stop()

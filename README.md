@@ -27,7 +27,7 @@
   - 新增 `IntradayPredictionTracker` 盘中预测滚动自检器，到期自动对照最新真实价核算实盘命中率与同期上涨基准。
   - **GUI「实时监控」页**：新增「⚡ 实时涨跌预测」开关、「短线周期」选择与「📊 重算盘中模型」按钮，以及「📱 手机看板/同花顺浮窗」一键启动手机服务与同花顺公式弹窗；**CLI**：新增 `python stock_predictor.py --intraday-predict 600519 --bar-period 5 --bar-horizon 3 --json intraday_pred.json`，`--monitor` 同步输出 `intraday_prediction` 与 `live_verification`。
 - **手机端实时看板 + 同花顺屏幕显示方案**：
-  - 新增零额外依赖内置手机 Web 服务（`python stock_predictor.py --web --web-port 8765`，手机浏览器访问完整版 `/` 或安卓分屏/小窗打开同花顺悬浮条 `/widget`，后台 `AutoAnalysisService` 自动定时轮询计算，支持手机端切股、一键日线模型预测与可选 `--push` 阈值推送；安卓手机亦可通过 `scripts/termux_mobile_start.sh` 在 Termux 本机直接运行）。
+  - 新增零额外依赖内置手机 Web 服务（`python stock_predictor.py --web --web-port 8765`，手机浏览器访问完整版 `/` 或安卓分屏/小窗打开同花顺悬浮条 `/widget`，后台 `AutoAnalysisService` 自动定时轮询计算——**休市自动降频待机防刷接口、支持股票中文简称 `f58`、手机端一键日线预测后台异步执行、到期盘中预测自动落盘到 `monitor_log/intraday_verify_*.csv` 并支持分档校准统计 `/api/intraday_calibration`**，可选 `--push` 阈值推送；安卓手机亦可通过 `scripts/termux_mobile_start.sh` 在 Termux 本机直接运行）。
   - 新增同花顺原生副图公式生成器（`python stock_predictor.py --export-ths`），可粘贴进 PC 同花顺并开启云同步，直接在手机同花顺 K 线/分时副图屏幕显示平滑量化动量得分（注：同花顺为闭源沙箱 App，外部 Python 不能向其进程内部注入界面，故采用“云公式副图 + 安卓小窗/分屏悬浮条”双方案合规落地）。仍坚持诚实边界：盘中高频噪声极大，仅供量化研究参考，不构成买卖信号或投资建议、盈亏自负。
 
 ---

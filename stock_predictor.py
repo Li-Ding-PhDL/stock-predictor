@@ -1549,7 +1549,7 @@ class StockDataFetcher:
             raise RuntimeError("实时行情需要requests，请安装：pip install requests") from exc
         fields = ("f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,"
                   "f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,"
-                  "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f60,f71,f168,f169,f170,f530")
+                  "f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f71,f168,f169,f170,f530")
         def request():
             response = requests.get("https://push2.eastmoney.com/api/qt/stock/get",
                                     params={"fltt": "2", "invt": "2", "fields": fields,
@@ -1577,7 +1577,10 @@ class StockDataFetcher:
                 return None
         bids = [(g(f"f{19 - 2*i}"), g(f"f{20 - 2*i}")) for i in range(5)]
         asks = [(g(f"f{39 - 2*i}"), g(f"f{40 - 2*i}")) for i in range(5)]
+        raw_name = m.get("f58")
+        name = str(raw_name).strip() if raw_name not in ("", "-", None) else None
         return {
+            "name": name,
             "price": g("f43"), "pct": g("f170"), "chg": g("f169"),
             "open": g("f46"), "high": g("f44"), "low": g("f45"), "prev": g("f60"),
             "avg": g("f71"), "vol": g("f47"), "amount": g("f48"),
@@ -6919,14 +6922,25 @@ def intraday_realtime_html(pred: Optional[Dict[str, Any]],
         )
 
     trk_block = ""
-    if isinstance(tracker_stats, dict) and tracker_stats.get("total_recorded", 0) > 0:
+    if isinstance(tracker_stats, dict) and (tracker_stats.get("total_recorded", 0) > 0 or (tracker_stats.get("hist_verified_n") or 0) > 0):
         vn = tracker_stats.get("verified_n", 0)
+        hn = tracker_stats.get("hist_verified_n", 0) or 0
+        hist_str = (
+            f"　|　历史累计已核验 <b>{hn}</b> 次（命中率 <b>{tracker_stats['hist_hit_rate_pct']:.1f}%</b>，"
+            f"基准涨占比 {tracker_stats['hist_baseline_up_pct']:.1f}%）"
+            if hn > 0 and tracker_stats.get("hist_hit_rate_pct") is not None else ""
+        )
         if vn > 0:
             trk_block = (
                 f"<p style='font-size:12px;color:#2c3e50;margin:4px 0'>📊 <b>盘中预测实时兑现追踪</b>："
-                f"已核验 <b>{vn}</b> 次（命中 {tracker_stats['hit_n']} 次，"
+                f"本次已核验 <b>{vn}</b> 次（命中 {tracker_stats['hit_n']} 次，"
                 f"实盘命中率 <b>{tracker_stats['hit_rate_pct']:.1f}%</b>，同期实际涨占比 {tracker_stats['baseline_up_pct']:.1f}%）；"
-                f"待到期 {tracker_stats['pending_n']} 次。</p>"
+                f"待到期 {tracker_stats['pending_n']} 次{hist_str}。</p>"
+            )
+        elif hn > 0:
+            trk_block = (
+                f"<p style='font-size:12px;color:#2c3e50;margin:4px 0'>📊 <b>盘中预测实时兑现追踪</b>："
+                f"本次已记录 {tracker_stats.get('total_recorded', 0)} 次（等待窗口到期）{hist_str}。</p>"
             )
         else:
             trk_block = (
@@ -6961,12 +6975,73 @@ def intraday_realtime_html(pred: Optional[Dict[str, Any]],
     )
 
 
-class IntradayPredictionTracker:
-    """盘中实时预测滚动自检器：记录每次实时方向预测，到期后自动对照真实最新价计算实盘命中率。"""
+_INTRADAY_VERIFY_LOCK = threading.Lock()
 
-    def __init__(self, horizon_sec: float = 60.0, max_items: int = 300):
+
+def intraday_calibration_summary(code: Optional[str] = None,
+                                 persist_dir: Optional[str] = MONITOR_DIR) -> Dict[str, Any]:
+    """汇总已落盘的盘中实时核验记录，分概率档位对照实际涨跌比例（跨会话累计诚实校准）。"""
+    import csv
+    if not persist_dir or not os.path.isdir(persist_dir):
+        return {"verified_n": 0, "hit_rate_pct": None, "baseline_up_pct": None, "buckets": []}
+    rows: List[Dict[str, Any]] = []
+    with _INTRADAY_VERIFY_LOCK:
+        files = sorted(f for f in os.listdir(persist_dir)
+                       if f.startswith("intraday_verify_") and f.endswith(".csv"))
+        for fname in files:
+            fpath = os.path.join(persist_dir, fname)
+            try:
+                with open(fpath, newline="", encoding="utf-8-sig") as fh:
+                    for row in csv.DictReader(fh):
+                        if code and row.get("code") != str(code).strip():
+                            continue
+                        rows.append(row)
+            except Exception:
+                continue
+    if not rows:
+        return {"verified_n": 0, "hit_rate_pct": None, "baseline_up_pct": None, "buckets": []}
+    valid = []
+    for r in rows:
+        try:
+            p_up = float(r["p_up_pct"])
+            actual_up = int(float(r["actual_up"]))
+            hit = int(float(r["hit"]))
+            valid.append((p_up, actual_up, hit))
+        except Exception:
+            continue
+    if not valid:
+        return {"verified_n": 0, "hit_rate_pct": None, "baseline_up_pct": None, "buckets": []}
+    n = len(valid)
+    hits = sum(x[2] for x in valid)
+    ups = sum(x[1] for x in valid)
+    buckets = []
+    for label, lo, hi in (("高看涨(>=58%)", 58.0, 100.1), ("偏多(55-58%)", 55.0, 58.0),
+                          ("偏空(42-45%)", 42.0, 45.01), ("高看跌(<=42%)", 0.0, 42.0)):
+        sub = [x for x in valid if lo <= x[0] < hi]
+        if sub:
+            buckets.append({
+                "bucket": label,
+                "n": len(sub),
+                "hit_rate_pct": round(sum(x[2] for x in sub) / len(sub) * 100.0, 1),
+                "actual_up_pct": round(sum(x[1] for x in sub) / len(sub) * 100.0, 1),
+            })
+    return {
+        "verified_n": n,
+        "hit_n": hits,
+        "hit_rate_pct": round(hits / n * 100.0, 1),
+        "baseline_up_pct": round(ups / n * 100.0, 1),
+        "buckets": buckets,
+    }
+
+
+class IntradayPredictionTracker:
+    """盘中实时预测滚动自检器：记录每次实时方向预测，到期后自动对照真实最新价计算实盘命中率并可选落盘。"""
+
+    def __init__(self, horizon_sec: float = 60.0, max_items: int = 300,
+                 persist_dir: Optional[str] = None):
         self.horizon_sec = max(10.0, float(horizon_sec))
         self.max_items = max(20, int(max_items))
+        self.persist_dir = persist_dir
         self._lock = threading.Lock()
         self._records: List[Dict[str, Any]] = []
 
@@ -6974,10 +7049,41 @@ class IntradayPredictionTracker:
         with self._lock:
             self._records.clear()
 
+    def _append_verified_row(self, rec: Dict[str, Any], exit_ts: float) -> None:
+        if not self.persist_dir:
+            return
+        import csv
+        os.makedirs(self.persist_dir, exist_ok=True)
+        day = dt.datetime.fromtimestamp(exit_ts).strftime("%Y%m%d")
+        path = os.path.join(self.persist_dir, f"intraday_verify_{day}.csv")
+        fields = ["verified_at", "code", "entry_ts", "exit_ts", "entry_price",
+                  "exit_price", "p_up_pct", "pred_dir", "actual_up", "hit", "horizon_sec"]
+        row = {
+            "verified_at": dt.datetime.fromtimestamp(exit_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "code": rec["code"],
+            "entry_ts": round(float(rec["ts"]), 3),
+            "exit_ts": round(float(exit_ts), 3),
+            "entry_price": round(float(rec["price"]), 4),
+            "exit_price": round(float(rec["exit_price"]), 4),
+            "p_up_pct": round(float(rec["p_up_pct"]), 2),
+            "pred_dir": int(rec["pred_dir"]),
+            "actual_up": 1 if rec["actual_up"] else 0,
+            "hit": 1 if rec["hit"] else 0,
+            "horizon_sec": round(float(self.horizon_sec), 1),
+        }
+        with _INTRADAY_VERIFY_LOCK:
+            is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="", encoding="utf-8-sig") as fh:
+                wr = csv.DictWriter(fh, fieldnames=fields)
+                if is_new:
+                    wr.writeheader()
+                wr.writerow(row)
+
     def update(self, code: str, price: Optional[float], p_up_pct: Optional[float],
                ts: Optional[float] = None) -> Dict[str, Any]:
-        """先核验已到期的历史预测，再记录本次有效预测(方向明确时纳入命中统计)。"""
+        """先核验已到期的历史预测并落盘，再记录本次有效预测(方向明确时纳入命中统计)。"""
         now_ts = float(ts if ts is not None else time.time())
+        matured_rows: List[Dict[str, Any]] = []
         with self._lock:
             if price is not None and np.isfinite(price) and price > 0:
                 for rec in self._records:
@@ -6988,12 +7094,12 @@ class IntradayPredictionTracker:
                         rec["actual_up"] = actual_up
                         if rec["pred_dir"] != 0:
                             rec["hit"] = ((rec["pred_dir"] > 0) == actual_up)
+                            matured_rows.append(dict(rec))
                         else:
                             rec["hit"] = None
 
                 if p_up_pct is not None and np.isfinite(p_up_pct):
                     pred_dir = 1 if p_up_pct >= 55.0 else (-1 if p_up_pct <= 45.0 else 0)
-                    # 仅记录方向倾向明确的实时预测用于命中率验证；中性观望也留档展示
                     self._records.append({
                         "code": code,
                         "ts": now_ts,
@@ -7013,15 +7119,26 @@ class IntradayPredictionTracker:
             hits = sum(1 for r in verified_dir if r["hit"])
             up_actuals = sum(1 for r in verified_dir if r["actual_up"])
             pending = sum(1 for r in code_recs if not r["verified"])
-            return {
-                "horizon_sec": self.horizon_sec,
-                "total_recorded": len(code_recs),
-                "verified_n": len(verified_dir),
-                "hit_n": hits,
-                "hit_rate_pct": round(hits / len(verified_dir) * 100.0, 1) if verified_dir else None,
-                "baseline_up_pct": round(up_actuals / len(verified_dir) * 100.0, 1) if verified_dir else None,
-                "pending_n": pending,
-            }
+
+        for mrec in matured_rows:
+            try:
+                self._append_verified_row(mrec, now_ts)
+            except Exception:
+                pass
+
+        hist = intraday_calibration_summary(code=code, persist_dir=self.persist_dir) if self.persist_dir else {}
+        return {
+            "horizon_sec": self.horizon_sec,
+            "total_recorded": len(code_recs),
+            "verified_n": len(verified_dir),
+            "hit_n": hits,
+            "hit_rate_pct": round(hits / len(verified_dir) * 100.0, 1) if verified_dir else None,
+            "baseline_up_pct": round(up_actuals / len(verified_dir) * 100.0, 1) if verified_dir else None,
+            "pending_n": pending,
+            "hist_verified_n": hist.get("verified_n", 0),
+            "hist_hit_rate_pct": hist.get("hit_rate_pct"),
+            "hist_baseline_up_pct": hist.get("baseline_up_pct"),
+        }
 
 
 _SNAPSHOT_WRITE_LOCK = threading.Lock()
@@ -7460,7 +7577,8 @@ class AutoAnalysisService:
 
     def __init__(self, codes: Optional[List[str]] = None, interval_sec: float = 10.0,
                  bar_period: str = "5", horizon_bars: int = 3,
-                 push_spec: str = "", alert_prob: float = 64.0):
+                 push_spec: str = "", alert_prob: float = 64.0,
+                 persist_dir: Optional[str] = MONITOR_DIR):
         clean_codes = []
         for c in (codes or list(USER_WATCHLIST_CODES[:5]) or ["600519"]):
             cs = str(c).strip()
@@ -7476,6 +7594,7 @@ class AutoAnalysisService:
         self.push_spec: str = str(push_spec or "").strip()
         self.alert_prob: float = float(np.clip(alert_prob, 55.0, 75.0))
         self.paused: bool = False
+        self.off_hours_slowdown: bool = False
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -7484,10 +7603,13 @@ class AutoAnalysisService:
 
         self._snapshots_by_code: Dict[str, List[Dict[str, Any]]] = {}
         self._bar_cache_by_code: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-        self._tracker = IntradayPredictionTracker(horizon_sec=max(60.0, self.interval_sec * 3.0))
+        self._tracker = IntradayPredictionTracker(horizon_sec=max(60.0, self.interval_sec * 3.0),
+                                                  persist_dir=persist_dir)
         self._latest_by_code: Dict[str, Dict[str, Any]] = {}
         self._errors_by_code: Dict[str, str] = {}
         self._daily_by_code: Dict[str, Dict[str, Any]] = {}
+        self._daily_running: Dict[str, bool] = {}
+        self._daily_errors: Dict[str, str] = {}
         self._last_alert_ts: Dict[str, float] = {}
         self._cycle_count: int = 0
         self._last_cycle_at: str = ""
@@ -7554,10 +7676,12 @@ class AutoAnalysisService:
 
         entry = {
             "code": cs,
+            "name": q.get("name"),
             "updated_at": q.get("received_at") or dt.datetime.now().isoformat(timespec="seconds"),
             "trading": res["trading"],
             "status": res["status"],
             "quote": {
+                "name": q.get("name"),
                 "price": q.get("price"), "pct": q.get("pct"), "chg": q.get("chg"),
                 "open": q.get("open"), "high": q.get("high"), "low": q.get("low"),
                 "prev": q.get("prev"), "avg": q.get("avg"), "vol": q.get("vol"),
@@ -7585,8 +7709,9 @@ class AutoAnalysisService:
                 last_sent = self._last_alert_ts.get(cs, 0.0)
                 if (now_wall - last_sent) >= 1800.0:
                     self._last_alert_ts[cs] = now_wall
-                    title = f"[盘中实时] {cs} {pred['direction']} P(涨)={p_up:.1f}%"
-                    body = (f"代码: {cs}\n现价: {pred['price']} ({q.get('pct')}%)\n"
+                    label = f"{cs} {q.get('name')}" if q.get("name") else cs
+                    title = f"[盘中实时] {label} {pred['direction']} P(涨)={p_up:.1f}%"
+                    body = (f"股票: {label}\n现价: {pred['price']} ({q.get('pct')}%)\n"
                             f"实时涨跌倾向: {pred['direction']} | P(涨)={p_up:.1f}% / P(跌)={pred['p_down_pct']:.1f}%\n"
                             f"微价格: {pred.get('micro_price')} | 五档失衡: {pred.get('weighted_obi_pct')}%\n"
                             f"⚠ {pred['disclaimer']}")
@@ -7628,6 +7753,30 @@ class AutoAnalysisService:
             self._daily_by_code[cs] = summary
         return summary
 
+    def trigger_daily_analysis_async(self, code: str) -> Dict[str, Any]:
+        """后台异步触发日线多模型分析，避免手机端 HTTP POST 长时间阻塞超时。"""
+        cs = str(code).strip()
+        if not re.fullmatch(r"\d{6}", cs):
+            raise ValueError("股票代码必须是六位数字。")
+        with self._lock:
+            if self._daily_running.get(cs):
+                return {"ok": True, "status": "running", "code": cs}
+            self._daily_running[cs] = True
+            self._daily_errors.pop(cs, None)
+
+        def _worker():
+            try:
+                self.run_daily_analysis(cs)
+            except Exception as exc:
+                with self._lock:
+                    self._daily_errors[cs] = str(exc)
+            finally:
+                with self._lock:
+                    self._daily_running[cs] = False
+
+        threading.Thread(target=_worker, name=f"DailyAsync-{cs}", daemon=True).start()
+        return {"ok": True, "status": "started", "code": cs}
+
     def get_state(self, code: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
             target = str(code).strip() if code and re.fullmatch(r"\d{6}", str(code).strip()) else self.active_code
@@ -7638,14 +7787,18 @@ class AutoAnalysisService:
                 "bar_period": self.bar_period,
                 "horizon_bars": self.horizon_bars,
                 "paused": self.paused,
+                "off_hours_slowdown": self.off_hours_slowdown,
                 "cycle_count": self._cycle_count,
                 "last_cycle_at": self._last_cycle_at,
                 "active": self._latest_by_code.get(target),
                 "active_error": self._errors_by_code.get(target),
                 "daily": self._daily_by_code.get(target),
+                "daily_running": bool(self._daily_running.get(target, False)),
+                "daily_error": self._daily_errors.get(target),
                 "watchlist_summary": [
                     {
                         "code": c,
+                        "name": (self._latest_by_code[c].get("name") if c in self._latest_by_code else None),
                         "price": (self._latest_by_code[c]["quote"]["price"] if c in self._latest_by_code else None),
                         "pct": (self._latest_by_code[c]["quote"]["pct"] if c in self._latest_by_code else None),
                         "p_up_pct": (self._latest_by_code[c]["intraday_prediction"]["p_up_pct"] if c in self._latest_by_code else None),
@@ -7661,6 +7814,7 @@ class AutoAnalysisService:
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             self._wake_event.clear()
+            wait_sec = self.interval_sec
             if not self.paused:
                 with self._lock:
                     # 优先刷新当前活跃股，再轮询1只自选列表其他股票（避免并发轰炸数据源）
@@ -7679,7 +7833,18 @@ class AutoAnalysisService:
                 with self._lock:
                     self._cycle_count += 1
                     self._last_cycle_at = dt.datetime.now().strftime("%H:%M:%S")
-            self._wake_event.wait(self.interval_sec)
+                    all_fetched = all(c in self._latest_by_code for c in self.codes)
+                try:
+                    trading_now, _ = is_trading_now()
+                except Exception:
+                    trading_now = True
+                if not trading_now and all_fetched:
+                    # 休市且所有盯盘股均已取得最新收盘快照 → 自动降频(至少120秒)，防夜间/周末空转刷接口
+                    wait_sec = max(self.interval_sec, 120.0)
+                    self.off_hours_slowdown = True
+                else:
+                    self.off_hours_slowdown = False
+            self._wake_event.wait(wait_sec)
 
 
 def _render_mobile_app_html(token_qs: str = "") -> str:
@@ -7773,12 +7938,14 @@ async function refresh() {{
     const r = await fetch(apiUrl('/api/state', curCode ? 'code=' + encodeURIComponent(curCode) : ''));
     const d = await r.json();
     if (!curCode) curCode = d.active_code;
-    document.getElementById('statusBadge').textContent = `自动轮询第${{d.cycle_count}}轮 · ${{d.last_cycle_at || '--'}}`;
+    const modeTxt = d.paused ? '已暂停' : (d.off_hours_slowdown ? '休市低频待机' : `自动轮询第${{d.cycle_count}}轮`);
+    document.getElementById('statusBadge').textContent = `${{modeTxt}} · ${{d.last_cycle_at || '--'}}`;
     const chips = document.getElementById('chips');
     chips.innerHTML = d.watchlist_summary.map(x => {{
+      const nm = x.name ? ` ${{x.name}}` : '';
       const pTxt = x.price != null ? ` ${{x.price}}` : '';
       const cls = x.code === d.active_code ? 'chip active' : 'chip';
-      return `<button class="${{cls}}" onclick="pickCode('${{x.code}}')">${{x.code}}${{pTxt}}</button>`;
+      return `<button class="${{cls}}" onclick="pickCode('${{x.code}}')">${{x.code}}${{nm}}${{pTxt}}</button>`;
     }}).join('');
     renderActive(d);
   }} catch (e) {{
@@ -7789,11 +7956,18 @@ async function refresh() {{
 function renderActive(d) {{
   const box = document.getElementById('mainCard');
   const fbox = document.getElementById('factorsCard');
+  const dailyBtn = document.getElementById('dailyBtn');
+  if (d.daily_running) {{
+    dailyBtn.disabled = true; dailyBtn.textContent = '后台计算中...';
+  }} else {{
+    dailyBtn.disabled = false; dailyBtn.textContent = '一键运行';
+  }}
   if (!d.active) {{
     box.innerHTML = d.active_error ? `<div class="up">拉取失败: ${{d.active_error}}</div>` : '<div class="muted">等待后台首次分析完成...</div>';
     return;
   }}
   const a = d.active, q = a.quote, p = a.intraday_prediction, v = a.live_verification || {{}};
+  const titleName = a.name ? `${{a.code}} ${{a.name}}` : a.code;
   const cls = (q.pct || 0) >= 0 ? 'up' : 'dn';
   const pctStr = q.pct != null ? (q.pct >= 0 ? '+' : '') + Number(q.pct).toFixed(2) + '%' : '--';
   const bf = p.bar_forecast;
@@ -7802,13 +7976,16 @@ function renderActive(d) {{
     | 80%区间 [${{bf.pred_lo}}, ${{bf.pred_hi}}]<br>
     样本外DA <b>${{bf.oos_da_pct}}%</b> vs 多数基准 <b>${{bf.majority_baseline_pct}}%</b> (n=${{bf.oos_n}})
   </div>` : '';
+  const histTxt = (v.hist_verified_n > 0 && v.hist_hit_rate_pct != null)
+    ? ` ｜ 累计落盘 <b>${{v.hist_verified_n}}</b> 次(命中 <b>${{v.hist_hit_rate_pct}}%</b>, 基准涨 ${{v.hist_baseline_up_pct}}%)`
+    : '';
   const verHtml = (v.verified_n > 0)
-    ? `<div class="muted" style="margin-top:6px">实盘滚动核验：已到期 <b>${{v.verified_n}}</b> 次，命中率 <b class="up">${{v.hit_rate_pct}}%</b> (同期实际涨 ${{v.baseline_up_pct}}%)</div>`
-    : `<div class="muted" style="margin-top:6px">实盘滚动核验：已记录 ${{v.total_recorded || 0}} 次，等待窗口到期验证</div>`;
+    ? `<div class="muted" style="margin-top:6px">实盘滚动核验：本次 <b>${{v.verified_n}}</b> 次，命中率 <b class="up">${{v.hit_rate_pct}}%</b> (同期实际涨 ${{v.baseline_up_pct}}%)${{histTxt}}</div>`
+    : `<div class="muted" style="margin-top:6px">实盘滚动核验：本次已记录 ${{v.total_recorded || 0}} 次，等待窗口到期${{histTxt}}</div>`;
 
   box.innerHTML = `
     <div class="row">
-      <div><b style="font-size:18px">${{a.code}}</b> <span class="muted">[${{a.status}}] ${{a.updated_at}}</span></div>
+      <div><b style="font-size:18px">${{titleName}}</b> <span class="muted">[${{a.status}}] ${{a.updated_at}}</span></div>
       <div class="muted">${{p.limit_state}}</div>
     </div>
     <div class="row" style="margin-top:6px">
@@ -7838,7 +8015,9 @@ function renderActive(d) {{
       p.factors.map(f => `<tr><td>${{f.name}}</td><td>${{f.value}}</td><td class="${{f.bias==='偏多'?'up':(f.bias==='偏空'?'dn':'')}}">${{f.bias}}</td><td>${{Math.round(f.weight*100)}}%</td></tr>`).join('') +
       '</table>';
   }}
-  if (d.daily) {{
+  if (d.daily_error) {{
+    document.getElementById('dailyBox').innerHTML = `<div class="up">日线计算失败: ${{d.daily_error}}</div>`;
+  }} else if (d.daily) {{
     const dm = d.daily;
     document.getElementById('dailyBox').innerHTML = `<div>更新: ${{dm.updated_at}}</div>` +
       '<table><tr><th>模型</th><th>DA%</th><th>UP_P%</th><th>RMSE</th></tr>' +
@@ -7862,13 +8041,10 @@ async function changeBar() {{
 }}
 async function runDaily() {{
   const btn = document.getElementById('dailyBtn');
-  btn.disabled = true; btn.textContent = '计算中...';
-  try {{
-    await fetch(apiUrl('/api/daily_analyze'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:curCode}})}});
-    await refresh();
-  }} finally {{
-    btn.disabled = false; btn.textContent = '一键运行';
-  }}
+  btn.disabled = true; btn.textContent = '后台计算中...';
+  document.getElementById('dailyBox').textContent = '已提交后台日线多模型计算，结果将在几秒内自动刷新...';
+  await fetch(apiUrl('/api/daily_analyze'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:curCode}})}});
+  setTimeout(refresh, 1500);
 }}
 function copyThs() {{
   const txt = THS.formula + '\\n\\n' + (THS.intraday_formula || '');
@@ -7922,7 +8098,8 @@ async function tick() {{
     const q = a.quote, p = a.intraday_prediction, v = a.live_verification || {{}};
     const cls = (q.pct || 0) >= 0 ? 'up' : 'dn';
     const pct = q.pct != null ? (q.pct >= 0 ? '+' : '') + Number(q.pct).toFixed(2) + '%' : '--';
-    document.getElementById('hdr').innerHTML = `<b>${{a.code}}</b> <span class="${{cls}}">${{q.price}} (${{pct}})</span>`;
+    const nm = a.name ? ` ${{a.name}}` : '';
+    document.getElementById('hdr').innerHTML = `<b>${{a.code}}${{nm}}</b> <span class="${{cls}}">${{q.price}} (${{pct}})</span>`;
     document.getElementById('bu').style.width = p.p_up_pct + '%';
     document.getElementById('bd').style.width = p.p_down_pct + '%';
     document.getElementById('sub').innerHTML =
@@ -8004,6 +8181,11 @@ class MobileWebServer:
                 elif parsed.path == "/api/ths_formula":
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(generate_ths_formula(), ensure_ascii=False).encode("utf-8"))
+                elif parsed.path == "/api/intraday_calibration":
+                    code = (qs.get("code") or [""])[0].strip() or None
+                    cal = intraday_calibration_summary(code=code, persist_dir=parent.service._tracker.persist_dir)
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(cal, ensure_ascii=False).encode("utf-8"))
                 else:
                     self._send(404, "application/json; charset=utf-8",
                                json.dumps({"error": "not found"}).encode("utf-8"))
@@ -8029,14 +8211,21 @@ class MobileWebServer:
                             parent.service.set_bar_params(payload["bar_period"], int(payload["horizon_bars"]))
                         if "paused" in payload:
                             parent.service.paused = bool(payload["paused"])
+                        if payload.get("refresh"):
+                            parent.service._wake_event.set()
                         self._send(200, "application/json; charset=utf-8",
                                    json.dumps({"ok": True, "active_code": parent.service.active_code},
                                               ensure_ascii=False).encode("utf-8"))
                     elif parsed.path == "/api/daily_analyze":
                         code = str(payload.get("code") or parent.service.active_code).strip()
-                        res = parent.service.run_daily_analysis(code)
-                        self._send(200, "application/json; charset=utf-8",
-                                   json.dumps({"ok": True, "daily": res}, ensure_ascii=False).encode("utf-8"))
+                        if payload.get("sync"):
+                            res = parent.service.run_daily_analysis(code)
+                            self._send(200, "application/json; charset=utf-8",
+                                       json.dumps({"ok": True, "daily": res}, ensure_ascii=False).encode("utf-8"))
+                        else:
+                            ack = parent.service.trigger_daily_analysis_async(code)
+                            self._send(202, "application/json; charset=utf-8",
+                                       json.dumps(ack, ensure_ascii=False).encode("utf-8"))
                     else:
                         self._send(404, "application/json; charset=utf-8",
                                    json.dumps({"error": "not found"}).encode("utf-8"))
@@ -11864,7 +12053,7 @@ if HAS_PYSIDE6:
             self._monitor_code = ""
             self._monitor_last_html = ""
             self._mon_snapshots = []
-            self._mon_tracker = IntradayPredictionTracker(horizon_sec=60.0)
+            self._mon_tracker = IntradayPredictionTracker(horizon_sec=60.0, persist_dir=MONITOR_DIR)
             self._mon_bar_cache = None
             self._mon_bar_last_ts = 0.0
             self._mobile_web_server = None
@@ -11914,6 +12103,8 @@ if HAS_PYSIDE6:
                 f"<p>• <b>手机完整版看盘</b>：<a href='{urls['mobile_url']}'>{urls['mobile_url']}</a><br>"
                 f"• <b>同花顺悬浮窗/分屏极简条</b>：<a href='{urls['widget_url']}'>{urls['widget_url']}</a><br>"
                 f"• 本机调试：<a href='{urls['local_url']}'>{urls['local_url']}</a></p>"
+                "<p style='color:#888;font-size:11px'>提示：① 若手机连同一 Wi-Fi 打不开，请检查 Windows 防火墙是否放行 Python 端口；"
+                "② 外出跨网访问建议使用 Tailscale/ZeroTier 组网并配合命令行 <code>--web-token</code>。</p>"
             )
             lay.addWidget(info)
             formula_box = QTextEdit()
@@ -11994,7 +12185,7 @@ if HAS_PYSIDE6:
             self._mon_snapshots = []
             self._mon_bar_cache = None
             self._mon_bar_last_ts = 0.0
-            self._mon_tracker = IntradayPredictionTracker(horizon_sec=max(60.0, sec * 3.0))
+            self._mon_tracker = IntradayPredictionTracker(horizon_sec=max(60.0, sec * 3.0), persist_dir=MONITOR_DIR)
             self._monitor_timer.start(sec * 1000)
             self.mon_start_btn.setEnabled(False); self.mon_stop_btn.setEnabled(True)
             self.mon_interval.setEnabled(False)
@@ -12112,7 +12303,9 @@ if HAS_PYSIDE6:
             col = "#c0392b" if (pct or 0) >= 0 else "#1a9d5a"
             now = q.get("received_at") or "接收时间未取得"
             st_col = "#1e8449" if trading else "#888"
-            head = (f"<h2>{code} 实时监控　<span style='color:{st_col}'>[{status}]</span>"
+            import html as _html
+            nm_str = f" {_html.escape(str(q['name']))}" if q.get("name") else ""
+            head = (f"<h2>{code}{nm_str} 实时监控　<span style='color:{st_col}'>[{status}]</span>"
                     f"　<span style='color:#888;font-size:12px'>更新 {now}</span></h2>"
                     f"<div style='font-size:22px;color:{col}'><b>{q.get('price','-')}</b>　"
                     f"{('%+.2f%%' % pct) if pct is not None else ''}　"
