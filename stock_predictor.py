@@ -7665,13 +7665,20 @@ def evaluate_orderbook_accuracy(
     }
 
 
-def orderbook_eval_report_html(ev: Dict[str, Any]) -> str:
-    """将 evaluate_orderbook_accuracy() 的结果渲染为手机友好 HTML 报告页。"""
+def orderbook_eval_report_html(ev: Dict[str, Any], light: bool = False) -> str:
+    """将 evaluate_orderbook_accuracy() 的结果渲染为 HTML 报告页(支持手机深色与桌面浅色主题)。"""
     import html as _html
 
-    if ev.get("error"):
-        return f"<html><body><h3>盘口回放评估</h3><p>{_html.escape(str(ev['error']))}</p></body></html>"
+    bg = "#ffffff" if light else "#0f172a"
+    fg = "#1e293b" if light else "#f1f5f9"
+    card_bg = "#f8fafc" if light else "#1e293b"
+    th_bg = "#eef2f7" if light else "#020617"
+    th_fg = "#334155" if light else "#94a3b8"
+    bd = "#cbd5e1" if light else "#334155"
 
+    if ev.get("error"):
+        return (f"<html><body style='font-family:-apple-system,sans-serif;padding:12px;background:{bg};color:{fg}'>"
+                f"<h3>盘口回放评估</h3><p>{_html.escape(str(ev['error']))}</p></body></html>")
     sig_rows = "".join(
         f"<tr><td>{_html.escape(s['signal'])}</td><td>{s['n_move']}</td>"
         f"<td><b>{s['da_pct'] if s['da_pct'] is not None else '-'}%</b></td>"
@@ -7692,16 +7699,16 @@ def orderbook_eval_report_html(ev: Dict[str, Any]) -> str:
     return (
         "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>body{font-family:-apple-system,sans-serif;padding:12px;background:#0f172a;color:#f1f5f9;font-size:13px}"
-        "table{width:100%;border-collapse:collapse;margin:8px 0;background:#1e293b}th,td{border:1px solid #334155;padding:6px;text-align:left}"
-        "th{background:#020617;color:#94a3b8}.card{background:#1e293b;border-radius:10px;padding:10px;margin-bottom:10px}</style></head><body>"
+        f"<style>body{{font-family:-apple-system,sans-serif;padding:12px;background:{bg};color:{fg};font-size:13px}}"
+        f"table{{width:100%;border-collapse:collapse;margin:8px 0;background:{card_bg}}}th,td{{border:1px solid {bd};padding:6px;text-align:left}}"
+        f"th{{background:{th_bg};color:{th_fg}}}.card{{background:{card_bg};border:1px solid {bd};border-radius:10px;padding:10px;margin-bottom:10px}}</style></head><body>"
         f"<div class='card'><h3>📊 买手卖手盘口回放准确性报告（前瞻 {ev['horizon_sec']:.0f}s）</h3>"
         f"<p>文件数={ev['n_files']} | 有效快照={ev['n_snapshots']} | 配对={ev['n_pairs']} (波动样本={ev['move_n']}, 平盘={ev['flat_n']}) | 整体多数基准={ev['majority_baseline_pct']}%</p></div>"
         f"<div class='card'><b>各盘口因子准确率 vs 多数类基准</b><table>"
         f"<tr><th>信号/因子</th><th>波动样本</th><th>方向准确率</th><th>多数基准</th><th>超额</th><th>方向均值(bps)</th><th>显著性</th></tr>{sig_rows}</table></div>"
         f"<div class='card'><b>按买卖五档失衡(W-OBI)分档实测效果</b><table>"
         f"<tr><th>买盘/卖盘分档</th><th>总样本</th><th>波动样本</th><th>实际涨占比</th><th>未来均值(bps)</th></tr>{wb_rows}</table></div>"
-        f"<p style='color:#fca5a5;font-size:12px'>⚠ {_html.escape(ev['disclaimer'])}</p></body></html>"
+        f"<p style='color:#c0392b;font-size:12px'>⚠ {_html.escape(ev['disclaimer'])}</p></body></html>"
     )
 
 
@@ -7949,6 +7956,7 @@ class AutoAnalysisService:
         self._daily_running: Dict[str, bool] = {}
         self._daily_errors: Dict[str, str] = {}
         self._last_alert_ts: Dict[str, float] = {}
+        self._offhours_persisted: set = set()
         self._cycle_count: int = 0
         self._last_cycle_at: str = ""
 
@@ -8002,11 +8010,26 @@ class AutoAnalysisService:
         if not force_bars and cached_entry is not None and (now_mono - cached_entry[0]) < 60.0:
             cached_bf = cached_entry[1]
 
+        try:
+            trading_now, _ = is_trading_now()
+        except Exception:
+            trading_now = True
+        with self._lock:
+            already_offhours = cs in self._offhours_persisted
+        # 盘中每次采集都落盘；休市期间每只股票只落盘 1 条收盘快照，避免夜间重复写入静态行
+        do_persist = bool(self.persist_snapshots and (trading_now or not already_offhours))
+
         res = collect_intraday_snapshot(
-            cs, persist=self.persist_snapshots, include_bars=(cached_bf is None),
+            cs, persist=do_persist, include_bars=(cached_bf is None),
             bar_period=bar_period, horizon_bars=horizon_bars,
             snapshots=snaps, cached_bar_forecast=cached_bf,
         )
+        if res.get("trading"):
+            with self._lock:
+                self._offhours_persisted.discard(cs)
+        elif do_persist:
+            with self._lock:
+                self._offhours_persisted.add(cs)
         q = res["quote"]
         pred = res["intraday_prediction"]
         bf = res.get("bar_forecast")
@@ -8396,25 +8419,39 @@ async function togglePause() {{
 }}
 async function forceRefresh() {{
   await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{refresh:true}})}});
-  setTimeout(refresh, 800);
+  setTimeout(() => {{ refresh(); loadEval(); }}, 800);
 }}
 async function loadEval() {{
   const h = document.getElementById('evalHor') ? document.getElementById('evalHor').value : '60';
   const box = document.getElementById('evalBox');
   if (!box) return;
   try {{
-    const q = (curCode ? 'code=' + encodeURIComponent(curCode) + '&' : '') + 'horizon=' + encodeURIComponent(h);
-    const r = await fetch(apiUrl('/api/orderbook_eval', q));
+    const cq = curCode ? 'code=' + encodeURIComponent(curCode) : '';
+    const q = (cq ? cq + '&' : '') + 'horizon=' + encodeURIComponent(h);
+    const [r, cr] = await Promise.all([
+      fetch(apiUrl('/api/orderbook_eval', q)),
+      fetch(apiUrl('/api/intraday_calibration', cq)),
+    ]);
     const ev = await r.json();
+    const cal = await cr.json();
+    let html = '';
     if (ev.error) {{
-      box.innerHTML = `<span class="muted">${{ev.error}}</span>`;
-      return;
+      html += `<div class="muted">${{ev.error}}</div>`;
+    }} else {{
+      const sigHtml = (ev.signals || []).map(s =>
+        `<tr><td>${{s.signal}}</td><td>${{s.n_move}}</td><td><b>${{s.da_pct ?? '-'}}%</b></td><td>${{s.majority_baseline_pct ?? '-'}}%</td><td class="${{(s.excess_pct||0)>0?'up':'dn'}}">${{s.excess_pct!=null?(s.excess_pct>=0?'+':'')+s.excess_pct+'%':'-'}}</td></tr>`
+      ).join('');
+      const wbHtml = (ev.wobi_buckets || []).map(b =>
+        `<tr><td>${{b.bucket}}</td><td>${{b.n}}</td><td>${{b.actual_up_pct ?? '-'}}%</td><td>${{b.mean_ret_bps>=0?'+':''}}${{b.mean_ret_bps}}</td></tr>`
+      ).join('');
+      html += `<div>配对样本 <b>${{ev.n_pairs}}</b> (波动 ${{ev.move_n}} | 多数基准 ${{ev.majority_baseline_pct}}%)</div>` +
+        `<table><tr><th>信号</th><th>样本</th><th>DA%</th><th>基准%</th><th>超额</th></tr>${{sigHtml}}</table>` +
+        (wbHtml ? `<table style="margin-top:6px"><tr><th>五档买手/卖手分档</th><th>样本</th><th>涨占比</th><th>均值bps</th></tr>${{wbHtml}}</table>` : '');
     }}
-    const sigHtml = (ev.signals || []).slice(0, 4).map(s =>
-      `<tr><td>${{s.signal}}</td><td>${{s.n_move}}</td><td><b>${{s.da_pct ?? '-'}}%</b></td><td>${{s.majority_baseline_pct ?? '-'}}%</td><td class="${{(s.excess_pct||0)>0?'up':'dn'}}">${{s.excess_pct!=null?(s.excess_pct>=0?'+':'')+s.excess_pct+'%':'-'}}</td></tr>`
-    ).join('');
-    box.innerHTML = `<div>配对样本 <b>${{ev.n_pairs}}</b> (波动 ${{ev.move_n}} | 多数基准 ${{ev.majority_baseline_pct}}%)</div>` +
-      `<table><tr><th>信号</th><th>样本</th><th>DA%</th><th>基准%</th><th>超额</th></tr>${{sigHtml}}</table>`;
+    if (cal && cal.verified_n > 0) {{
+      html += `<div class="muted" style="margin-top:6px">累计到期自动核验：<b>${{cal.verified_n}}</b> 次，实盘命中 <b>${{cal.hit_rate_pct}}%</b> (同期实际涨 ${{cal.baseline_up_pct}}%)</div>`;
+    }}
+    box.innerHTML = html;
   }} catch (e) {{
     box.textContent = '回放加载失败: ' + e;
   }}
@@ -8424,6 +8461,7 @@ async function pickCode(c) {{
   curCode = c;
   await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{code:c}})}});
   refresh();
+  loadEval();
 }}
 function switchCode() {{
   const c = document.getElementById('codeInput').value.trim();
@@ -8446,6 +8484,7 @@ function copyThs() {{
   navigator.clipboard.writeText(txt).then(() => alert('已复制同花顺副图公式（通用版+盘中短线版）！')).catch(() => alert('请长按下方代码块手动全选复制'));
 }}
 refresh();
+setTimeout(loadEval, 900);
 setInterval(refresh, 4000);
 </script>
 </body>
@@ -8478,7 +8517,10 @@ def _render_mobile_widget_html(token_qs: str = "") -> str:
   </div>
   <div class="bar"><div id="bu" style="background:#d63031;width:50%"></div><div id="bd" style="background:#00b894;width:50%"></div></div>
   <div class="top" id="sub"><span class="mu">等待实时数据...</span></div>
-  <div class="mu" style="margin-top:3px" id="foot">仅供参考·非买卖信号</div>
+  <div class="top" style="margin-top:3px">
+    <div class="mu" id="foot">仅供参考·非买卖信号</div>
+    <div><a href="/{token_qs}" style="color:#60a5fa;font-size:11px;text-decoration:none;margin-right:6px">看板↗</a><a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:11px;text-decoration:none">实测↗</a></div>
+  </div>
 </div>
 <script>
 const TQ = {json.dumps(token_qs)};
@@ -8501,8 +8543,9 @@ async function tick() {{
       `<span class="up">涨 ${{p.p_up_pct}}%</span><span>${{p.direction}}</span><span class="dn">跌 ${{p.p_down_pct}}%</span>`;
     const bf = p.bar_forecast;
     const ml = (bf && bf.available) ? `ML:${{bf.pred_ret_pct>=0?'+':''}}${{bf.pred_ret_pct}}%(DA:${{bf.oos_da_pct}}%)` : '盘口微结构';
+    const obi = p.weighted_obi_pct != null ? ` | 五档:${{p.weighted_obi_pct>=0?'+':''}}${{p.weighted_obi_pct}}%` : '';
     const hit = v.verified_n > 0 ? ` | 命中${{v.hit_rate_pct}}%` : '';
-    document.getElementById('foot').textContent = `${{ml}} | 微价:${{p.micro_price ?? '-'}}${{hit}} · 仅供参考`;
+    document.getElementById('foot').textContent = `${{ml}}${{obi}} | 微价:${{p.micro_price ?? '-'}}${{hit}}`;
   }} catch (e) {{}}
 }}
 async function setC() {{
@@ -12452,6 +12495,10 @@ if HAS_PYSIDE6:
             self.mon_sincerity_btn = QPushButton("🔍 挂单量变化")
             self.mon_sincerity_btn.clicked.connect(self._on_order_sincerity)
             top.addWidget(self.mon_sincerity_btn)
+            self.mon_eval_btn = QPushButton("📏 盘口回放准确率")
+            self.mon_eval_btn.setToolTip("严格因果回放已采集的五档买手/卖手快照，检验预测准确率与多数基准")
+            self.mon_eval_btn.clicked.connect(self._on_eval_orderbook)
+            top.addWidget(self.mon_eval_btn)
             self.mon_mobile_btn = QPushButton("📱 手机看板/同花顺浮窗")
             self.mon_mobile_btn.setStyleSheet("font-weight:bold; padding:6px; background:#2563eb; color:white;")
             self.mon_mobile_btn.setToolTip("启动手机端自动分析网页服务 + 安卓小窗/分屏悬浮条 + 导出同花顺副图公式")
@@ -12894,6 +12941,18 @@ if HAS_PYSIDE6:
                     "仅供研究，非投资建议、盈亏自负。</p>")
             self.mon_view.setHtml(html)
             self._oplog(f"挂单量变化：{code}。")
+
+        def _on_eval_orderbook(self):
+            """在桌面端回放检验已采集买手/卖手盘口的实盘预测准确率（对比多数类基准）。"""
+            code = self.code_edit.text().strip()
+            codes = [code] if re.fullmatch(r"\d{6}", code) else None
+            ev = evaluate_orderbook_accuracy(codes=codes, horizon_sec=60.0, monitor_dir=MONITOR_DIR)
+            if ev.get("error") and codes:
+                ev_all = evaluate_orderbook_accuracy(codes=None, horizon_sec=60.0, monitor_dir=MONITOR_DIR)
+                if not ev_all.get("error"):
+                    ev = ev_all
+            self.mon_view.setHtml(orderbook_eval_report_html(ev, light=True))
+            self._oplog(f"盘口回放准确率：配对={ev.get('n_pairs', 0)}，波动样本={ev.get('move_n', 0)}。")
 
         # ---- 9.2.1i2 监管披露观察名单标签页（策略四，见《机器学习输入输出设计报告》第七节）----
         def _build_regulatory_tab(self) -> QWidget:

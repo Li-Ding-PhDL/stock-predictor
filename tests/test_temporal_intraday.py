@@ -816,6 +816,7 @@ def test_evaluate_orderbook_accuracy_causal_and_cli(tmp_path, monkeypatch):
     cli_res = s.main()
     assert cli_res["n_pairs"] == len(prices) - 2
     assert out_json.exists() and json.loads(out_json.read_text(encoding="utf-8"))["n_pairs"] == len(prices) - 2
+    assert "#ffffff" in s.orderbook_eval_report_html(cli_res, light=True)
 
 
 def test_auto_service_persists_orderbook_and_eval_endpoints(tmp_path, monkeypatch):
@@ -831,9 +832,22 @@ def test_auto_service_persists_orderbook_and_eval_endpoints(tmp_path, monkeypatc
 
     svc = s.AutoAnalysisService(codes=["600519"], interval_sec=5.0, persist_dir=str(tmp_path), persist_snapshots=True)
     svc.analyze_code_once("600519")
+    svc.analyze_code_once("600519")
     csv_files = list(tmp_path.glob("monitor_600519_*.csv"))
     assert len(csv_files) == 1
-    assert "手" in csv_files[0].read_text(encoding="utf-8-sig")
+    lines_trading = [ln for ln in csv_files[0].read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
+    assert len(lines_trading) == 3  # header + 2 trading snapshots
+    assert "手" in lines_trading[1]
+
+    # 休市期间同代码多次轮询只保留 1 条收盘快照，避免夜间重复写入静态行
+    monkeypatch.setattr(s, "is_trading_now", lambda: (False, "休市"))
+    svc_off = s.AutoAnalysisService(codes=["000858"], interval_sec=5.0, persist_dir=str(tmp_path), persist_snapshots=True)
+    svc_off.analyze_code_once("000858")
+    svc_off.analyze_code_once("000858")
+    off_files = list(tmp_path.glob("monitor_000858_*.csv"))
+    assert len(off_files) == 1
+    lines_off = [ln for ln in off_files[0].read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
+    assert len(lines_off) == 2  # header + 1 offhours snapshot only
 
     srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
     srv.start(background=True)
@@ -843,5 +857,6 @@ def test_auto_service_persists_orderbook_and_eval_endpoints(tmp_path, monkeypatc
         assert ev["horizon_sec"] == 60.0
         html = urllib.request.urlopen(f"{base}/orderbook_eval?code=600519", timeout=3).read().decode("utf-8")
         assert "盘口回放" in html
+        assert "#ffffff" in s.orderbook_eval_report_html(ev, light=True)
     finally:
         srv.stop()
