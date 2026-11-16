@@ -743,3 +743,105 @@ def test_auto_service_async_daily_and_name_propagation(tmp_path, monkeypatch):
         assert cal["verified_n"] == 0
     finally:
         srv.stop()
+
+
+def _write_synthetic_monitor_csv(path, rows):
+    import csv
+
+    fields = [
+        "time", "price", "pct", "vol_ratio", "turnover",
+        "buy1_p", "buy1_v", "buy2_p", "buy2_v", "buy3_p", "buy3_v", "buy4_p", "buy4_v", "buy5_p", "buy5_v",
+        "sell1_p", "sell1_v", "sell2_p", "sell2_v", "sell3_p", "sell3_v", "sell4_p", "sell4_v", "sell5_p", "sell5_v",
+        "avg", "vol", "amount", "main_net", "main_pct", "book_volume_unit",
+    ]
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        wr = csv.DictWriter(fh, fieldnames=fields)
+        wr.writeheader()
+        for r in rows:
+            wr.writerow(r)
+
+
+def test_evaluate_orderbook_accuracy_causal_and_cli(tmp_path, monkeypatch):
+    import datetime as dt
+
+    csv_path = tmp_path / "monitor_600519_20261116.csv"
+    t0 = dt.datetime(2026, 11, 16, 10, 0, 0)
+    rows = []
+    # 先插入一条缺少 book_volume_unit="手" 的旧记录，验证会被过滤
+    rows.append({
+        "time": (t0 - dt.timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),
+        "price": 100.0, "buy1_p": 99.9, "buy1_v": 900, "sell1_p": 100.0, "sell1_v": 10,
+        "book_volume_unit": "",
+    })
+    prices = [100.0, 100.1, 100.2, 100.3, 100.2, 100.1, 100.0, 100.2, 100.4, 100.6, 100.5, 100.3]
+    for i, px in enumerate(prices):
+        fut_up = (i + 2 < len(prices)) and (prices[i + 2] > px)
+        bv = 600.0 if fut_up else 30.0
+        sv = 30.0 if fut_up else 600.0
+        rows.append({
+            "time": (t0 + dt.timedelta(seconds=30 * i)).strftime("%Y-%m-%d %H:%M:%S"),
+            "price": px,
+            "avg": px - 0.1 if fut_up else px + 0.1,
+            "buy1_p": px - 0.01, "buy1_v": bv, "buy2_p": px - 0.02, "buy2_v": bv,
+            "sell1_p": px + 0.01, "sell1_v": sv, "sell2_p": px + 0.02, "sell2_v": sv,
+            "vol": 1000 + i * 100,
+            "amount": 1e6 + i * 1e5,
+            "book_volume_unit": "手",
+        })
+    _write_synthetic_monitor_csv(csv_path, rows)
+
+    ev = s.evaluate_orderbook_accuracy(codes=["600519"], horizon_sec=60.0, monitor_dir=str(tmp_path))
+    assert ev["n_files"] == 1
+    assert ev["excluded_unverified_rows"] == 1
+    assert ev["n_snapshots"] == len(prices)
+    assert ev["n_pairs"] == len(prices) - 2
+    assert ev["flat_n"] == 1 and ev["move_n"] == len(prices) - 3
+    sig_map = {x["signal"]: x for x in ev["signals"]}
+    wobi_sig = sig_map["买手卖手五档失衡(W-OBI)"]
+    assert wobi_sig["n_move"] == ev["move_n"]
+    assert wobi_sig["da_pct"] > wobi_sig["majority_baseline_pct"]
+    assert {b["bucket"] for b in ev["wobi_buckets"]} >= {"强买盘(W-OBI>=+25%)", "强卖盘(W-OBI<=-25%)"}
+
+    # 因果防泄露：prefix 文件只有前5条有效快照（rows[0]为无效旧格式），与追加未来行情截断回放保持一致
+    prefix_dir = tmp_path / "prefix_only"
+    prefix_dir.mkdir()
+    _write_synthetic_monitor_csv(prefix_dir / "monitor_600519_20261116.csv", rows[:6])
+    ev_prefix = s.evaluate_orderbook_accuracy(codes=["600519"], horizon_sec=30.0, monitor_dir=str(prefix_dir))
+    assert ev_prefix["n_snapshots"] == 5 and ev_prefix["n_pairs"] == 4
+
+    # 完整 CSV 配 --eval-orderbook CLI + --json 输出
+    monkeypatch.setattr(s, "MONITOR_DIR", str(tmp_path))
+    out_json = tmp_path / "eval.json"
+    monkeypatch.setattr(s.sys, "argv", ["stock_predictor.py", "--eval-orderbook", "--eval-horizon", "60", "--json", str(out_json)])
+    cli_res = s.main()
+    assert cli_res["n_pairs"] == len(prices) - 2
+    assert out_json.exists() and json.loads(out_json.read_text(encoding="utf-8"))["n_pairs"] == len(prices) - 2
+
+
+def test_auto_service_persists_orderbook_and_eval_endpoints(tmp_path, monkeypatch):
+    import urllib.request
+
+    bars = _synthetic_intraday_bars(n=80)
+    q = dict(_quote(), name="贵州茅台", bids=[(100.0, 420.0)], asks=[(100.1, 40.0)], book_volume_unit="手")
+    monkeypatch.setattr(s, "MONITOR_DIR", str(tmp_path))
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime", lambda code: dict(q))
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_realtime_fundflow", lambda code: None)
+    monkeypatch.setattr(s.StockDataFetcher, "fetch_intraday_bars", lambda code, period="5": bars)
+    monkeypatch.setattr(s, "is_trading_now", lambda: (True, "盘中"))
+
+    svc = s.AutoAnalysisService(codes=["600519"], interval_sec=5.0, persist_dir=str(tmp_path), persist_snapshots=True)
+    svc.analyze_code_once("600519")
+    csv_files = list(tmp_path.glob("monitor_600519_*.csv"))
+    assert len(csv_files) == 1
+    assert "手" in csv_files[0].read_text(encoding="utf-8-sig")
+
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
+    srv.start(background=True)
+    try:
+        base = f"http://127.0.0.1:{srv.port}"
+        ev = json.loads(urllib.request.urlopen(f"{base}/api/orderbook_eval?code=600519", timeout=3).read().decode("utf-8"))
+        assert ev["horizon_sec"] == 60.0
+        html = urllib.request.urlopen(f"{base}/orderbook_eval?code=600519", timeout=3).read().decode("utf-8")
+        assert "盘口回放" in html
+    finally:
+        srv.stop()

@@ -7370,6 +7370,341 @@ def analyze_order_sincerity(code: str, day: Optional[str] = None) -> Dict[str, A
     }
 
 
+def _parse_snapshot_csv_rows(path: str) -> Tuple[List[Dict[str, Any]], int]:
+    """解析 monitor_{code}_{day}.csv 中严格标注为「手」的快照行，按时间升序返回。"""
+    import csv
+
+    def _fnum(v: Any, positive: bool = False) -> Optional[float]:
+        try:
+            x = float(v)
+            if not np.isfinite(x):
+                return None
+            return x if (not positive or x > 0) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_ts(row: Dict[str, Any]) -> Optional[float]:
+        for key in ("time", "received_at"):
+            raw = str(row.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                return dt.datetime.fromisoformat(raw.replace("Z", "")).timestamp()
+            except ValueError:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    return dt.datetime.strptime(raw[:19], fmt).timestamp()
+                except ValueError:
+                    continue
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    excluded = 0
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for r in csv.DictReader(fh):
+            if str(r.get("book_volume_unit") or "").strip() != "手":
+                excluded += 1
+                continue
+            ts = _parse_ts(r)
+            price = _fnum(r.get("price"), positive=True)
+            if ts is None or price is None:
+                excluded += 1
+                continue
+            bids, asks = [], []
+            for side, pref in ((bids, "buy"), (asks, "sell")):
+                for idx in range(1, 6):
+                    bp = _fnum(r.get(f"{pref}{idx}_p"), positive=True)
+                    bv = _fnum(r.get(f"{pref}{idx}_v"))
+                    if bp is not None and bv is not None and bv >= 0:
+                        side.append((bp, bv))
+            avg = _fnum(r.get("avg"), positive=True)
+            rows.append({
+                "ts": ts,
+                "time": str(r.get("time") or r.get("received_at") or ""),
+                "price": price,
+                "pct": _fnum(r.get("pct")),
+                "open": _fnum(r.get("open"), positive=True),
+                "high": _fnum(r.get("high"), positive=True),
+                "low": _fnum(r.get("low"), positive=True),
+                "prev": _fnum(r.get("prev"), positive=True),
+                "avg": avg,
+                "vs_avg_pct": ((price / avg - 1.0) * 100.0) if avg else None,
+                "vol": _fnum(r.get("vol")),
+                "amount": _fnum(r.get("amount")),
+                "main_net": _fnum(r.get("main_net")),
+                "main_pct": _fnum(r.get("main_pct")),
+                "book_volume_unit": "手",
+                "bids": bids,
+                "asks": asks,
+            })
+    rows.sort(key=lambda x: x["ts"])
+    return rows, excluded
+
+
+_DEFAULT_MONITOR_DIR = object()
+
+
+def evaluate_orderbook_accuracy(
+    codes: Optional[List[str]] = None,
+    horizon_sec: float = 60.0,
+    monitor_dir: Any = _DEFAULT_MONITOR_DIR,
+    day: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    严格因果回放已采集的五档买手/卖手快照(monitor_{code}_{day}.csv)，检验盘口因子与综合实时评分
+    对未来 horizon_sec 秒涨跌的真实样本外准确率，并强制对比多数类基准(总是涨/总是跌)与显著性 p 值。
+    """
+    from bisect import bisect_left
+
+    if monitor_dir is _DEFAULT_MONITOR_DIR:
+        monitor_dir = MONITOR_DIR
+
+    horizon = max(5.0, float(horizon_sec))
+    max_gap = max(300.0, horizon * 5.0)
+    code_filter = {str(c).strip() for c in (codes or []) if str(c).strip()}
+    day_filter = str(day).strip() if day else None
+
+    if not monitor_dir or not os.path.isdir(monitor_dir):
+        return {
+            "n_files": 0, "n_snapshots": 0, "n_pairs": 0, "move_n": 0,
+            "horizon_sec": horizon, "signals": [], "wobi_buckets": [], "p_up_buckets": [],
+            "by_code": [], "excluded_unverified_rows": 0,
+            "error": f"快照目录不存在: {monitor_dir}；请先运行 --web / --monitor / --snapshot 采集盘中买手卖手快照。",
+            "disclaimer": "盘口历史回放仅供参考，不构成买卖信号或投资建议、盈亏自负。",
+        }
+
+    pat = re.compile(r"^monitor_(\d{6})_(\d{8})\.csv$")
+    matched_files: List[Tuple[str, str, str]] = []
+    for fname in sorted(os.listdir(monitor_dir)):
+        m = pat.match(fname)
+        if not m:
+            continue
+        fcode, fday = m.group(1), m.group(2)
+        if code_filter and fcode not in code_filter:
+            continue
+        if day_filter and fday != day_filter:
+            continue
+        matched_files.append((fcode, fday, os.path.join(monitor_dir, fname)))
+
+    if not matched_files:
+        return {
+            "n_files": 0, "n_snapshots": 0, "n_pairs": 0, "move_n": 0,
+            "horizon_sec": horizon, "signals": [], "wobi_buckets": [], "p_up_buckets": [],
+            "by_code": [], "excluded_unverified_rows": 0,
+            "error": "未找到满足条件的 monitor_{code}_{day}.csv 快照文件。",
+            "disclaimer": "盘口历史回放仅供参考，不构成买卖信号或投资建议、盈亏自负。",
+        }
+
+    paired_events: List[Dict[str, Any]] = []
+    total_snaps = 0
+    total_excluded = 0
+
+    for fcode, fday, fpath in matched_files:
+        snaps, excl = _parse_snapshot_csv_rows(fpath)
+        total_excluded += excl
+        total_snaps += len(snaps)
+        if len(snaps) < 2:
+            continue
+        ts_list = [s["ts"] for s in snaps]
+        for i, cur in enumerate(snaps):
+            j = bisect_left(ts_list, cur["ts"] + horizon, lo=i + 1)
+            if j >= len(snaps):
+                continue
+            dt_gap = ts_list[j] - cur["ts"]
+            if dt_gap > max_gap:
+                continue
+            # 严格因果：t_i 时刻仅能看到 snaps[:i+1]，绝不读取未来快照
+            hist = snaps[max(0, i - 11):i + 1]
+            ff = None
+            if cur["main_net"] is not None or cur["main_pct"] is not None:
+                ff = {"main_net": cur["main_net"], "main_pct": cur["main_pct"]}
+            pred = compute_intraday_realtime_prediction(cur, snapshots=hist, fundflow=ff)
+            fut_price = snaps[j]["price"]
+            ret_bps = (fut_price / cur["price"] - 1.0) * 10000.0
+            diff_dir = 1 if fut_price > cur["price"] else (-1 if fut_price < cur["price"] else 0)
+            paired_events.append({
+                "code": fcode,
+                "day": fday,
+                "t0": cur["time"],
+                "dt_sec": round(dt_gap, 1),
+                "ret_bps": ret_bps,
+                "actual_dir": diff_dir,
+                "p_up_pct": pred.get("p_up_pct"),
+                "score": pred.get("score"),
+                "w_obi": pred.get("weighted_obi_pct"),
+                "micro_edge_bps": pred.get("micro_edge_bps"),
+                "book_delta_pct": pred.get("book_delta_pct"),
+                "vs_avg_pct": cur.get("vs_avg_pct"),
+            })
+
+    n_pairs = len(paired_events)
+    if n_pairs == 0:
+        return {
+            "n_files": len(matched_files), "n_snapshots": total_snaps,
+            "n_pairs": 0, "move_n": 0, "horizon_sec": horizon,
+            "signals": [], "wobi_buckets": [], "p_up_buckets": [], "by_code": [],
+            "excluded_unverified_rows": total_excluded,
+            "error": f"有效快照共 {total_snaps} 条，但无法配对出间隔 [{horizon:.0f}s, {max_gap:.0f}s] 的同日样本。",
+            "disclaimer": "盘口历史回放仅供参考，不构成买卖信号或投资建议、盈亏自负。",
+        }
+
+    move_events = [e for e in paired_events if e["actual_dir"] != 0]
+    flat_n = n_pairs - len(move_events)
+    move_up_n = sum(1 for e in move_events if e["actual_dir"] > 0)
+    move_n = len(move_events)
+    actual_up_rate = round(move_up_n / move_n * 100.0, 2) if move_n else None
+    overall_maj = round(max(move_up_n, move_n - move_up_n) / move_n * 100.0, 2) if move_n else None
+
+    def _eval_signal(label: str, dir_fn) -> Dict[str, Any]:
+        triggered_all = [(dir_fn(e), e) for e in paired_events if dir_fn(e) != 0]
+        triggered_move = [(d, e) for d, e in triggered_all if e["actual_dir"] != 0]
+        nm = len(triggered_move)
+        if nm == 0:
+            return {"signal": label, "n_trigger": len(triggered_all), "n_move": 0,
+                    "da_pct": None, "majority_baseline_pct": None, "excess_pct": None,
+                    "pred_up_pct": None, "mean_ret_bps": None, "signed_ret_bps": None,
+                    "p_val": None, "sig": False, "sig_text": "无有效波动样本"}
+        hits = sum(1 for d, e in triggered_move if d == e["actual_dir"])
+        ups = sum(1 for _, e in triggered_move if e["actual_dir"] > 0)
+        pred_ups = sum(1 for d, _ in triggered_move if d > 0)
+        da_pct = round(hits / nm * 100.0, 2)
+        maj_pct = round(max(ups, nm - ups) / nm * 100.0, 2)
+        sig = da_significance(da_pct, nm)
+        mean_bps = round(sum(e["ret_bps"] for _, e in triggered_all) / len(triggered_all), 2)
+        signed_bps = round(sum(d * e["ret_bps"] for d, e in triggered_all) / len(triggered_all), 2)
+        return {
+            "signal": label,
+            "n_trigger": len(triggered_all),
+            "n_move": nm,
+            "da_pct": da_pct,
+            "majority_baseline_pct": maj_pct,
+            "excess_pct": round(da_pct - maj_pct, 2),
+            "pred_up_pct": round(pred_ups / nm * 100.0, 1),
+            "mean_ret_bps": mean_bps,
+            "signed_ret_bps": signed_bps,
+            "p_val": sig["p"],
+            "sig": bool(sig["sig"]),
+            "sig_text": sig["text"],
+        }
+
+    signal_specs = [
+        ("综合实时评分(P涨>=55/<=45)", lambda e: 1 if (e["p_up_pct"] is not None and e["p_up_pct"] >= 55.0) else (-1 if (e["p_up_pct"] is not None and e["p_up_pct"] <= 45.0) else 0)),
+        ("综合实时方向(得分>0/<0)", lambda e: 1 if (e["score"] is not None and e["score"] > 0) else (-1 if (e["score"] is not None and e["score"] < 0) else 0)),
+        ("买手卖手五档失衡(W-OBI)", lambda e: 1 if (e["w_obi"] is not None and e["w_obi"] > 0) else (-1 if (e["w_obi"] is not None and e["w_obi"] < 0) else 0)),
+        ("微价格偏离(MicroPrice)", lambda e: 1 if (e["micro_edge_bps"] is not None and e["micro_edge_bps"] > 0) else (-1 if (e["micro_edge_bps"] is not None and e["micro_edge_bps"] < 0) else 0)),
+        ("挂单增减动量(BookDelta)", lambda e: 1 if (e["book_delta_pct"] is not None and e["book_delta_pct"] > 0) else (-1 if (e["book_delta_pct"] is not None and e["book_delta_pct"] < 0) else 0)),
+        ("分时均价偏离(vs_avg)", lambda e: 1 if (e["vs_avg_pct"] is not None and e["vs_avg_pct"] > 0) else (-1 if (e["vs_avg_pct"] is not None and e["vs_avg_pct"] < 0) else 0)),
+    ]
+    signals = [_eval_signal(lbl, fn) for lbl, fn in signal_specs]
+
+    def _bucket_rows(key: str, bins: List[Tuple[str, float, float]]) -> List[Dict[str, Any]]:
+        out = []
+        for lbl, lo, hi in bins:
+            sub = [e for e in paired_events if e[key] is not None and lo <= e[key] < hi]
+            if not sub:
+                continue
+            sub_mv = [e for e in sub if e["actual_dir"] != 0]
+            up_r = round(sum(1 for e in sub_mv if e["actual_dir"] > 0) / len(sub_mv) * 100.0, 1) if sub_mv else None
+            out.append({
+                "bucket": lbl,
+                "n": len(sub),
+                "move_n": len(sub_mv),
+                "actual_up_pct": up_r,
+                "mean_ret_bps": round(sum(e["ret_bps"] for e in sub) / len(sub), 2),
+            })
+        return out
+
+    wobi_buckets = _bucket_rows("w_obi", [
+        ("强买盘(W-OBI>=+25%)", 25.0, 1000.0),
+        ("偏多买盘(+5%~+25%)", 5.0, 25.0),
+        ("买卖均衡(-5%~+5%)", -5.0, 5.0),
+        ("偏空卖盘(-25%~-5%)", -25.0, -5.0),
+        ("强卖盘(W-OBI<=-25%)", -1000.0, -25.0),
+    ])
+    p_up_buckets = _bucket_rows("p_up_pct", [
+        ("高看涨(P>=58%)", 58.0, 101.0),
+        ("偏多(55-58%)", 55.0, 58.0),
+        ("震荡(45-55%)", 45.0, 55.0),
+        ("偏空(42-45%)", 42.0, 45.0),
+        ("高看跌(P<=42%)", 0.0, 42.0),
+    ])
+
+    by_code: List[Dict[str, Any]] = []
+    for c in sorted({e["code"] for e in paired_events}):
+        c_all = [e for e in paired_events if e["code"] == c]
+        c_mv = [e for e in c_all if e["actual_dir"] != 0 and e["score"] is not None and e["score"] != 0]
+        if c_mv:
+            c_hits = sum(1 for e in c_mv if (e["score"] > 0) == (e["actual_dir"] > 0))
+            c_ups = sum(1 for e in c_mv if e["actual_dir"] > 0)
+            c_da = round(c_hits / len(c_mv) * 100.0, 2)
+            c_maj = round(max(c_ups, len(c_mv) - c_ups) / len(c_mv) * 100.0, 2)
+            c_ex = round(c_da - c_maj, 2)
+        else:
+            c_da = c_maj = c_ex = None
+        by_code.append({
+            "code": c, "n_pairs": len(c_all), "move_n": len(c_mv),
+            "da_pct": c_da, "majority_baseline_pct": c_maj, "excess_pct": c_ex,
+        })
+
+    return {
+        "n_files": len(matched_files),
+        "n_snapshots": total_snaps,
+        "excluded_unverified_rows": total_excluded,
+        "n_pairs": n_pairs,
+        "move_n": move_n,
+        "flat_n": flat_n,
+        "horizon_sec": horizon,
+        "actual_up_rate_pct": actual_up_rate,
+        "majority_baseline_pct": overall_maj,
+        "signals": signals,
+        "wobi_buckets": wobi_buckets,
+        "p_up_buckets": p_up_buckets,
+        "by_code": by_code,
+        "disclaimer": "盘口历史回放仅反映已采集时段的样本特征，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。",
+    }
+
+
+def orderbook_eval_report_html(ev: Dict[str, Any]) -> str:
+    """将 evaluate_orderbook_accuracy() 的结果渲染为手机友好 HTML 报告页。"""
+    import html as _html
+
+    if ev.get("error"):
+        return f"<html><body><h3>盘口回放评估</h3><p>{_html.escape(str(ev['error']))}</p></body></html>"
+
+    sig_rows = "".join(
+        f"<tr><td>{_html.escape(s['signal'])}</td><td>{s['n_move']}</td>"
+        f"<td><b>{s['da_pct'] if s['da_pct'] is not None else '-'}%</b></td>"
+        f"<td>{s['majority_baseline_pct'] if s['majority_baseline_pct'] is not None else '-'}%</td>"
+        f"<td style='color:{'#c0392b' if (s['excess_pct'] or 0) > 0 else '#1a9d5a'}'>{s['excess_pct']:+.2f}%</td>"
+        f"<td>{s['signed_ret_bps'] if s['signed_ret_bps'] is not None else '-'}</td>"
+        f"<td>{'✅' if s['sig'] else '➖'} {_html.escape(str(s['sig_text']))}</td></tr>"
+        if s["excess_pct"] is not None else
+        f"<tr><td>{_html.escape(s['signal'])}</td><td>0</td><td>-</td><td>-</td><td>-</td><td>-</td><td>样本不足</td></tr>"
+        for s in (ev.get("signals") or [])
+    )
+    wb_rows = "".join(
+        f"<tr><td>{_html.escape(b['bucket'])}</td><td>{b['n']}</td><td>{b['move_n']}</td>"
+        f"<td>{b['actual_up_pct'] if b['actual_up_pct'] is not None else '-'}%</td>"
+        f"<td>{b['mean_ret_bps']:+.2f}</td></tr>"
+        for b in (ev.get("wobi_buckets") or [])
+    )
+    return (
+        "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>body{font-family:-apple-system,sans-serif;padding:12px;background:#0f172a;color:#f1f5f9;font-size:13px}"
+        "table{width:100%;border-collapse:collapse;margin:8px 0;background:#1e293b}th,td{border:1px solid #334155;padding:6px;text-align:left}"
+        "th{background:#020617;color:#94a3b8}.card{background:#1e293b;border-radius:10px;padding:10px;margin-bottom:10px}</style></head><body>"
+        f"<div class='card'><h3>📊 买手卖手盘口回放准确性报告（前瞻 {ev['horizon_sec']:.0f}s）</h3>"
+        f"<p>文件数={ev['n_files']} | 有效快照={ev['n_snapshots']} | 配对={ev['n_pairs']} (波动样本={ev['move_n']}, 平盘={ev['flat_n']}) | 整体多数基准={ev['majority_baseline_pct']}%</p></div>"
+        f"<div class='card'><b>各盘口因子准确率 vs 多数类基准</b><table>"
+        f"<tr><th>信号/因子</th><th>波动样本</th><th>方向准确率</th><th>多数基准</th><th>超额</th><th>方向均值(bps)</th><th>显著性</th></tr>{sig_rows}</table></div>"
+        f"<div class='card'><b>按买卖五档失衡(W-OBI)分档实测效果</b><table>"
+        f"<tr><th>买盘/卖盘分档</th><th>总样本</th><th>波动样本</th><th>实际涨占比</th><th>未来均值(bps)</th></tr>{wb_rows}</table></div>"
+        f"<p style='color:#fca5a5;font-size:12px'>⚠ {_html.escape(ev['disclaimer'])}</p></body></html>"
+    )
+
+
 # ==================== 第八部分补充6b：手机移动端自动分析服务 + 同花顺浮窗/副图公式 ====================
 def _ths_fit_linear_weights(df: Optional[pd.DataFrame], horizon: int = 1) -> Tuple[Dict[str, float], Optional[Dict[str, Any]]]:
     """用因果时间序列切分与 Ridge 回归，为同花顺公式的 6 个平稳量价特征拟合数据校准权重。
@@ -7578,7 +7913,8 @@ class AutoAnalysisService:
     def __init__(self, codes: Optional[List[str]] = None, interval_sec: float = 10.0,
                  bar_period: str = "5", horizon_bars: int = 3,
                  push_spec: str = "", alert_prob: float = 64.0,
-                 persist_dir: Optional[str] = MONITOR_DIR):
+                 persist_dir: Optional[str] = MONITOR_DIR,
+                 persist_snapshots: bool = False):
         clean_codes = []
         for c in (codes or list(USER_WATCHLIST_CODES[:5]) or ["600519"]):
             cs = str(c).strip()
@@ -7593,6 +7929,8 @@ class AutoAnalysisService:
         self.horizon_bars: int = max(1, int(horizon_bars))
         self.push_spec: str = str(push_spec or "").strip()
         self.alert_prob: float = float(np.clip(alert_prob, 55.0, 75.0))
+        self.persist_snapshots: bool = bool(persist_snapshots)
+        self.snapshot_persist_dir: Optional[str] = persist_dir
         self.paused: bool = False
         self.off_hours_slowdown: bool = False
 
@@ -7665,7 +8003,7 @@ class AutoAnalysisService:
             cached_bf = cached_entry[1]
 
         res = collect_intraday_snapshot(
-            cs, persist=False, include_bars=(cached_bf is None),
+            cs, persist=self.persist_snapshots, include_bars=(cached_bf is None),
             bar_period=bar_period, horizon_bars=horizon_bars,
             snapshots=snaps, cached_bar_forecast=cached_bf,
         )
@@ -7787,6 +8125,7 @@ class AutoAnalysisService:
                 "bar_period": self.bar_period,
                 "horizon_bars": self.horizon_bars,
                 "paused": self.paused,
+                "persist_snapshots": self.persist_snapshots,
                 "off_hours_slowdown": self.off_hours_slowdown,
                 "cycle_count": self._cycle_count,
                 "last_cycle_at": self._last_cycle_at,
@@ -7897,13 +8236,31 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
         <option value="1:5">1分钟·5m预测</option>
         <option value="15:4">15分钟·60m预测</option>
       </select>
-      <a href="/widget{token_qs}" style="color:#60a5fa;font-size:12px;text-decoration:none">同花顺浮窗模式↗</a>
+      <button id="pauseBtn" class="sec" onclick="togglePause()">暂停轮询</button>
+      <button class="sec" onclick="forceRefresh()">立即刷新</button>
+      <a href="/widget{token_qs}" style="color:#60a5fa;font-size:12px;text-decoration:none">同花顺浮窗↗</a>
+      <a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:12px;text-decoration:none">盘口回放准确率↗</a>
     </div>
     <div id="chips" class="chips" style="margin-top:8px"></div>
   </div>
 
   <div id="mainCard" class="card"><div class="muted">正在拉取实时行情并计算...</div></div>
   <div id="factorsCard" class="card" style="display:none"></div>
+
+  <div class="card">
+    <div class="row">
+      <b>📏 买手/卖手盘口准确率实测（历史快照因果回放）</b>
+      <div>
+        <select id="evalHor" onchange="loadEval()">
+          <option value="30">前瞻30秒</option>
+          <option value="60" selected>前瞻60秒</option>
+          <option value="180">前瞻3分钟</option>
+        </select>
+        <button class="sec" onclick="loadEval()">刷新评测</button>
+      </div>
+    </div>
+    <div id="evalBox" class="muted" style="margin-top:6px">开启后自动把五档买手/卖手落盘到 monitor_log/，点击「刷新评测」即可对比多数基准的实盘命中率。</div>
+  </div>
 
   <div class="card">
     <div class="row">
@@ -7939,7 +8296,11 @@ async function refresh() {{
     const d = await r.json();
     if (!curCode) curCode = d.active_code;
     const modeTxt = d.paused ? '已暂停' : (d.off_hours_slowdown ? '休市低频待机' : `自动轮询第${{d.cycle_count}}轮`);
-    document.getElementById('statusBadge').textContent = `${{modeTxt}} · ${{d.last_cycle_at || '--'}}`;
+    const saveTxt = d.persist_snapshots ? ' · 落盘采集中' : '';
+    document.getElementById('statusBadge').textContent = `${{modeTxt}}${{saveTxt}} · ${{d.last_cycle_at || '--'}}`;
+    const pbtn = document.getElementById('pauseBtn');
+    if (pbtn) pbtn.textContent = d.paused ? '继续轮询' : '暂停轮询';
+    window._curPaused = Boolean(d.paused);
     const chips = document.getElementById('chips');
     chips.innerHTML = d.watchlist_summary.map(x => {{
       const nm = x.name ? ` ${{x.name}}` : '';
@@ -8019,9 +8380,43 @@ function renderActive(d) {{
     document.getElementById('dailyBox').innerHTML = `<div class="up">日线计算失败: ${{d.daily_error}}</div>`;
   }} else if (d.daily) {{
     const dm = d.daily;
+    const fc = (dm.forecast || []).filter(f => !f.error).map(f =>
+      `<div><b>${{f.algo}}</b> 明日预估 <b>${{f.pred_close}}</b> (<span class="${{f.pred_change_pct>=0?'up':'dn'}}">${{f.pred_change_pct>=0?'+':''}}${{f.pred_change_pct}}%</span>)</div>`
+    ).join('');
+    const tg = dm.trust_gate && dm.trust_gate.n_models ? `<div class="muted" style="margin-top:4px">可信度闸门: <b>${{dm.trust_gate.n_passed}}/${{dm.trust_gate.n_models}}</b> 通过</div>` : '';
     document.getElementById('dailyBox').innerHTML = `<div>更新: ${{dm.updated_at}}</div>` +
       '<table><tr><th>模型</th><th>DA%</th><th>UP_P%</th><th>RMSE</th></tr>' +
-      dm.models.map(m => `<tr><td>${{m.algo}}</td><td>${{m.da}}</td><td>${{m.up_p}}</td><td>${{m.rmse}}</td></tr>`).join('') + '</table>';
+      dm.models.map(m => `<tr><td>${{m.algo}}</td><td>${{m.da}}</td><td>${{m.up_p}}</td><td>${{m.rmse}}</td></tr>`).join('') + '</table>' + fc + tg;
+  }}
+}}
+
+async function togglePause() {{
+  await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{paused:!window._curPaused}})}});
+  refresh();
+}}
+async function forceRefresh() {{
+  await fetch(apiUrl('/api/watch'), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{refresh:true}})}});
+  setTimeout(refresh, 800);
+}}
+async function loadEval() {{
+  const h = document.getElementById('evalHor') ? document.getElementById('evalHor').value : '60';
+  const box = document.getElementById('evalBox');
+  if (!box) return;
+  try {{
+    const q = (curCode ? 'code=' + encodeURIComponent(curCode) + '&' : '') + 'horizon=' + encodeURIComponent(h);
+    const r = await fetch(apiUrl('/api/orderbook_eval', q));
+    const ev = await r.json();
+    if (ev.error) {{
+      box.innerHTML = `<span class="muted">${{ev.error}}</span>`;
+      return;
+    }}
+    const sigHtml = (ev.signals || []).slice(0, 4).map(s =>
+      `<tr><td>${{s.signal}}</td><td>${{s.n_move}}</td><td><b>${{s.da_pct ?? '-'}}%</b></td><td>${{s.majority_baseline_pct ?? '-'}}%</td><td class="${{(s.excess_pct||0)>0?'up':'dn'}}">${{s.excess_pct!=null?(s.excess_pct>=0?'+':'')+s.excess_pct+'%':'-'}}</td></tr>`
+    ).join('');
+    box.innerHTML = `<div>配对样本 <b>${{ev.n_pairs}}</b> (波动 ${{ev.move_n}} | 多数基准 ${{ev.majority_baseline_pct}}%)</div>` +
+      `<table><tr><th>信号</th><th>样本</th><th>DA%</th><th>基准%</th><th>超额</th></tr>${{sigHtml}}</table>`;
+  }} catch (e) {{
+    box.textContent = '回放加载失败: ' + e;
   }}
 }}
 
@@ -8186,6 +8581,25 @@ class MobileWebServer:
                     cal = intraday_calibration_summary(code=code, persist_dir=parent.service._tracker.persist_dir)
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(cal, ensure_ascii=False).encode("utf-8"))
+                elif parsed.path in ("/api/orderbook_eval", "/orderbook_eval"):
+                    raw_code = (qs.get("code") or [""])[0].strip()
+                    try:
+                        horizon = float((qs.get("horizon") or ["60"])[0])
+                    except Exception:
+                        horizon = 60.0
+                    day_arg = (qs.get("day") or [""])[0].strip() or None
+                    ev = evaluate_orderbook_accuracy(
+                        codes=[raw_code] if raw_code else None,
+                        horizon_sec=horizon,
+                        monitor_dir=parent.service.snapshot_persist_dir or MONITOR_DIR,
+                        day=day_arg,
+                    )
+                    if parsed.path == "/orderbook_eval":
+                        self._send(200, "text/html; charset=utf-8",
+                                   orderbook_eval_report_html(ev).encode("utf-8"))
+                    else:
+                        self._send(200, "application/json; charset=utf-8",
+                                   json.dumps(ev, ensure_ascii=False).encode("utf-8"))
                 else:
                     self._send(404, "application/json; charset=utf-8",
                                json.dumps({"error": "not found"}).encode("utf-8"))
@@ -8279,11 +8693,13 @@ def start_mobile_web_server(
     alert_prob: float = 64.0,
     auth_token: str = "",
     background: bool = False,
+    persist_snapshots: bool = True,
 ) -> MobileWebServer:
     """启动手机端自动分析 Web 服务与同花顺悬浮窗视图。"""
     service = AutoAnalysisService(
         codes=codes, interval_sec=interval, bar_period=bar_period,
         horizon_bars=horizon_bars, push_spec=push_spec, alert_prob=alert_prob,
+        persist_snapshots=persist_snapshots,
     )
     server = MobileWebServer(service, host=host, port=port, auth_token=auth_token)
     server.start(background=background)
@@ -19347,6 +19763,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--web-token", default="", help="可选访问口令(?token=... 或 X-Auth-Token)，公网暴露建议设置")
     p.add_argument("--alert-prob", type=float, default=64.0,
                    help="配合 --web --push 的概率阈值%%(默认64，即 P(涨)>=64%% 或 <=36%% 时推送提醒)")
+    p.add_argument("--no-persist", action="store_true",
+                   help="配合 --web 启动时不自动落盘五档买手/卖手快照到 monitor_log/")
+    p.add_argument("--eval-orderbook", action="store_true",
+                   help="严格因果回放 monitor_log/ 中已采集的买手/卖手快照，检验各盘口因子准确率与多数基准")
+    p.add_argument("--eval-horizon", type=float, default=60.0,
+                   help="配合 --eval-orderbook 的前瞻验证窗口(秒，默认60)")
     p.add_argument("--export-ths", nargs="?", const="SP_QUANT_同花顺副图.txt", default=None,
                    help="生成并导出可直接粘贴进同花顺 PC/手机云公式的副图指标源码")
     p.add_argument("--verify", action="store_true",
@@ -19551,6 +19973,44 @@ def main():
         print("\n".join(ths["guide"]))
         return ths
 
+    if getattr(args, "eval_orderbook", False):
+        codes = ([c.strip() for c in args.web_codes.split(",") if c.strip()]
+                 if args.web_codes.strip() else ([args.code.strip()] if "--code" in sys.argv else None))
+        ev = evaluate_orderbook_accuracy(codes=codes, horizon_sec=args.eval_horizon, monitor_dir=MONITOR_DIR)
+        if ev.get("error"):
+            print(f"[eval-orderbook] {ev['error']}")
+        else:
+            print("=" * 84)
+            print(f"📊 买手/卖手盘口回放准确性评测（前瞻窗口 {ev['horizon_sec']:.0f}s | 文件={ev['n_files']} | "
+                  f"有效快照={ev['n_snapshots']} | 配对={ev['n_pairs']} | 波动样本={ev['move_n']} | 多数基准={ev['majority_baseline_pct']}%）")
+            print("-" * 84)
+            print(f"{'信号/因子':<28}{'波动样本':>8}{'DA%':>8}{'多数基准%':>10}{'超额%':>8}{'方向均值bps':>12}  显著性")
+            for s in ev["signals"]:
+                da_s = f"{s['da_pct']:.2f}" if s["da_pct"] is not None else "-"
+                mb_s = f"{s['majority_baseline_pct']:.2f}" if s["majority_baseline_pct"] is not None else "-"
+                ex_s = f"{s['excess_pct']:+.2f}" if s["excess_pct"] is not None else "-"
+                sb_s = f"{s['signed_ret_bps']:+.2f}" if s["signed_ret_bps"] is not None else "-"
+                print(f"{s['signal']:<28}{s['n_move']:>8}{da_s:>8}{mb_s:>10}{ex_s:>8}{sb_s:>12}  {s['sig_text']}")
+            if ev["wobi_buckets"]:
+                print("\n【按买手/卖手五档失衡(W-OBI)分档实测】")
+                for b in ev["wobi_buckets"]:
+                    up_s = f"{b['actual_up_pct']:.1f}%" if b["actual_up_pct"] is not None else "-"
+                    print(f"  {b['bucket']:<22} n={b['n']:>4} (波动={b['move_n']:>4})  实际涨占比={up_s:>7}  未来均值={b['mean_ret_bps']:+.2f} bps")
+            print(f"\n⚠ {ev['disclaimer']}")
+            print("=" * 84)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump(ev, fh, ensure_ascii=False, indent=2)
+            print(f"结果 JSON 已写入: {args.json}")
+        if args.push and not ev.get("error"):
+            top_sig = ev["signals"][0] if ev.get("signals") else {}
+            title = f"[收盘盘口复盘] 样本{ev['n_pairs']}笔 综合DA={top_sig.get('da_pct','-')}%"
+            lines = [f"前瞻{ev['horizon_sec']:.0f}s | 波动样本={ev['move_n']} | 多数基准={ev['majority_baseline_pct']}%"]
+            lines += [f"- {s['signal']}: DA={s['da_pct']}% (超额{s['excess_pct']:+}%)" for s in ev["signals"] if s.get("da_pct") is not None]
+            lines.append(f"⚠ {ev['disclaimer']}")
+            _push_message(args.push, title, "\n".join(lines))
+        return ev
+
     if args.web:
         codes = ([c.strip() for c in args.web_codes.split(",") if c.strip()]
                  if args.web_codes.strip() else [args.code.strip()] + [c for c in USER_WATCHLIST_CODES[:4] if c != args.code.strip()])
@@ -19559,7 +20019,7 @@ def main():
             interval=args.web_interval, bar_period=args.bar_period,
             horizon_bars=args.bar_horizon, push_spec=args.push,
             alert_prob=args.alert_prob, auth_token=args.web_token,
-            background=True,
+            background=True, persist_snapshots=not getattr(args, "no_persist", False),
         )
         urls = srv.urls()
         print("=" * 72)
@@ -19567,7 +20027,8 @@ def main():
         print(f"  手机完整版 : {urls['mobile_url']}")
         print(f"  同花顺浮窗 : {urls['widget_url']}  （安卓小窗/分屏挂在同花顺上方）")
         print(f"  本机访问   : {urls['local_url']}")
-        print(f"  自动盯盘   : {', '.join(srv.service.codes)}  (每 {srv.service.interval_sec:.0f}s 自动轮询分析)")
+        persist_msg = "已开启自动落盘买手/卖手快照到 monitor_log/" if srv.service.persist_snapshots else "已禁用快照落盘(--no-persist)"
+        print(f"  自动盯盘   : {', '.join(srv.service.codes)}  (每 {srv.service.interval_sec:.0f}s | {persist_msg})")
         print("  ⚠ 仅供量化研究，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。")
         print("=" * 72)
         try:
