@@ -1061,3 +1061,43 @@ def test_real_orderbook_wall_trap_seal_ratio_and_outer_inner():
     res_mom = s.compute_intraday_realtime_prediction(q_next, snapshots=[q_prev, q_next])
     names = {f["name"]: f for f in res_mom["factors"]}
     assert "内外盘主动买卖比" in names and names["内外盘主动买卖比"]["bias"] == "偏多"
+
+
+def test_stale_local_csv_refreshes_online_and_falls_back(tmp_path, monkeypatch):
+    """本地离线 CSV 明显滞后于目标 end_date(>10天) 时，auto 模式优先联网拉最新；联网失败才回退本地。"""
+    csv_dir = tmp_path / "每只股票一个文件" / "前复权"
+    csv_dir.mkdir(parents=True)
+    local_csv = csv_dir / "601212.csv"
+    local_csv.write_text(
+        "日期,开盘价,最高价,最低价,收盘价,成交量（股）,成交额（元）\n"
+        "2026-04-09,7.90,8.10,7.85,8.00,1000000,8000000\n"
+        "2026-04-10,8.00,8.12,7.95,8.04,1100000,8844000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STOCK_LOCAL_DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(s.StockDataFetcher, "_cache_path", staticmethod(lambda *a, **kw: str(tmp_path / "cache.parquet")))
+    monkeypatch.setattr(s, "HAS_AKSHARE", True)
+    monkeypatch.setattr(s, "HAS_BAOSTOCK", False)
+
+    online_df = pd.DataFrame({
+        "date": pd.to_datetime(["2026-04-10", "2026-11-17"]),
+        "open": [8.00, 4.41], "high": [8.12, 4.61],
+        "low": [7.95, 4.32], "close": [8.04, 4.49], "volume": [10000, 11087],
+    })
+    monkeypatch.setattr(s.StockDataFetcher, "_fetch_akshare", staticmethod(lambda *a, **kw: online_df))
+    monkeypatch.setattr(s._AK_THROTTLE, "wait", lambda: None)
+
+    got_auto = s.StockDataFetcher().fetch("601212", "20260401", "20261117", use_cache=False, source="auto")
+    assert pd.to_datetime(got_auto["date"]).max().strftime("%Y-%m-%d") == "2026-11-17"
+    assert float(got_auto["close"].iloc[-1]) == 4.49
+
+    # 指定 source="local" 时强制仅用本地
+    got_local = s.StockDataFetcher().fetch("601212", "20260401", "20261117", source="local")
+    assert pd.to_datetime(got_local["date"]).max().strftime("%Y-%m-%d") == "2026-04-10"
+
+    # 若联网失败，则自动回退 stale 本地 CSV
+    def _boom(*a, **kw):
+        raise RuntimeError("offline")
+    monkeypatch.setattr(s.StockDataFetcher, "_fetch_akshare", staticmethod(_boom))
+    got_fb = s.StockDataFetcher().fetch("601212", "20260401", "20261117", use_cache=False, source="auto", retries=1)
+    assert pd.to_datetime(got_fb["date"]).max().strftime("%Y-%m-%d") == "2026-04-10"

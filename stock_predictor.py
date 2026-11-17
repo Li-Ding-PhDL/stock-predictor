@@ -424,11 +424,8 @@ class StockDataFetcher:
         return os.path.join(root, "每只股票一个文件", adj, f"{str(code).strip()}.csv")
 
     @staticmethod
-    def _fetch_local(code, start_date, end_date, adjust, root) -> pd.DataFrame:
-        """从本地 CSV 读单只股票日线，产出与 _fetch_akshare 一致的契约列并按 [start,end] 截取。
-        注意：本地 成交量 单位为『股』（akshare 为『手』）。同一次离线运行内所有股票单位一致，
-        且下游对 volume 做标准化/比率处理，不影响相对特征；仅在与联网数据混用时需知晓此差异。"""
-        path = StockDataFetcher._local_csv_path(code, adjust, root)
+    def _read_local_csv(path: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """从指定本地 CSV 路径读取单只股票日线并按 [start_date, end_date] 截取。"""
         if not os.path.exists(path):
             raise FileNotFoundError(f"本地数据集无此代码文件: {path}")
         raw = pd.read_csv(path, dtype=str)
@@ -450,10 +447,33 @@ class StockDataFetcher:
         return df.reset_index(drop=True)
 
     @staticmethod
-    def _fetch_valuation_local(code, root) -> pd.DataFrame:
-        """从同一份本地 CSV 抽出日频估值列（PE_TTM/PB/PS_TTM/总市值），列名与联网 _fetch_valuation 对齐，
-        供 enrich() 离线顶替联网估值。估值与复权无关，固定读『前复权』文件即可。"""
-        path = StockDataFetcher._local_csv_path(code, "qfq", root)
+    def _resolve_best_local_csv(code: str, adjust: str) -> Optional[str]:
+        """解析该股最佳本地 CSV：未显式覆写 STOCK_LOCAL_DATA_ROOT 时优先 data_updated，再回落 LOCAL_DATA_ROOT。"""
+        if not os.environ.get("STOCK_LOCAL_DATA_ROOT"):
+            upd_root = globals().get("UPDATED_DATA_ROOT")
+            if upd_root:
+                upd = StockDataFetcher._local_csv_path(code, adjust, upd_root)
+                if os.path.exists(upd):
+                    return upd
+        root = StockDataFetcher._resolve_local_root()
+        if root:
+            cand = StockDataFetcher._local_csv_path(code, adjust, root)
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    @staticmethod
+    def _fetch_local(code, start_date, end_date, adjust, root) -> pd.DataFrame:
+        """从本地 CSV 读单只股票日线，产出与 _fetch_akshare 一致的契约列并按 [start,end] 截取。
+        注意：本地 成交量 单位为『股』（akshare 为『手』）。同一次离线运行内所有股票单位一致，
+        且下游对 volume 做标准化/比率处理，不影响相对特征；仅在与联网数据混用时需知晓此差异。"""
+        return StockDataFetcher._read_local_csv(
+            StockDataFetcher._local_csv_path(code, adjust, root), start_date, end_date
+        )
+
+    @staticmethod
+    def _fetch_valuation_local_path(path: str) -> pd.DataFrame:
+        """从指定本地 CSV 文件抽出日频估值列（PE_TTM/PB/PS_TTM/总市值）。"""
         if not os.path.exists(path):
             raise FileNotFoundError(f"本地数据集无此代码文件: {path}")
         raw = pd.read_csv(path, dtype=str)
@@ -464,6 +484,14 @@ class StockDataFetcher:
             if c != "date":
                 v[c] = pd.to_numeric(v[c], errors="coerce")
         return v.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    @staticmethod
+    def _fetch_valuation_local(code, root) -> pd.DataFrame:
+        """从同一份本地 CSV 抽出日频估值列（PE_TTM/PB/PS_TTM/总市值），列名与联网 _fetch_valuation 对齐，
+        供 enrich() 离线顶替联网估值。估值与复权无关，固定读『前复权』文件即可。"""
+        return StockDataFetcher._fetch_valuation_local_path(
+            StockDataFetcher._local_csv_path(code, "qfq", root)
+        )
 
     # ---------- 3.1 拉取真实历史行情（多源自动容错）----------
     def fetch(self, code: str, start_date: str, end_date: str,
@@ -488,19 +516,28 @@ class StockDataFetcher:
         """
         cache_path = self._cache_path(code, start_date, end_date, adjust)
 
-        # ---- 3.1.0 本地离线数据集优先（配置了 LOCAL_DATA_ROOT 且该代码文件存在时）----
+        # ---- 3.1.0 本地离线数据集优先（覆盖到目标日期附近时直接返回；若明显滞后则优先联网取最新，失败再回退）----
+        stale_local_df = None
         local_root = self._resolve_local_root()
-        if source in ("auto", "local") and local_root and \
-                os.path.exists(self._local_csv_path(code, adjust, local_root)):
-            try:
-                df = self._fetch_local(code, start_date, end_date, adjust, local_root)
-                if df is None or len(df) == 0:
-                    raise RuntimeError("本地数据在该日期区间为空")
-                return df
-            except Exception as e:
-                if source == "local":
-                    raise RuntimeError(f"本地数据集读取失败({code}): {e}")
-                # auto 模式：本地失败则继续回落联网
+        if source in ("auto", "local"):
+            best_csv = self._resolve_best_local_csv(code, adjust)
+            if best_csv:
+                try:
+                    df = self._read_local_csv(best_csv, start_date, end_date)
+                    if df is None or len(df) == 0:
+                        raise RuntimeError("本地数据在该日期区间为空")
+                    end_dt = pd.to_datetime(str(end_date), format="%Y%m%d", errors="coerce")
+                    max_dt = pd.to_datetime(df["date"]).max()
+                    today_str = dt.date.today().strftime("%Y%m%d")
+                    max_lag = (0 if dt.date.today().weekday() < 5 else 2) if str(end_date) >= today_str else 10
+                    if source == "auto" and pd.notna(end_dt) and pd.notna(max_dt) and (end_dt - max_dt).days > max_lag:
+                        stale_local_df = df
+                    else:
+                        return df
+                except Exception as e:
+                    if source == "local":
+                        raise RuntimeError(f"本地数据集读取失败({code}): {e}")
+                    # auto 模式：本地失败则继续回落联网
         if source == "local":
             _p = self._local_csv_path(code, adjust, local_root) if local_root else "(未配置/无效 LOCAL_DATA_ROOT)"
             raise RuntimeError(f"指定 source='local' 但未找到本地数据: {_p}")
@@ -552,7 +589,11 @@ class StockDataFetcher:
                         else:
                             time.sleep(1.0 * attempt)    # 普通瞬时抖动：递增退避 1/2 秒
 
-        # ---- 3.1.3 全部数据源失败：给出清晰、可操作的报错 ----
+        # ---- 3.1.3 全部数据源失败：若有离线历史可垫底则带警告回退，否则给出清晰报错 ----
+        if stale_local_df is not None and len(stale_local_df) > 0:
+            _last = pd.to_datetime(stale_local_df["date"]).max().strftime("%Y-%m-%d")
+            print(f"[警告] 联网拉取 {code} 最新行情失败，已回退本地历史数据(截至 {_last})")
+            return stale_local_df
         hint = ""
         if not HAS_BAOSTOCK:
             hint = ("\n建议加装更稳定的国内备用源:  pip install baostock"
@@ -641,18 +682,24 @@ class StockDataFetcher:
         df = _nsdate(df)
         status: Dict[str, str] = {}
         if want_valuation:
-            _root = StockDataFetcher._resolve_local_root()
-            _use_local = bool(_root) and os.path.exists(StockDataFetcher._local_csv_path(code, "qfq", _root))
-            if _use_local:
-                # 本地 CSV 自带日频 PE_TTM/PB/PS_TTM/总市值，离线顶替联网估值，补上「数据缺省」
+            _val_csv = StockDataFetcher._resolve_best_local_csv(code, "qfq")
+            _df_max = pd.to_datetime(df["date"]).max() if len(df) else pd.NaT
+            _local_val_ok = False
+            if _val_csv:
+                # 本地 CSV 自带日频 PE_TTM/PB/PS_TTM/总市值；若明显滞后于最新行情日期则优先联网刷新
                 try:
-                    v = _nsdate(StockDataFetcher._fetch_valuation_local(code, _root))
-                    df = pd.merge_asof(df, v, on="date", direction="backward")
-                    vcols = [c for c in v.columns if c != "date"]
-                    status["valuation"] = f"已接入(本地CSV, {len(v)}行: {'/'.join(vcols)})"
+                    v = _nsdate(StockDataFetcher._fetch_valuation_local_path(_val_csv))
+                    _v_max = v["date"].max() if len(v) else pd.NaT
+                    _stale = pd.notna(_df_max) and pd.notna(_v_max) and (_df_max - _v_max).days > 10
+                    if not (_stale and HAS_AKSHARE):
+                        df = pd.merge_asof(df, v, on="date", direction="backward")
+                        vcols = [c for c in v.columns if c != "date"]
+                        status["valuation"] = f"已接入(本地CSV, {len(v)}行: {'/'.join(vcols)})"
+                        _local_val_ok = True
                 except Exception as e:
-                    status["valuation"] = f"跳过(本地估值失败: {e})"
-            elif HAS_AKSHARE:
+                    if not HAS_AKSHARE:
+                        status["valuation"] = f"跳过(本地估值失败: {e})"
+            if (not _local_val_ok) and HAS_AKSHARE:
                 try:
                     v = _nsdate(StockDataFetcher._fetch_valuation(code, bypass_proxy))
                     df = pd.merge_asof(df, v, on="date", direction="backward")
@@ -660,7 +707,7 @@ class StockDataFetcher:
                     status["valuation"] = f"已接入({len(v)}行: {'/'.join(vcols)})"
                 except Exception as e:
                     status["valuation"] = f"跳过(取数失败: {e})"
-            else:
+            elif (not _local_val_ok) and ("valuation" not in status):
                 status["valuation"] = "跳过(未安装 akshare 且无本地数据)"
         if want_index and HAS_AKSHARE:
             try:
