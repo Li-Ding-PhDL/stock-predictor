@@ -19695,6 +19695,7 @@ def _anomaly_risk_one(df: pd.DataFrame, name: str = "") -> Dict[str, Any]:
 
 def anomaly_risk_scan(codes: Optional[List[str]] = None, root: Optional[str] = None,
                       start: str = "20230101", end: Optional[str] = None,
+                      dfs: Optional[Dict[str, pd.DataFrame]] = None,
                       progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """『主力视角·避雷扫描』：对一篮子股票算异动/操纵风险分并按高→低排序。
     诚实定位：跟庄不可行(拿不到 Level2/真实席位)，此模块只做**风险规避**——识别被异常拉抬/出货/操纵的特征。
@@ -19705,8 +19706,10 @@ def anomaly_risk_scan(codes: Optional[List[str]] = None, root: Optional[str] = N
     rows = []
     for i, code in enumerate([c.strip() for c in codes if c.strip()], 1):
         try:
-            df, _ = (_mh_load_local_rich(code, root) if root else (None, False))
+            df = dfs.get(code) if isinstance(dfs, dict) else None
             if df is None:
+                df, _ = (_mh_load_local_rich(code, root) if root else (None, False))
+            if df is None and dfs is None:
                 df, _ = _mh_load_online_rich(code, start, end, progress_cb=log)
             if df is None or len(df) < 30:
                 rows.append({"code": code, "name": "", "score": None,
@@ -19967,29 +19970,32 @@ def _dip_signal_at(cl: np.ndarray, ret: np.ndarray, i: int, n_win: int, x_down: 
     return True
 
 
-def _dip_load(code: str, root: str):
-    """取单股 date/close + 日收益 + 逐日对齐的『上一完成月』6月均线(防用未来)。自动优先 data_updated。"""
-    df, _ = _mh_load_local_rich(code, root)
+def _dip_record_from_df(df: Optional[pd.DataFrame], code: str):
+    """从已加载的升序 df 向量化构建回测/扫描记录(含上一已完成月6月均线)，避免重复读盘。"""
     if df is None or len(df) < 40:
         return None
     cl = df["close"].values.astype(float)
     ret = pd.Series(cl).pct_change().values
     name = str(df["name"].iloc[-1]) if "name" in df.columns and len(df) else code
     ma_m = df.set_index("date")["close"].resample("ME").last().rolling(6, min_periods=2).mean()
-    # 每根K对齐到"上一个已完成月"的月均线值
-    prev_ma = np.full(len(df), np.nan)
-    idx = ma_m.index
-    for i in range(len(df)):
-        dt = df["date"].iloc[i]
-        p = ma_m[idx < pd.Timestamp(dt).replace(day=1)]
-        if len(p) and pd.notna(p.iloc[-1]):
-            prev_ma[i] = float(p.iloc[-1])
+    idx_arr = pd.DatetimeIndex(ma_m.index).asi8
+    vals_arr = ma_m.values.astype(float)
+    month_starts = pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp().asi8
+    pos = np.searchsorted(idx_arr, month_starts, side="left") - 1
+    prev_ma = np.where(pos >= 0, vals_arr[np.maximum(pos, 0)], np.nan)
     return df["date"].values, cl, ret, prev_ma, name
+
+
+def _dip_load(code: str, root: str):
+    """取单股 date/close + 日收益 + 逐日对齐的『上一完成月』6月均线(防用未来)。自动优先 data_updated。"""
+    df, _ = _mh_load_local_rich(code, root)
+    return _dip_record_from_df(df, code)
 
 
 def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
                         y_hold: int = 5, drop_pct: float = 0.0, monthly: str = "off",
                         cost_bps: float = 15.0, root: Optional[str] = None,
+                        dip_records: Optional[Dict[str, Any]] = None,
                         progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """回测：近 n_win 日≥x_down 跌(+可选回撤≥drop_pct)(+monthly: 'off'/'below'/'above') 且末日涨 → 买，持 y_hold 日卖。
     非重叠(每股触发后跳过 y_hold 天)。扣双边成本(2×cost_bps)。返回胜率/净收益/笔/中位/赚亏均值+基准对比。研究用途、非投资建议。"""
@@ -20001,7 +20007,7 @@ def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 10, x_do
     rs, base = [], []
     used = 0
     for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
-        rec = _dip_load(code, root)
+        rec = dip_records.get(code) if isinstance(dip_records, dict) else _dip_load(code, root)
         if rec is None:
             log(f"[{ci}/{len(codes)}] {code} 数据不足，跳过"); continue
         _, cl, ret, prev_ma, name = rec; n = len(cl); used += 1
@@ -20041,6 +20047,7 @@ def dip_bounce_backtest(codes: Optional[List[str]] = None, n_win: int = 10, x_do
 
 def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 10, x_down: int = 8,
                     drop_pct: float = 0.0, monthly: str = "off", root: Optional[str] = None,
+                    dip_records: Optional[Dict[str, Any]] = None,
                     progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """今日买点扫描：一批股票里，哪些在『最新一根K』正好触发买点(近n_win日≥x_down跌+末日涨+可选过滤)。
     命中≠推荐买入，只是"符合这条规则"；是否买、买多少自行判断。研究用途、非投资建议、盈亏自负。"""
@@ -20050,7 +20057,7 @@ def dip_bounce_scan(codes: Optional[List[str]] = None, n_win: int = 10, x_down: 
     ma_below = None if monthly == "off" else (monthly == "below")
     hits, as_of = [], None
     for ci, code in enumerate([c.strip() for c in codes if c.strip()], 1):
-        rec = _dip_load(code, root)
+        rec = dip_records.get(code) if isinstance(dip_records, dict) else _dip_load(code, root)
         if rec is None:
             continue
         dates, cl, ret, prev_ma, name = rec; i = len(cl) - 1
@@ -20364,11 +20371,25 @@ def watchlist_health_report(codes: Optional[List[str]] = None, root: Optional[st
         pool = list(USER_WATCHLIST_CODES)
     root = root or StockDataFetcher._resolve_local_root()
 
-    avoid = anomaly_risk_scan(codes=pool, root=root, progress_cb=log)
+    # 单次预加载整池 CSV（避免避雷/估值/超跌扫盘重复读盘 6 次）
+    dfs: Dict[str, pd.DataFrame] = {}
+    dip_recs: Dict[str, Any] = {}
+    for c in pool:
+        try:
+            d, _ = (_mh_load_local_rich(c, root) if root else (None, False))
+            if d is not None and len(d) >= 30:
+                dfs[c] = d
+                rec = _dip_record_from_df(d, c)
+                if rec is not None:
+                    dip_recs[c] = rec
+        except Exception:
+            pass
+
+    avoid = anomaly_risk_scan(codes=pool, root=root, dfs=dfs, progress_cb=log)
     avoid_rows = avoid.get("ranked") or []
     avoid_map = {r["code"]: r for r in avoid_rows if r.get("code")}
 
-    temp = market_temperature(codes=pool, root=root, progress_cb=log)
+    temp = market_temperature(codes=pool, root=root, dfs=dfs, progress_cb=log)
     temp_rows = temp.get("rows") or []
     temp_map = {r["code"]: r for r in temp_rows if r.get("code")}
 
@@ -20382,9 +20403,11 @@ def watchlist_health_report(codes: Optional[List[str]] = None, root: Optional[st
     dip_sections = []
     for ps in strict_presets:
         sc = dip_bounce_scan(codes=pool, n_win=ps["n_win"], x_down=ps["x_down"],
-                             drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root, progress_cb=lambda m: None)
+                             drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root,
+                             dip_records=dip_recs, progress_cb=lambda m: None)
         bt = dip_bounce_backtest(codes=pool, n_win=ps["n_win"], x_down=ps["x_down"], y_hold=ps["y_hold"],
-                                 drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root, progress_cb=lambda m: None)
+                                 drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root,
+                                 dip_records=dip_recs, progress_cb=lambda m: None)
         hits = []
         for h in (sc.get("hits") or []):
             av = avoid_map.get(h["code"], {})
