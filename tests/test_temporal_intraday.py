@@ -1148,6 +1148,9 @@ def test_rank_stocks_scores_latest_live_date_and_watchlist_health_api(tmp_path, 
     assert rep["as_of"] == dates[-1].strftime("%Y-%m-%d")
     assert len(rep["dip_strict"]) == 2
     assert "avoid_summary" in rep and "temperature_summary" in rep
+    sample_df, _ = s._mh_load_local_rich(codes[0], str(tmp_path))
+    rec = s._dip_record_from_df(sample_df, codes[0])
+    assert rec is not None and len(rec[3]) == len(sample_df)
 
     svc = s.AutoAnalysisService(codes=codes, interval_sec=60.0)
     srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)

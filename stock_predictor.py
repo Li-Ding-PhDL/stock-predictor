@@ -19978,9 +19978,9 @@ def _dip_record_from_df(df: Optional[pd.DataFrame], code: str):
     ret = pd.Series(cl).pct_change().values
     name = str(df["name"].iloc[-1]) if "name" in df.columns and len(df) else code
     ma_m = df.set_index("date")["close"].resample("ME").last().rolling(6, min_periods=2).mean()
-    idx_arr = pd.DatetimeIndex(ma_m.index).asi8
+    idx_arr = pd.DatetimeIndex(ma_m.index).to_numpy(dtype="datetime64[ns]")
     vals_arr = ma_m.values.astype(float)
-    month_starts = pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp().asi8
+    month_starts = pd.DatetimeIndex(pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp()).to_numpy(dtype="datetime64[ns]")
     pos = np.searchsorted(idx_arr, month_starts, side="left") - 1
     prev_ma = np.where(pos >= 0, vals_arr[np.maximum(pos, 0)], np.nan)
     return df["date"].values, cl, ret, prev_ma, name
