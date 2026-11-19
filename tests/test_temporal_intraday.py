@@ -1101,3 +1101,67 @@ def test_stale_local_csv_refreshes_online_and_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(s.StockDataFetcher, "_fetch_akshare", staticmethod(_boom))
     got_fb = s.StockDataFetcher().fetch("601212", "20260401", "20261117", use_cache=False, source="auto", retries=1)
     assert pd.to_datetime(got_fb["date"]).max().strftime("%Y-%m-%d") == "2026-04-10"
+
+
+def test_rank_stocks_scores_latest_live_date_and_watchlist_health_api(tmp_path, monkeypatch):
+    """验证 rank_stocks_cross_sectional 实时打分使用最新交易日(而非 horizon 日前)，以及 /api/watchlist_health 接口与看板风控提醒。"""
+    csv_dir = tmp_path / "每只股票一个文件" / "前复权"
+    csv_dir.mkdir(parents=True)
+    dates = pd.bdate_range("2023-01-02", periods=320)
+    codes = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    rng = np.random.default_rng(7)
+    for idx, c in enumerate(codes):
+        ret = rng.normal(0.0005 * (idx - 2), 0.02, len(dates))
+        close = 10.0 * np.cumprod(1.0 + ret)
+        df_c = pd.DataFrame({
+            "日期": dates.strftime("%Y-%m-%d"),
+            "代码": c,
+            "名称": f"测试股{idx}",
+            "所属行业": "电子" if idx % 2 == 0 else "医药",
+            "开盘价": np.round(close * 0.995, 3),
+            "最高价": np.round(close * 1.015, 3),
+            "最低价": np.round(close * 0.985, 3),
+            "收盘价": np.round(close, 3),
+            "成交量（股）": rng.integers(100000, 500000, len(dates)),
+            "成交额（元）": rng.integers(1000000, 5000000, len(dates)),
+            "换手率": np.round(rng.uniform(1.0, 5.0, len(dates)), 2),
+            "涨幅%": np.round(ret * 100.0, 2),
+            "滚动市盈率": np.round(rng.uniform(15.0, 35.0, len(dates)), 2),
+            "市净率": np.round(rng.uniform(1.2, 3.5, len(dates)), 2),
+            "滚动市销率": np.round(rng.uniform(1.0, 4.0, len(dates)), 2),
+            "退市时间": ["-"] * len(dates),
+        })
+        df_c.to_csv(csv_dir / f"{c}.csv", index=False, encoding="utf-8-sig")
+
+    monkeypatch.setenv("STOCK_LOCAL_DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(s, "UPDATED_DATA_ROOT", str(tmp_path))
+
+    rk = s.rank_stocks_cross_sectional(codes=codes, horizon=10, split_date="2024-01-01",
+                                       start="20230101", root=str(tmp_path), out_png=None)
+    # 必须按最新一天打分，而不是倒退 10 个交易日
+    assert rk["as_of"] == dates[-1].strftime("%Y-%m-%d")
+    assert len(rk["ranked"]) == len(codes)
+    assert all(item["close"] is not None for item in rk["ranked"])
+
+    rep = s.watchlist_health_report(codes=codes, root=str(tmp_path), include_rank=False)
+    assert rep["n_codes"] == len(codes)
+    assert rep["as_of"] == dates[-1].strftime("%Y-%m-%d")
+    assert len(rep["dip_strict"]) == 2
+    assert "avoid_summary" in rep and "temperature_summary" in rep
+
+    svc = s.AutoAnalysisService(codes=codes, interval_sec=60.0)
+    srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)
+    srv.start(background=True)
+    try:
+        base = f"http://127.0.0.1:{srv.port}"
+        import urllib.request
+        with urllib.request.urlopen(base + "/api/watchlist_health", timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            assert payload["n_codes"] == len(codes)
+            assert "dip_strict" in payload
+        with urllib.request.urlopen(base + "/", timeout=10) as resp:
+            html_txt = resp.read().decode("utf-8")
+            assert "loadHealth(" in html_txt
+            assert "短线风控提醒" in html_txt
+    finally:
+        srv.stop()

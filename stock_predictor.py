@@ -8355,6 +8355,7 @@ class AutoAnalysisService:
         self._last_batch_ts: float = 0.0
         self._cycle_count: int = 0
         self._last_cycle_at: str = ""
+        self._health_cache: Optional[Tuple[float, bool, Dict[str, Any]]] = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -8655,6 +8656,21 @@ class AutoAnalysisService:
                 "disclaimer": "自动实时测算仅供量化研究，高频噪声极大，不构成买卖信号或投资建议、盈亏自负。",
             }
 
+    def get_watchlist_health(self, force: bool = False, include_rank: bool = False) -> Dict[str, Any]:
+        """获取自选股防坑体检结果（避雷扫描 + 估值温度 + 严格超跌 + 可选21日强弱排序，带10分钟内存缓存）。"""
+        now_m = time.monotonic()
+        with self._lock:
+            cached = self._health_cache
+            pool = [c for c in self.codes if c not in USER_ETF_CODES] or list(USER_WATCHLIST_CODES)
+        if not force and cached is not None:
+            ts, has_rank, data = cached
+            if (now_m - ts) < 600.0 and (has_rank or not include_rank):
+                return {**data, "cached": True}
+        rep = watchlist_health_report(codes=pool, include_rank=bool(include_rank))
+        with self._lock:
+            self._health_cache = (time.monotonic(), bool(include_rank), rep)
+        return {**rep, "cached": False}
+
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             self._wake_event.clear()
@@ -8769,6 +8785,17 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
       </div>
     </div>
     <div id="watchBox" class="muted" style="margin-top:6px;display:none"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <b>🛡️ 自选风控避雷 · 估值温度 · 严格超跌与21日强弱</b>
+      <div>
+        <button class="sec" onclick="loadHealth(false, true)">⚡ 快速体检</button>
+        <button onclick="loadHealth(true, true)">🏆 含21日排序</button>
+      </div>
+    </div>
+    <div id="healthBox" class="muted" style="margin-top:6px">聚焦「少踩雷、低频正期望超跌、21日横截面强弱」，替代高频追涨杀跌...</div>
   </div>
 
   <div class="card">
@@ -8969,6 +8996,9 @@ function renderActive(d) {{
     `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">价位指数</div><b>${{posTxt}}</b></div>` +
     `</div>` + (p.book_alert ? `<div style="margin-top:6px;padding:6px 8px;border-radius:8px;background:#451a03;color:#fde68a;font-size:12px">⚠ ${{p.book_alert}}</div>` : '');
 
+  const edgeWarn = (bf && bf.available && Number(bf.oos_excess_da_pct || 0) <= 0)
+    ? `<div style="margin-top:6px;padding:6px 8px;border-radius:8px;background:#451a03;color:#fde68a;font-size:12px">🛑 <b>短线风控提醒</b>：分钟级ML样本外(${{bf.oos_da_pct}}%)未跑赢多数基准(${{bf.majority_baseline_pct}}%)，请勿因盘中微弱波动频繁买卖损耗手续费。</div>`
+    : '';
   box.innerHTML = `
     <div class="row">
       <div><b style="font-size:18px">${{titleName}}</b> <span class="muted">[${{a.status}}] ${{a.updated_at}}</span></div>
@@ -8993,6 +9023,7 @@ function renderActive(d) {{
     ${{bookMetricsHtml}}
     ${{traceHtml}}
     ${{bfHtml}}
+    ${{edgeWarn}}
     ${{verHtml}}
     <div class="muted" style="margin-top:6px;color:#fca5a5">⚠ ${{p.disclaimer}}</div>
   `;
@@ -9129,9 +9160,61 @@ async function loadMood() {{
     box.textContent = '情绪数据加载失败: ' + e;
   }}
 }}
+async function loadHealth(includeRank=false, force=false) {{
+  const box = document.getElementById('healthBox');
+  if (!box) return;
+  box.innerHTML = includeRank ? '正在计算40只自选避雷 + 估值 + 21日横截面排名(约15秒)...' : '正在扫描自选避雷 + 估值温度 + 严格超跌...';
+  try {{
+    const q = (includeRank ? 'include_rank=1&' : '') + (force ? 'force=1' : '');
+    const r = await fetch(apiUrl('/api/watchlist_health', q));
+    const h = await r.json();
+    if (h.error) {{ box.innerHTML = `<span class="up">${{h.error}}</span>`; return; }}
+    const av = h.avoid_summary || {{}};
+    const tp = h.temperature_summary || {{}};
+    const riskList = (av.high_risk || []).concat((av.medium_risk || []).slice(0, 4));
+    const riskRows = riskList.map(x =>
+      `<tr><td><button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}}</button></td><td><b>${{x.score}}</b></td><td>${{x.level}}</td><td class="muted">${{(x.reasons||[])[0]||''}}</td></tr>`
+    ).join('');
+    const dipRows = (h.dip_strict || []).map(sec => {{
+      const hitTxt = (sec.hits || []).length
+        ? sec.hits.map(x => `<button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}} ${{x.avoid_trap?'🔴高异动慎抄':''}}</button>`).join(' ')
+        : '<span class="muted">今日无触发(空仓观望)</span>';
+      return `<div style="margin-top:4px"><b>${{sec.label}}</b> <span class="muted">(历史胜率 ${{sec.win_pct ?? '-'}}% | 净 ${{sec.net_per_trade_pct ?? '-'}}%/笔)</span>：${{hitTxt}}</div>`;
+    }}).join('');
+    const coldChips = (tp.cold || []).map(x => `<button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}} 温${{x.temperature}}</button>`).join(' ');
+    const hotChips = (tp.overheated || []).map(x => `<button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}} 温${{x.temperature}}</button>`).join(' ');
+    let rankHtml = '';
+    if (h.rank && h.rank.error) {{
+      rankHtml = `<div class="up" style="margin-top:6px">21日排序失败: ${{h.rank.error}}</div>`;
+    }} else if (h.rank && h.rank.top) {{
+      const rk = h.rank;
+      const topRows = rk.top.map(x =>
+        `<tr><td>#${{x.rank}}</td><td><button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}}</button></td><td>${{x.close ?? '-'}}</td><td class="up"><b>${{x.score}}</b></td><td class="muted">${{x.risk_level || '-'}}</td></tr>`
+      ).join('');
+      const botRows = (rk.bottom || []).slice().reverse().slice(0, 5).map(x =>
+        `<tr><td>#${{x.rank}}</td><td><button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name||''}}</button></td><td>${{x.close ?? '-'}}</td><td class="dn">${{x.score}}</td><td class="muted">${{x.risk_level || '-'}}</td></tr>`
+      ).join('');
+      rankHtml = `<div style="margin-top:8px;padding:8px;background:#0f172a;border-radius:8px">` +
+        `<div><b>🏆 21日横截面相对强弱 (${{rk.as_of}})</b> · RankIC=<b>${{rk.rank_ic}}</b> · 扣费净价差 <b>${{rk.ls_spread_net_pct}}%/期</b> · 年化净 <b>${{rk.top_cagr_net_pct}}%</b></div>` +
+        `<div class="muted" style="font-size:11px">逐年IC: ${{JSON.stringify(rk.ic_by_year || {{}})}} | size暴露: ${{rk.size_exposure}}</div>` +
+        `<table><tr><th>排名</th><th>代码/名称</th><th>现价</th><th>强弱分</th><th>避雷状态</th></tr>${{topRows}}${{botRows}}</table></div>`;
+    }}
+    box.innerHTML = `<div class="row"><span>数据截至 <b>${{h.as_of || '未更新'}}</b> (${{h.n_codes}}只)</span>` +
+      `<span>池中位温度 <b>${{tp.median_temp ?? '-'}}</b> (${{tp.label || '-'}}) | 🔴高异动 <b>${{av.high_count || 0}}</b> 只 / 🟠谨慎 <b>${{av.med_count || 0}}</b> 只</span></div>` +
+      (riskRows ? `<table><tr><th>高风险避雷标的</th><th>异动分</th><th>等级</th><th>主要原因</th></tr>${{riskRows}}</table>` : '<div class="muted" style="margin-top:4px">当前未扫到高异动标的</div>') +
+      `<div style="margin-top:6px">${{dipRows}}</div>` +
+      (hotChips ? `<div style="margin-top:6px"><span class="up">🔥 估值过热/偏热(≥70):</span> ${{hotChips}}</div>` : '') +
+      (coldChips ? `<div style="margin-top:4px"><span class="dn">❄️ 估值偏冷(≤20):</span> ${{coldChips}}</div>` : '') +
+      rankHtml +
+      `<div class="muted" style="margin-top:6px;font-size:11px">⚠ ${{h.disclaimer}}</div>`;
+  }} catch (e) {{
+    box.textContent = '体检加载失败: ' + e;
+  }}
+}}
 refresh();
 setTimeout(loadEval, 900);
 setTimeout(loadMood, 1100);
+setTimeout(() => loadHealth(false, false), 1400);
 setInterval(refresh, 4000);
 </script>
 </body>
@@ -9355,6 +9438,12 @@ class MobileWebServer:
                     mood = fetch_market_sentiment_snapshot(day=day_arg)
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(mood, ensure_ascii=False).encode("utf-8"))
+                elif parsed.path == "/api/watchlist_health":
+                    inc_rk = (qs.get("include_rank") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+                    frc = (qs.get("force") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+                    health = parent.service.get_watchlist_health(force=frc, include_rank=inc_rk)
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(health, ensure_ascii=False).encode("utf-8"))
                 elif parsed.path in ("/api/orderbook_eval", "/orderbook_eval"):
                     raw_code = (qs.get("code") or [""])[0].strip()
                     try:
@@ -18696,7 +18785,24 @@ def _mh_add_causal_features(df: pd.DataFrame) -> pd.DataFrame:
     """在已含 date/close(及可选 ret_1d/ma20/ma60/ma250/pe_ttm 等源列)的 df 上，追加**因果**技术/分布/流派量化特征
     (只用当天及以前；rolling/shift 不含未来)。本地 CSV 与联网取数两条路共用它，保证两边口径一致、都无泄露。"""
     cl = df["close"]
-    df["vol20"] = df["ret_1d"].rolling(20).std() if "ret_1d" in df.columns else (cl.pct_change() * 100).rolling(20).std()
+    if "ret_1d" not in df.columns:
+        df["ret_1d"] = cl.pct_change() * 100
+    for _k in (3, 6, 10):
+        _col = f"ret_{_k}d"
+        if _col not in df.columns:
+            df[_col] = (cl / cl.shift(_k) - 1) * 100
+    for _m in (20, 60, 250):
+        _mcol = f"ma{_m}"
+        if _mcol not in df.columns:
+            df[_mcol] = cl.rolling(_m).mean()
+    if "vol_ratio" not in df.columns:
+        df["vol_ratio"] = 1.0
+    if "turnover" not in df.columns:
+        df["turnover"] = np.nan
+    for _vc in ("pe_ttm", "pb", "ps_ttm"):
+        if _vc not in df.columns:
+            df[_vc] = np.nan
+    df["vol20"] = df["ret_1d"].rolling(20).std()
     df["mom20"] = (cl / cl.shift(20) - 1) * 100                                           # 20日动量%
     # RSI(14)
     delta = cl.diff()
@@ -18803,6 +18909,62 @@ def _mh_load_online_rich(code: str, start: str = "20150101", end: Optional[str] 
     return df, False
 
 
+def _extract_mh_feature_row(df: pd.DataFrame, i: int, code: str, name: str) -> Dict[str, Any]:
+    """从升序因果 df 的第 i 行提取池化/横截面模型所需特征(纯历史≤i，无未来标签)。"""
+    r = df.iloc[i]
+    c0 = float(df["close"].iloc[i])
+    return {
+        "code": code, "name": name, "date": r["date"],
+        "close": round(c0, 3),
+        "total_mv": r.get("total_mv"), "industry": r.get("industry", ""),
+        "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
+        "ma20_dev": (c0 / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
+        "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
+        "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
+        "vol20": r.get("vol20"), "mom20": r.get("mom20"), "mom60": r.get("mom60"),
+        "rsi14": r.get("rsi14"), "dist_ma60": r.get("dist_ma60"), "dist_ma250": r.get("dist_ma250"),
+        "dist_hi120": r.get("dist_hi120"), "dist_lo120": r.get("dist_lo120"),
+        "macd_hist": r.get("macd_hist"), "boll_pos": r.get("boll_pos"),
+        "price_tier": int(np.searchsorted([3, 6, 9, 11, 20, 50], c0) + 1),
+        "lb_up_freq": r.get("lb_up_freq"), "lb_bigup_freq": r.get("lb_bigup_freq"),
+        "lb_bigdn_freq": r.get("lb_bigdn_freq"), "lb_ret_skew": r.get("lb_ret_skew"),
+        "lb_ret_q80": r.get("lb_ret_q80"), "lb_ret_q20": r.get("lb_ret_q20"),
+        "sch_tech": r.get("sch_tech"), "pe_pctile": r.get("pe_pctile"),
+    }
+
+
+def build_latest_cross_section(codes: List[str], start: str = "20150101", end: Optional[str] = None,
+                               root: Optional[str] = None, drop_delisted: bool = True,
+                               allow_online: bool = False,
+                               progress_cb: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
+    """构建各股截至最新已知交易日(不需要未来标签)的横截面特征，用于实时排序打分。"""
+    log = progress_cb or (lambda m: None)
+    root = root or StockDataFetcher._resolve_local_root()
+    s = pd.to_datetime(str(start), format="%Y%m%d", errors="coerce")
+    e = pd.to_datetime(str(end), format="%Y%m%d", errors="coerce") if end else None
+    rows = []
+    for code in [c.strip() for c in codes if c.strip()]:
+        df, is_delisted = (_mh_load_local_rich(code, root) if root else (None, False))
+        if df is None and allow_online:
+            df, is_delisted = _mh_load_online_rich(code, start, end, progress_cb=log)
+        if df is None or (drop_delisted and is_delisted):
+            continue
+        if s is not None:
+            df = df[df["date"] >= s]
+        if e is not None:
+            df = df[df["date"] <= e]
+        df = df.reset_index(drop=True)
+        if len(df) == 0:
+            continue
+        valid_idx = df.index[df["ret_10d"].notna()]
+        if len(valid_idx) == 0:
+            continue
+        i = int(valid_idx[-1])
+        nm = str(df["name"].iloc[-1]) if "name" in df.columns and len(df) else code
+        rows.append(_extract_mh_feature_row(df, i, code, nm))
+    return pd.DataFrame(rows)
+
+
 def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] = None,
                                 start: str = "20150101", end: Optional[str] = None,
                                 root: Optional[str] = None, drop_delisted: bool = True,
@@ -18862,30 +19024,8 @@ def build_multi_horizon_dataset(codes: List[str], horizons: Optional[List[int]] 
             valid = valid[::-1][::anchor_stride][::-1]
         log(f"[{ci}/{len(codes)}] {code} {name}（{src}）：{len(valid)} 个锚定日 × {len(horizons)} 期限")
         for i in valid:
-            r = df.iloc[i]
             c0 = close[i]
-            base = {
-                "code": code, "name": name, "date": r["date"],
-                "close": round(float(c0), 3),
-                # 中性化用(非模型特征)：市值(size)、行业。缺则 NaN/空，中性化时自动跳过、如实说明。
-                "total_mv": r.get("total_mv"), "industry": r.get("industry", ""),
-                "ret_1d": r["ret_1d"], "ret_3d": r["ret_3d"], "ret_6d": r["ret_6d"], "ret_10d": r["ret_10d"],
-                "ma20_dev": (float(c0) / r["ma20"] - 1) * 100 if pd.notna(r.get("ma20")) and r.get("ma20") else np.nan,
-                "vol_ratio": r["vol_ratio"], "turnover": r["turnover"],
-                "pe_ttm": r["pe_ttm"], "pb": r["pb"], "ps_ttm": r["ps_ttm"],
-                "vol20": r.get("vol20"), "mom20": r.get("mom20"), "mom60": r.get("mom60"),
-                "rsi14": r.get("rsi14"), "dist_ma60": r.get("dist_ma60"), "dist_ma250": r.get("dist_ma250"),
-                "dist_hi120": r.get("dist_hi120"), "dist_lo120": r.get("dist_lo120"),
-                "macd_hist": r.get("macd_hist"), "boll_pos": r.get("boll_pos"),
-                # 价格档位(股价区间 regime)：1-3/3-6/6-9/9-11/11-20/20-50/50+ → 1..7；树模型可据此在不同价位学不同规律
-                "price_tier": int(np.searchsorted([3, 6, 9, 11, 20, 50], float(c0)) + 1),
-                # 勒贝格/值域横向分带：近60日落在各涨跌幅带的频率(测度)+分布形状
-                "lb_up_freq": r.get("lb_up_freq"), "lb_bigup_freq": r.get("lb_bigup_freq"),
-                "lb_bigdn_freq": r.get("lb_bigdn_freq"), "lb_ret_skew": r.get("lb_ret_skew"),
-                "lb_ret_q80": r.get("lb_ret_q80"), "lb_ret_q20": r.get("lb_ret_q20"),
-                # 流派规则可量化子集(因果)：技术/趋势符合度 + PE滚动分位
-                "sch_tech": r.get("sch_tech"), "pe_pctile": r.get("pe_pctile"),
-            }
+            base = _extract_mh_feature_row(df, i, code, name)
             for h in horizons:
                 win = close[i + 1: i + h + 1]
                 if len(win) < h:
@@ -19386,9 +19526,20 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
             _sz.append(float(cc))
     size_expo = float(np.mean(_sz)) if _sz else float("nan")
 
-    # ④ 最新一期打分排名(以数据集最后一个交易日的横截面)
-    last_d = ds["date"].max()
-    latest = ds[ds["date"] == last_d].copy()
+    # ④ 最新一期实时打分排名(优先用截至最新交易日的无未来标签横截面，避免停在 horizon 个交易日前)
+    live_xs = build_latest_cross_section(codes, start=start, end=end, root=root, progress_cb=lambda m: None)
+    if len(live_xs) >= 5:
+        live_xs["h"] = int(horizon)
+        for f in xr:
+            if f in live_xs.columns:
+                live_xs[f + "_xr"] = live_xs[f].rank(pct=True)
+        live_xs = live_xs.dropna(subset=feat).copy()
+    if len(live_xs) >= 5:
+        latest = live_xs
+        last_d = pd.to_datetime(latest["date"]).max()
+    else:
+        last_d = ds["date"].max()
+        latest = ds[ds["date"] == last_d].copy()
     latest["score"] = model.predict(scaler.transform(latest[feat].values.astype(float)))
     latest = latest.sort_values("score", ascending=False)
     n = len(latest); k = max(1, n // 3)
@@ -19396,6 +19547,8 @@ def rank_stocks_cross_sectional(codes: Optional[List[str]] = None, horizon: int 
     for i, (_, r) in enumerate(latest.iterrows()):
         tag = "建议关注(前1/3)" if i < k else ("回避(后1/3)" if i >= n - k else "中性")
         ranked.append({"rank": i + 1, "code": r["code"], "name": r.get("name", ""),
+                       "close": round(float(r["close"]), 3) if pd.notna(r.get("close")) else None,
+                       "as_of": str(pd.Timestamp(r["date"]).date()),
                        "score": round(float(r["score"]), 4), "tag": tag})
 
     if out_png:
@@ -20198,6 +20351,108 @@ def dip_daily_report(codes: Optional[List[str]] = None, n_win: int = 10, x_down:
     return {"as_of": as_of, "sections": sections, "total_hits": total_hits, "text": text,
             "out_html": out_html, "push_result": push_result,
             "disclaimer": "研究用途、非投资建议、不荐股、盈亏自负；数据取决于本地更新到的最新交易日。"}
+
+
+def watchlist_health_report(codes: Optional[List[str]] = None, root: Optional[str] = None,
+                            include_rank: bool = False, rank_horizon: int = 21,
+                            progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """自选股综合防坑与低频机会体检：联动避雷扫描(🔴/🟠)、估值温度水位(过热/偏冷)、
+    严格正期望超跌规则(剔除胜率<50%的宽松噪声)以及可选21日横截面相对强弱排序。"""
+    log = progress_cb or (lambda m: None)
+    pool = [c.strip() for c in (codes or USER_WATCHLIST_CODES) if str(c).strip() and str(c).strip() not in USER_ETF_CODES]
+    if not pool:
+        pool = list(USER_WATCHLIST_CODES)
+    root = root or StockDataFetcher._resolve_local_root()
+
+    avoid = anomaly_risk_scan(codes=pool, root=root, progress_cb=log)
+    avoid_rows = avoid.get("ranked") or []
+    avoid_map = {r["code"]: r for r in avoid_rows if r.get("code")}
+
+    temp = market_temperature(codes=pool, root=root, progress_cb=log)
+    temp_rows = temp.get("rows") or []
+    temp_map = {r["code"]: r for r in temp_rows if r.get("code")}
+
+    dates_seen = [r.get("as_of") for r in avoid_rows if r.get("as_of")] + [r.get("as_of") for r in temp_rows if r.get("as_of")]
+    as_of = max(dates_seen) if dates_seen else None
+
+    strict_presets = [
+        {"label": "稳健·近10日≥8跌", "n_win": 10, "x_down": 8, "y_hold": 5, "drop_pct": 0.0, "monthly": "off"},
+        {"label": "深跌超卖·15日≥10跌+回撤15%+月线下方", "n_win": 15, "x_down": 10, "y_hold": 5, "drop_pct": -0.15, "monthly": "below"},
+    ]
+    dip_sections = []
+    for ps in strict_presets:
+        sc = dip_bounce_scan(codes=pool, n_win=ps["n_win"], x_down=ps["x_down"],
+                             drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root, progress_cb=lambda m: None)
+        bt = dip_bounce_backtest(codes=pool, n_win=ps["n_win"], x_down=ps["x_down"], y_hold=ps["y_hold"],
+                                 drop_pct=ps["drop_pct"], monthly=ps["monthly"], root=root, progress_cb=lambda m: None)
+        hits = []
+        for h in (sc.get("hits") or []):
+            av = avoid_map.get(h["code"], {})
+            tp = temp_map.get(h["code"], {})
+            lv = av.get("level", "")
+            hits.append({
+                **h,
+                "risk_level": lv,
+                "risk_score": av.get("score"),
+                "risk_reasons": (av.get("reasons") or [])[:2],
+                "temperature": tp.get("temperature"),
+                "avoid_trap": ("高异动" in str(lv)),
+            })
+        dip_sections.append({
+            "label": ps["label"],
+            "as_of": sc.get("as_of"),
+            "hits": hits,
+            "win_pct": bt.get("win_pct"),
+            "net_per_trade_pct": bt.get("net_per_trade_pct"),
+            "n_trades": bt.get("n_trades", 0),
+        })
+
+    high_risk = [r for r in avoid_rows if "高异动" in str(r.get("level", ""))]
+    med_risk = [r for r in avoid_rows if "中等异动" in str(r.get("level", ""))]
+    overheated = [r for r in temp_rows if isinstance(r.get("temperature"), (int, float)) and r["temperature"] >= 70]
+    cold = [r for r in temp_rows if isinstance(r.get("temperature"), (int, float)) and r["temperature"] <= 20]
+
+    rank_block = None
+    if include_rank:
+        try:
+            rk = rank_stocks_cross_sectional(codes=pool, horizon=int(rank_horizon), root=root,
+                                             out_png=None, progress_cb=lambda m: None)
+            enriched_ranked = []
+            for item in (rk.get("ranked") or []):
+                av = avoid_map.get(item["code"], {})
+                tp = temp_map.get(item["code"], {})
+                enriched_ranked.append({
+                    **item,
+                    "risk_level": av.get("level", ""),
+                    "temperature": tp.get("temperature"),
+                })
+            rank_block = {
+                "as_of": rk.get("as_of"),
+                "horizon": rk.get("horizon"),
+                "algo": rk.get("algo"),
+                "rank_ic": rk.get("rank_ic"),
+                "ic_ir": rk.get("ic_ir"),
+                "ic_pos_ratio_pct": rk.get("ic_pos_ratio_pct"),
+                "ic_by_year": rk.get("ic_by_year"),
+                "ls_spread_net_pct": rk.get("ls_spread_net_pct"),
+                "top_cagr_net_pct": rk.get("top_cagr_net_pct"),
+                "size_exposure": rk.get("size_exposure"),
+                "top": enriched_ranked[:8],
+                "bottom": enriched_ranked[-8:],
+            }
+        except Exception as exc:
+            rank_block = {"error": str(exc)}
+
+    return {
+        "as_of": as_of,
+        "n_codes": len(pool),
+        "avoid_summary": {"high_count": len(high_risk), "med_count": len(med_risk),
+                          "high_risk": high_risk[:8], "medium_risk": med_risk[:8]},
+        "temperature_summary": {**(temp.get("summary") or {}), "overheated": overheated[:8], "cold": cold[:8]},
+        "dip_strict": dip_sections,
+        "rank": rank_block,
+        "disclaimer": "风控与低频体检仅作研究参考，不构成任何买卖依据或投资建议、盈亏自负。",
+    }
 
 
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
