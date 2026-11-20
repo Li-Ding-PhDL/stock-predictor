@@ -8689,10 +8689,10 @@ class AutoAnalysisService:
             self._health_cache = (time.monotonic(), bool(include_rank), rep)
         return {**rep, "cached": False}
 
-    def get_price_positions(self, force: bool = False, start: str = "20200101") -> Dict[str, Any]:
-        """获取自选池（含股票与ETF）2020~2026 股价历史排位百分比与指针曲线（带30秒缓存，盘中实时现价联动更新）。"""
+    def get_price_positions(self, force: bool = False, start: str = "20190101") -> Dict[str, Any]:
+        """获取自选池（含股票与ETF）2019~2026 股价历史排位百分比与指针曲线（带30秒缓存，盘中实时现价联动更新）。"""
         now_m = time.monotonic()
-        start_s = str(start or "20200101").strip()
+        start_s = str(start or "20190101").strip()
         with self._lock:
             cached = self._price_pos_cache
             pool = list(self.codes) or (list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES))
@@ -8802,7 +8802,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
       <button id="pauseBtn" class="sec" onclick="togglePause()">暂停轮询</button>
       <button class="sec" onclick="forceRefresh()">立即刷新</button>
       <a href="/widget{token_qs}" style="color:#60a5fa;font-size:12px;text-decoration:none">同花顺浮窗↗</a>
-      <a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:12px;text-decoration:none">2020~2026排位指针↗</a>
+      <a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:12px;text-decoration:none">2019~2026排位指针↗</a>
       <a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:12px;text-decoration:none">盘口回放准确率↗</a>
     </div>
     <div id="chips" class="chips" style="margin-top:8px"></div>
@@ -8824,7 +8824,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
 
   <div class="card">
     <div class="row">
-      <b>📍 2020~2026 股价历史排位指针（每日收盘价从低到高排序）</b>
+      <b>📍 2019~2026 股价历史排位指针（每日收盘价从低到高排序）</b>
       <div>
         <select id="ppSort" onchange="renderPricePos()">
           <option value="asc">排位 低→高</option>
@@ -8835,7 +8835,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
         <a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:12px;text-decoration:none;margin-left:4px">大图版↗</a>
       </div>
     </div>
-    <div id="pricePosBox" class="muted" style="margin-top:6px">正在计算 2020 年至今每日收盘价排序位置与实时指针...</div>
+    <div id="pricePosBox" class="muted" style="margin-top:6px">正在计算 2019 年至今每日收盘价排序位置与实时指针...</div>
   </div>
 
   <div class="card">
@@ -9053,7 +9053,7 @@ function renderActive(d) {{
         const rp = Number(pp.rank_pct);
         const col = rp <= 20 ? '#22c55e' : (rp <= 40 ? '#38bdf8' : (rp <= 70 ? '#f59e0b' : '#ef4444'));
         return `<div style="margin-top:8px;padding:7px 9px;background:#0f172a;border-radius:8px;font-size:12px">` +
-          `<div class="row"><span>📍 <b>2020~2026排序位置</b>（第${{pp.rank_day}}/${{pp.n_days}}天）</span><b style="color:${{col}}">▼ ${{rp.toFixed(1)}}%</b></div>` +
+          `<div class="row"><span>📍 <b>2019~2026排序位置</b>（第${{pp.rank_day}}/${{pp.n_days}}天）</span><b style="color:${{col}}">▼ ${{rp.toFixed(1)}}%</b></div>` +
           `<div style="position:relative;height:10px;background:linear-gradient(90deg,#16a34a 0%,#38bdf8 35%,#f59e0b 70%,#dc2626 100%);border-radius:999px;margin:7px 0 4px">` +
           `<div style="position:absolute;left:calc(${{Math.max(0,Math.min(100,rp))}}% - 6px);top:-5px;width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:8px solid #fff"></div>` +
           `<div style="position:absolute;left:${{Math.max(0,Math.min(100,rp))}}%;top:-1px;bottom:-1px;width:2px;background:#fff"></div></div>` +
@@ -9323,7 +9323,7 @@ function renderPricePos() {{
   box.innerHTML = `<div class="row"><span>起算 <b>${{s.start}}</b> · 截至 <b>${{s.as_of}}</b> · 实盘 <b>${{s.live_count}}/${{s.n_scored}}</b>只</span>` +
     `<span>&lt;10%极低位 <b class="dn">${{s.lt10_count ?? 0}}</b>只 ｜ 中位排位 <b>${{s.median_rank_pct}}%</b> ｜ 低位(≤20%) <b class="dn">${{s.low_zone_count}}</b>只 ｜ 高位(≥80%) <b class="up">${{s.high_zone_count}}</b>只</span></div>` +
     `<div class="chips" style="margin-top:6px">${{bChips}}</div>` +
-    `<div style="max-height:420px;overflow-y:auto;margin-top:6px"><table><tr><th>股票(最低~最高)</th><th>现价</th><th>2020~2026排位(分档)</th><th>升序曲线与指针</th></tr>${{trs}}</table></div>` +
+    `<div style="max-height:420px;overflow-y:auto;margin-top:6px"><table><tr><th>股票(最低~最高)</th><th>现价</th><th>2019~2026排位(分档)</th><th>升序曲线与指针</th></tr>${{trs}}</table></div>` +
     `<div class="muted" style="margin-top:4px;font-size:11px">⚠ ${{d.disclaimer}}</div>`;
 }}
 async function loadPricePos(force=false) {{
@@ -9447,7 +9447,7 @@ async function tick() {{
     if (wpp && d.price_position && d.price_position.rank_pct != null) {{
       const pp = d.price_position;
       wpp.style.display = 'block';
-      wpp.innerHTML = `📍 2020~2026排序: <b>▼ ${{Number(pp.rank_pct).toFixed(1)}}%</b> (第${{pp.rank_day}}/${{pp.n_days}}天 · 低${{pp.min_price}}~高${{pp.max_price}})`;
+      wpp.innerHTML = `📍 2019~2026排序: <b>▼ ${{Number(pp.rank_pct).toFixed(1)}}%</b> (第${{pp.rank_day}}/${{pp.n_days}}天 · 低${{pp.min_price}}~高${{pp.max_price}})`;
     }} else if (wpp) {{ wpp.style.display = 'none'; }}
 
     const bids = (q.bids || []).slice(0, 5), asks = (q.asks || []).slice(0, 5);
@@ -9580,7 +9580,7 @@ class MobileWebServer:
                                json.dumps(health, ensure_ascii=False).encode("utf-8"))
                 elif parsed.path in ("/api/price_positions", "/price_pos"):
                     frc = (qs.get("force") or ["0"])[0].strip().lower() in ("1", "true", "yes")
-                    st = (qs.get("start") or ["20200101"])[0].strip() or "20200101"
+                    st = (qs.get("start") or ["20190101"])[0].strip() or "20190101"
                     rep = parent.service.get_price_positions(force=frc, start=st)
                     if parsed.path == "/price_pos":
                         self._send(200, "text/html; charset=utf-8",
@@ -20768,7 +20768,7 @@ def _compute_single_price_percentile(df: pd.DataFrame, code: str, name: str = ""
     }
 
 
-def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = "20200101",
+def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = "20190101",
                                 end: Optional[str] = None, root: Optional[str] = None,
                                 use_live: bool = True,
                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
@@ -20838,12 +20838,12 @@ def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = 
     return {
         "summary": summary,
         "rows": rows,
-        "disclaimer": "历史价格排位仅反映当前股价在2020年至今每日收盘价排序中的客观位置，低位≠必涨、高位≠必跌，不构成买卖建议、盈亏自负。",
+        "disclaimer": f"历史价格排位仅反映当前股价在{summary['start'][:4]}年至今每日收盘价排序中的客观位置，低位≠必涨、高位≠必跌，不构成买卖建议、盈亏自负。",
     }
 
 
 def price_percentile_report_html(rep: Dict[str, Any]) -> str:
-    """生成带升序分布曲线 + 实时指针箭头的 2020~2026 股价排位百分比独立 HTML 页面。"""
+    """生成带升序分布曲线 + 实时指针箭头的 股价历史排位百分比独立 HTML 页面。"""
     import html as _html
     summ = rep.get("summary") or {}
     rows = rep.get("rows") or []
@@ -20922,7 +20922,7 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>2020~2026 自选股价历史排位指针</title>
+<title>2019~2026 自选股价历史排位指针</title>
 <style>
   body {{ margin:0; padding:12px; background:#0b1220; color:#f1f5f9; font-family:-apple-system,"Microsoft YaHei",sans-serif; font-size:13px; }}
   .wrap {{ max-width:1100px; margin:0 auto; }}
@@ -20940,7 +20940,7 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
   input {{ background:#0f172a; color:#fff; border:1px solid #475569; border-radius:8px; padding:5px 8px; font-size:12px; }}
 </style></head><body><div class="wrap">
 <div class="hdr">
-  <div class="top"><b style="font-size:17px">📍 2020~2026 自选股价历史排位指针（每日收盘价从低到高排序）</b>
+  <div class="top"><b style="font-size:17px">📍 {str(summ.get("start","2019"))[:4]}~2026 自选股价历史排位指针（每日收盘价从低到高排序）</b>
     <span class="mu">起算 {summ.get("start","-")} · 历史截至 {summ.get("as_of","-")} · 实盘报价 {summ.get("live_count",0)}/{summ.get("n_scored",0)} 只</span></div>
   <div class="top" style="margin-top:8px">
     <span>&lt;10%极低位 <b class="dn">{summ.get("lt10_count",0)}</b> 只 ｜ 中位排位 <b>{summ.get("median_rank_pct","-")}%</b> ｜ 低位(≤20%) <b class="dn">{summ.get("low_zone_count",0)}</b> 只 ｜ 高位(≥80%) <b class="up">{summ.get("high_zone_count",0)}</b> 只</span>
@@ -20987,12 +20987,13 @@ function filterCards() {{
 
 
 def format_price_pos_markdown(rep: Dict[str, Any]) -> str:
-    """把 2020~2026 股价历史排位指针结果格式化为适合微信推送与 GitHub Step Summary 的 Markdown 报告。"""
+    """把股价历史排位指针结果格式化为适合微信推送与 GitHub Step Summary 的 Markdown 报告。"""
     summ = rep.get("summary") or {}
     rows = rep.get("rows") or []
     as_of = summ.get("as_of") or "-"
+    sy = str(summ.get("start") or "2019")[:4]
     lines = [
-        f"## 📍 2020~2026 自选股价历史排位 · 截至 {as_of}",
+        f"## 📍 {sy}~2026 自选股价历史排位 · 截至 {as_of}",
         f"- **起算**：`{summ.get('start', '-')}` ｜ **实盘**：`{summ.get('live_count', 0)}/{summ.get('n_scored', 0)}` 只 ｜ **中位排位**：`{summ.get('median_rank_pct', '-')}%`",
         f"- **<10% 极低位**：`{summ.get('lt10_count', 0)}` 只 ｜ **≤20% 低位**：`{summ.get('low_zone_count', 0)}` 只 ｜ **≥80% 高位**：`{summ.get('high_zone_count', 0)}` 只",
         "",
@@ -21017,7 +21018,7 @@ def format_price_pos_markdown(rep: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "### 📋 全部自选 2020~2026 排位完整榜单（从低到高）",
+        f"### 📋 全部自选 {sy}~2026 排位完整榜单（从低到高）",
         "| 排名 | 代码/名称 | 现价 | 排位% | 分档 | 第k/N天 | 区间% | 最低~最高 |",
         "|---|---|---|---|---|---|---|---|",
     ])
@@ -21485,8 +21486,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="用已冻结的全局模型预测某股票(传股票代码)，只加载不训练；配合 --global-algos 里第一个模型")
     p.add_argument("--price-pos", action="store_true",
                    help="计算自选股在 2020~2026 每日收盘价从低到高排序中的今日指针位置与百分比，并导出可视化 HTML")
-    p.add_argument("--price-start", default="20200101",
-                   help="配合 --price-pos 的起始日期 YYYYMMDD(默认 20200101)")
+    p.add_argument("--price-start", default="20190101",
+                   help="配合 --price-pos 的起始日期 YYYYMMDD(默认 20190101)")
     p.add_argument("--price-html", default="",
                    help="配合 --price-pos 的可视化 HTML 输出路径(默认生成在项目根目录)")
     p.add_argument("--price-md", default="",
@@ -21876,7 +21877,7 @@ def main():
         print("提示：把 STOCK_LOCAL_DATA_ROOT 指向该目录，或设 LOCAL_DATA_ROOT，即用最新数据跑选股/预测。")
         return
 
-    # --price-pos：2020~2026 每日收盘价从低到高排序与今日指针位置%
+    # --price-pos：2019~2026 每日收盘价从低到高排序与今日指针位置%
     if getattr(args, "price_pos", False):
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
@@ -21884,8 +21885,9 @@ def main():
                   else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else (list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES))))
         rep = watchlist_price_percentiles(codes=codes, start=args.price_start, use_live=True, progress_cb=lambda m: None)
         summ = rep["summary"]
+        sy = str(summ.get("start") or "2019")[:4]
         print("=" * 86)
-        print(f"📍 2020~2026 股价历史排位指针（起算 {summ['start']} · 截至 {summ['as_of']} · 实盘 {summ['live_count']}/{summ['n_scored']}只）")
+        print(f"📍 {sy}~2026 股价历史排位指针（起算 {summ['start']} · 截至 {summ['as_of']} · 实盘 {summ['live_count']}/{summ['n_scored']}只）")
         print(f"   <10%极低位: {summ['lt10_count']}只 | 中位排位: {summ['median_rank_pct']}% | 低位(≤20%): {summ['low_zone_count']}只 | 高位(≥80%): {summ['high_zone_count']}只")
         print("-" * 86)
         print(f"{'代码':<8}{'名称':<8}{'现价':>8} {'指针刻度(低→高)':<24}{'排位%':>7} {'分档':<9} {'第k/N天':>10} {'区间%':>7} {'最低~最高'}")
@@ -21903,7 +21905,7 @@ def main():
             print(f"  {b['label']:<9} [{b['count']:>2}只]: {names}")
         print("=" * 86)
         print("⚠ " + rep["disclaimer"])
-        html_out = (args.price_html or os.path.join(BASE_DIR, "2020_2026_股价历史排位指针.html")).strip()
+        html_out = (args.price_html or os.path.join(BASE_DIR, f"{sy}_2026_股价历史排位指针.html")).strip()
         if html_out:
             with open(html_out, "w", encoding="utf-8") as fh:
                 fh.write(price_percentile_report_html(rep))
@@ -21915,7 +21917,7 @@ def main():
             print(f"Markdown 摘要已写入: {args.price_md.strip()}")
         if getattr(args, "push", "").strip():
             targets = [t.strip() for t in str(args.push).replace("\n", ";").split(";") if t.strip()]
-            res_p = [_push_message(t, f"2020~2026股价排位 {summ['as_of']} · <10%共{summ['lt10_count']}只", md_txt) for t in targets]
+            res_p = [_push_message(t, f"{sy}~2026股价排位 {summ['as_of']} · <10%共{summ['lt10_count']}只", md_txt) for t in targets]
             print("推送结果: " + " | ".join(f"[{i+1}/{len(targets)}]{r}" for i, r in enumerate(res_p)))
         if args.json:
             with open(args.json, "w", encoding="utf-8") as fh:

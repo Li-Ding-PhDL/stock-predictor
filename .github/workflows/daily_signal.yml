@@ -25,7 +25,7 @@ on:
       price_start:
         description: "股价排位起算日期 (YYYYMMDD)"
         required: false
-        default: "20200101"
+        default: "20190101"
 
 permissions:
   contents: read
@@ -49,13 +49,13 @@ jobs:
       - name: 更新自选数据到最新 (baostock，境外偶尔限流不阻断)
         run: python stock_predictor.py --cli --update-data --global-scope mine
         continue-on-error: true
-      - name: 计算 2020~2026 股价历史排位指针（12档）与风险体检并推送
+      - name: 计算 2019~2026 股价历史排位指针（12档）与风险体检并推送
         env:
           STOCK_LOCAL_DATA_ROOT: ${{ github.workspace }}/data_updated
           PUSH_SPEC: ${{ secrets.PUSH_SPEC }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           RUN_MODE: ${{ github.event.inputs.mode || 'all' }}
-          PRICE_START: ${{ github.event.inputs.price_start || '20200101' }}
+          PRICE_START: ${{ github.event.inputs.price_start || '20190101' }}
         run: |
           PUSH="$PUSH_SPEC"
           if [ -z "$PUSH" ] && [ -n "$PUSHPLUS_TOKEN" ]; then PUSH="pushplus:${PUSHPLUS_TOKEN}"; fi
@@ -63,7 +63,7 @@ jobs:
           if [ -n "$PUSH" ]; then PUSH_ARGS="--push $PUSH"; fi
 
           if [ "$RUN_MODE" = "all" ] || [ "$RUN_MODE" = "price_pos" ]; then
-            echo ">>> [1] 运行 2020~2026 股价历史排位指针..."
+            echo ">>> [1] 运行 2019~2026 股价历史排位指针..."
             python stock_predictor.py --price-pos --global-scope mine --price-start "$PRICE_START" --price-md price_pos_summary.md $PUSH_ARGS || true
             if [ -f price_pos_summary.md ]; then
               cat price_pos_summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -94,6 +94,6 @@ jobs:
         with:
           name: daily-stock-reports
           path: |
-            2020_2026_股价历史排位指针.html
+            *_2026_股价历史排位指针.html
             每日信号_*.html
           if-no-files-found: ignore

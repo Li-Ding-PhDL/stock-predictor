@@ -1174,16 +1174,16 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
     """验证 2020~2026 每日收盘价从低到高排序排位百分比、指针 SVG、实时报价覆写及 Web /price_pos 接口。"""
     csv_dir = tmp_path / "每只股票一个文件" / "前复权"
     csv_dir.mkdir(parents=True)
-    # 构造含 2019(应被2020起点过滤掉) 与 2020~2026 收盘价 [10.0, 20.0, 30.0, 40.0, 50.0] 的 2 只测试股
+    # 构造含 2018(应被2019/2020起点过滤掉) 与 2020~2026 收盘价 [10.0..50.0] 的 2 只测试股
     dates_2020 = pd.date_range("2020-01-02", periods=10, freq="B")
     closes_a = [10.0, 20.0, 30.0, 40.0, 50.0, 15.0, 25.0, 35.0, 45.0, 30.0]
     closes_b = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
     for code, nm, cl_arr in [("000001", "低位样", closes_a), ("000002", "高位样", closes_b)]:
         df = pd.DataFrame({
-            "日期": ["2019-12-31"] + list(dates_2020.strftime("%Y-%m-%d")),
+            "日期": ["2018-12-28"] + list(dates_2020.strftime("%Y-%m-%d")),
             "代码": code,
             "名称": nm,
-            "收盘价": [999.0] + cl_arr,  # 2019年的999必须被 start="20200101" 排除
+            "收盘价": [999.0] + cl_arr,  # 2018年的999必须被 start="20190101"/"20200101" 排除
             "退市时间": ["-"] * 11,
         })
         df.to_csv(csv_dir / f"{code}.csv", index=False, encoding="utf-8-sig")
@@ -1199,7 +1199,8 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
         }
     ))
 
-    rep = s.watchlist_price_percentiles(codes=["000001", "000002"], start="20200101", root=str(tmp_path), use_live=True)
+    rep = s.watchlist_price_percentiles(codes=["000001", "000002"], root=str(tmp_path), use_live=True)
+    assert rep["summary"]["start"] == "2019-01-01"
     assert rep["summary"]["n_scored"] == 2
     assert rep["summary"]["live_count"] == 2
     rows_map = {r["code"]: r for r in rep["rows"]}
@@ -1241,6 +1242,6 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
             assert "<svg" in phtml and "15.0%" in phtml and "95.0%" in phtml
         with urllib.request.urlopen(base + "/widget", timeout=10) as resp:
             whtml = resp.read().decode("utf-8")
-            assert "2020~2026排序" in whtml
+            assert "2019~2026排序" in whtml
     finally:
         srv.stop()
