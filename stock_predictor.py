@@ -386,6 +386,12 @@ class StockDataFetcher:
         return c.startswith(("4", "8", "9"))
 
     @staticmethod
+    def _is_etf_code(code: str) -> bool:
+        """场内 ETF 代码判断：沪市 51/56/588 开头、深市 159 开头（科创50ETF/电池ETF等）。"""
+        c = str(code).strip()
+        return c.startswith(("51", "56", "588", "159"))
+
+    @staticmethod
     def _is_akshare_rate_limit_error(e: Exception) -> bool:
         """识别 akshare(东方财富) 的短时限流特征错误(命中时应等更久再重试)：
         RemoteDisconnected / Connection aborted / Connection reset 等被服务器主动掐连的特征。"""
@@ -605,11 +611,15 @@ class StockDataFetcher:
             "\n或先用「合成数据」跑通流程。"
         )
 
-    # ---------- 3.1a 数据源实现：akshare（东方财富）----------
+    # ---------- 3.1a 数据源实现：akshare（东方财富，自动兼容股票与ETF）----------
     @staticmethod
     def _fetch_akshare(code, start_date, end_date, adjust):
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=start_date, end_date=end_date, adjust=adjust)
+        if StockDataFetcher._is_etf_code(code):
+            df = ak.fund_etf_hist_em(symbol=code, period="daily",
+                                     start_date=start_date, end_date=end_date, adjust=adjust)
+        else:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily",
+                                    start_date=start_date, end_date=end_date, adjust=adjust)
         df = df.rename(columns={
             "日期": "date", "开盘": "open", "收盘": "close",
             "最高": "high", "最低": "low", "成交量": "volume",
@@ -8680,12 +8690,12 @@ class AutoAnalysisService:
         return {**rep, "cached": False}
 
     def get_price_positions(self, force: bool = False, start: str = "20200101") -> Dict[str, Any]:
-        """获取自选池 2020~2026 股价历史排位百分比与指针曲线（带30秒缓存，盘中实时现价联动更新）。"""
+        """获取自选池（含股票与ETF）2020~2026 股价历史排位百分比与指针曲线（带30秒缓存，盘中实时现价联动更新）。"""
         now_m = time.monotonic()
         start_s = str(start or "20200101").strip()
         with self._lock:
             cached = self._price_pos_cache
-            pool = [c for c in self.codes if c not in USER_ETF_CODES] or list(USER_WATCHLIST_CODES)
+            pool = list(self.codes) or (list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES))
         if not force and cached is not None:
             ts, c_start, data = cached
             if (now_m - ts) < 30.0 and c_start == start_s:
@@ -18825,16 +18835,28 @@ def update_daily_dataset(codes: List[str], out_root: str = UPDATED_DATA_ROOT,
                 rows = []
                 while rs.next():
                     rows.append(rs.get_row_data())
-                if not rows:
+                if rows:
+                    d = pd.DataFrame(rows, columns=rs.fields)
+                    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+                    for col in ("open", "high", "low", "close", "preclose", "volume", "amount",
+                                "turn", "pctChg", "peTTM", "psTTM", "pbMRQ"):
+                        d[col] = pd.to_numeric(d[col], errors="coerce")
+                elif StockDataFetcher._is_etf_code(c) and HAS_AKSHARE:
+                    with (_no_proxy() if bypass_proxy else contextlib.nullcontext()):
+                        d = StockDataFetcher._fetch_akshare(c, start, end.replace("-", ""), "qfq")
+                    if d is None or len(d) == 0:
+                        skip += 1; log(f"[{i}/{len(codes)}] {code} ETF无数据，跳过"); continue
+                    d["preclose"] = d["close"].shift(1)
+                    d["turn"] = pd.to_numeric(d.get("turnover"), errors="coerce")
+                    d["pctChg"] = pd.to_numeric(d.get("pct_change"), errors="coerce")
+                    for _vc in ("peTTM", "psTTM", "pbMRQ"):
+                        d[_vc] = np.nan
+                    d["isST"] = "0"
+                else:
                     skip += 1; log(f"[{i}/{len(codes)}] {code} baostock 无数据，跳过"); continue
-                d = pd.DataFrame(rows, columns=rs.fields)
-                d["date"] = pd.to_datetime(d["date"], errors="coerce")
-                for col in ("open", "high", "low", "close", "preclose", "volume", "amount",
-                            "turn", "pctChg", "peTTM", "psTTM", "pbMRQ"):
-                    d[col] = pd.to_numeric(d[col], errors="coerce")
                 d = d.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-                # 名称/行业沿用本地历史(若有)
-                name, ind = code, ""
+                # 名称/行业沿用本地历史(若有)或覆盖表
+                name, ind = STOCK_NAME_OVERRIDES.get(code, code), ("ETF" if StockDataFetcher._is_etf_code(code) else "")
                 if hist_root:
                     hp = StockDataFetcher._local_csv_path(code, "qfq", hist_root)
                     if os.path.exists(hp):
@@ -20750,7 +20772,7 @@ def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = 
                                 progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """统计自选池每只股票在 start~最新 每天收盘价从低到高排序后，今日股价所处的排位百分比与指针坐标。"""
     log = progress_cb or (lambda m: None)
-    pool = [str(c).strip() for c in (codes or USER_WATCHLIST_CODES) if str(c).strip()]
+    pool = [str(c).strip() for c in (codes or (list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES))) if str(c).strip()]
     root = root or StockDataFetcher._resolve_local_root()
 
     live_quotes: Dict[str, Dict[str, Any]] = {}
@@ -21844,7 +21866,7 @@ def main():
     if args.update_data:
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                 ((list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES)) if args.global_scope == "mine"
                   else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else _scan_all_local_codes()))
         print(f"[update-data] 抓取最新日线+估值，接续 {len(codes)} 只 ...")
         r = update_daily_dataset(codes, progress_cb=print)
@@ -21856,8 +21878,8 @@ def main():
     if getattr(args, "price_pos", False):
         codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
                  if args.global_codes else
-                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
-                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else list(USER_WATCHLIST_CODES)))
+                 ((list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES)) if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else (list(USER_WATCHLIST_CODES) + list(USER_ETF_CODES))))
         rep = watchlist_price_percentiles(codes=codes, start=args.price_start, use_live=True, progress_cb=lambda m: None)
         summ = rep["summary"]
         print("=" * 86)
