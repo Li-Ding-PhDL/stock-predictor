@@ -976,10 +976,10 @@ def test_exchange_routing_watchlist_and_batch_scan(monkeypatch):
     assert s.StockDataFetcher._exchange_market("002594") == ("0", "sz")
     assert s.StockDataFetcher._exchange_market("830001") == ("0", "bj")
 
-    # 补齐同花顺4张自选图里的40只个股 + 2只场内ETF
-    for code in ("002531", "002086", "000980", "688037", "600715", "300324", "002594", "300750", "000678"):
+    # 补齐同花顺4张自选图里的40只个股 + 新增603466 + 2只场内ETF
+    for code in ("002531", "002086", "000980", "688037", "600715", "300324", "002594", "300750", "000678", "603466"):
         assert code in s.USER_WATCHLIST_CODES
-    assert len(s.USER_WATCHLIST_CODES) == 40 and len(set(s.USER_WATCHLIST_CODES)) == 40
+    assert len(s.USER_WATCHLIST_CODES) == 41 and len(set(s.USER_WATCHLIST_CODES)) == 41
     assert s.USER_ETF_CODES == ["588940", "159155"]
 
     def _tx_line(var_prefix, name, code, price, pct):
