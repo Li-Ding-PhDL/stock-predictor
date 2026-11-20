@@ -1218,6 +1218,8 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
     assert rep["summary"]["buckets"][4]["label"] == "20%~30%"
     assert rep["summary"]["lt10_count"] == 0
     assert rep["rows"][0]["code"] == "000001"  # 默认按排位升序排列
+    md = s.format_price_pos_markdown(rep)
+    assert "<10%" in md and "0%~5%" in md and "15%~20%" in md and "90%~100%" in md
 
     svc = s.AutoAnalysisService(codes=["000001", "000002"], interval_sec=60.0)
     srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)

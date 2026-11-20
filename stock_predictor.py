@@ -20962,6 +20962,39 @@ function filterCards() {{
 </script></body></html>"""
 
 
+def format_price_pos_markdown(rep: Dict[str, Any]) -> str:
+    """把 2020~2026 股价历史排位指针结果格式化为适合微信推送与 GitHub Step Summary 的 Markdown 报告。"""
+    summ = rep.get("summary") or {}
+    rows = rep.get("rows") or []
+    as_of = summ.get("as_of") or "-"
+    lines = [
+        f"## 📍 2020~2026 自选股价历史排位 · 截至 {as_of}",
+        f"- **起算**：`{summ.get('start', '-')}` ｜ **实盘**：`{summ.get('live_count', 0)}/{summ.get('n_scored', 0)}` 只 ｜ **中位排位**：`{summ.get('median_rank_pct', '-')}%`",
+        f"- **<10% 极低位**：`{summ.get('lt10_count', 0)}` 只 ｜ **≤20% 低位**：`{summ.get('low_zone_count', 0)}` 只 ｜ **≥80% 高位**：`{summ.get('high_zone_count', 0)}` 只",
+        "",
+        "### 🟢 <10% 极低位标的（0%~5% 与 5%~10%）",
+    ]
+    lt10 = [r for r in rows if float(r.get("rank_pct", 100.0)) < 10.0]
+    if lt10:
+        lines.append("| 代码/名称 | 现价 | 排位% | 分档 | 第k/N天 | 最低~最高 |")
+        lines.append("|---|---|---|---|---|---|")
+        for r in lt10:
+            lines.append(
+                f"| {r['code']} {r['name']} | {r['current_price']} | **{r['rank_pct']:.1f}%** | "
+                f"{r.get('bucket', '')} | {r['rank_day']}/{r['n_days']} | {r['min_price']}~{r['max_price']} |"
+            )
+    else:
+        lines.append("- （当前无 <10% 极低位标的）")
+
+    lines.extend(["", "### 📊 12 档完整分布（0~20% 每 5% / 20~100% 每 10%）"])
+    for b in (summ.get("buckets") or []):
+        items = "、".join(f"{it['name']}({it['rank_pct']}%)" for it in (b.get("items") or [])) or "（无）"
+        lines.append(f"- **{b['label']}**（`{b['count']}` 只）：{items}")
+
+    lines.extend(["", f"> ⚠ {rep.get('disclaimer', '')}"])
+    return "\n".join(lines)
+
+
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
 VOTE_DEFAULT_ALGOS: List[str] = ["Lasso", "RidgeReg", "ElasticNet", "PLSR", "ELM", "KNN",
                                  "RF", "ExtraTrees", "Bagging", "GBRT", "XGBoost", "LightGBM"]
@@ -21419,6 +21452,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="配合 --price-pos 的起始日期 YYYYMMDD(默认 20200101)")
     p.add_argument("--price-html", default="",
                    help="配合 --price-pos 的可视化 HTML 输出路径(默认生成在项目根目录)")
+    p.add_argument("--price-md", default="",
+                   help="配合 --price-pos 的 Markdown 摘要输出路径(供 GitHub Actions 摘要等使用)")
     return p
 
 
@@ -21836,6 +21871,15 @@ def main():
             with open(html_out, "w", encoding="utf-8") as fh:
                 fh.write(price_percentile_report_html(rep))
             print(f"可视化指针网页已写入: {html_out}")
+        md_txt = format_price_pos_markdown(rep)
+        if getattr(args, "price_md", "").strip():
+            with open(args.price_md.strip(), "w", encoding="utf-8") as fh:
+                fh.write(md_txt + "\n")
+            print(f"Markdown 摘要已写入: {args.price_md.strip()}")
+        if getattr(args, "push", "").strip():
+            targets = [t.strip() for t in str(args.push).replace("\n", ";").split(";") if t.strip()]
+            res_p = [_push_message(t, f"2020~2026股价排位 {summ['as_of']} · <10%共{summ['lt10_count']}只", md_txt) for t in targets]
+            print("推送结果: " + " | ".join(f"[{i+1}/{len(targets)}]{r}" for i, r in enumerate(res_p)))
         if args.json:
             with open(args.json, "w", encoding="utf-8") as fh:
                 json.dump(rep, fh, ensure_ascii=False, indent=2)

@@ -1,16 +1,31 @@
-name: 每日选股信号推送微信
+name: 每日选股与排位一键推送
 
-# 云端定时(GitHub 服务器跑，不用你电脑开机)：每交易日收盘后扫『暴跌抄反弹』买点 + 风险，推送到微信。
-# 需要：仓库 Settings → Secrets and variables → Actions 里新增一个 Secret，名字 PUSHPLUS_TOKEN，值=你在 pushplus.plus 的 token。
-# ⚠ 诚实提示：GitHub 服务器在境外，连 A 股数据(baostock)可能不稳/偶尔失败；失败时会推"数据未更新/命中0只"，据此判断。
-# ⚠ 命中≠推荐买入；研究用途、非投资建议、盈亏自负。
+# 云端定时 + GitHub 网页一键触发（「Actions → 每日选股与排位一键推送 → Run workflow」）：
+# 1) 更新 40 只同花顺自选日线数据；
+# 2) 生成 2020~2026 股价历史排位指针（12 档分档 + <10% 极低位清单 + SVG 指针 HTML）；
+# 3) 运行避雷扫描、估值温度、严选超跌与 21 日横截面强弱，并写入 GitHub Actions 运行摘要页；
+# 4) 如已在仓库 Secrets 配置 PUSH_SPEC（如 serverchan:KEY / pushplus:TOKEN / 群机器人 webhook）或 PUSHPLUS_TOKEN，同步推送到微信/手机。
+# ⚠ 所有测算仅作研究参考，不构成买卖信号或投资建议、盈亏自负。
 
 on:
   schedule:
-    # 每天(含周末)两次。信号需当天收盘才算得出，故早间推的是"上一交易日"(消息里"截至 X 日"会标明)，收盘后才是当天最新。
-    - cron: "0 0 * * *"          # 00:00 UTC = 北京 08:00 —— 早间推(上一交易日信号)
-    - cron: "35 7 * * *"         # 07:35 UTC = 北京 15:35 —— 收盘后推(当天最新信号)
-  workflow_dispatch: {}          # 支持在 Actions 页手动点「Run workflow」测试
+    - cron: "0 0 * * 1-5"          # UTC 00:00 = 北京 08:00（工作日早间）
+    - cron: "35 7 * * 1-5"         # UTC 07:35 = 北京 15:35（工作日收盘后）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "推送内容选择（all=全部 / price_pos=仅2020~2026排位 / dip=仅超跌信号）"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - price_pos
+          - dip
+      price_start:
+        description: "股价排位起算日期 (YYYYMMDD)"
+        required: false
+        default: "20200101"
 
 permissions:
   contents: read
@@ -27,33 +42,58 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 安装依赖(仅计算+baostock+requests)
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas scipy scikit-learn matplotlib requests baostock
-      - name: 更新自选数据到最新(baostock, 免注册; 境外可能失败,不阻断)
+          pip install numpy pandas scipy scikit-learn matplotlib requests baostock akshare
+      - name: 更新自选数据到最新 (baostock，境外偶尔限流不阻断)
         run: python stock_predictor.py --cli --update-data --global-scope mine
         continue-on-error: true
-      - name: 扫今日买点+风险并推送微信
+      - name: 计算 2020~2026 股价历史排位指针（12档）与风险体检并推送
         env:
           STOCK_LOCAL_DATA_ROOT: ${{ github.workspace }}/data_updated
-          # PUSH_SPEC(推荐)=完整推送方式, 可填: 'serverchan:你的SENDKEY' / 'https://企业微信群机器人webhook' / 'pushplus:token'
-          # 给多个人推：用 ; 分隔多个，如 'serverchan:你的KEY;serverchan:朋友的KEY'(每人各自注册、给自己的SENDKEY)。
-          # 兼容旧的 PUSHPLUS_TOKEN(仅pushplus, 需实名)。二者都没配则只生成HTML不推送。
           PUSH_SPEC: ${{ secrets.PUSH_SPEC }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          RUN_MODE: ${{ github.event.inputs.mode || 'all' }}
+          PRICE_START: ${{ github.event.inputs.price_start || '20200101' }}
         run: |
           PUSH="$PUSH_SPEC"
           if [ -z "$PUSH" ] && [ -n "$PUSHPLUS_TOKEN" ]; then PUSH="pushplus:${PUSHPLUS_TOKEN}"; fi
-          if [ -z "$PUSH" ]; then
-            echo "未配置推送 Secret(PUSH_SPEC 或 PUSHPLUS_TOKEN)，仅生成HTML不推送。"
-            python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine
-          else
-            python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine --push "$PUSH"
+          PUSH_ARGS=""
+          if [ -n "$PUSH" ]; then PUSH_ARGS="--push $PUSH"; fi
+
+          if [ "$RUN_MODE" = "all" ] || [ "$RUN_MODE" = "price_pos" ]; then
+            echo ">>> [1] 运行 2020~2026 股价历史排位指针..."
+            python stock_predictor.py --price-pos --global-scope mine --price-start "$PRICE_START" --price-md price_pos_summary.md $PUSH_ARGS || true
+            if [ -f price_pos_summary.md ]; then
+              cat price_pos_summary.md >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
-      - name: 保存信号HTML为构件(Actions页可下载)
+
+          if [ "$RUN_MODE" = "all" ] || [ "$RUN_MODE" = "dip" ]; then
+            echo ">>> [2] 运行避雷扫描 + 估值体检..."
+            {
+              echo "## 🛡️ 避雷扫描与估值温度（摘要）"
+              echo '```text'
+              python stock_predictor.py --avoid-scan --global-scope mine | tail -n 18 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo ">>> [3] 运行严格超跌信号..."
+            if [ -n "$PUSH" ]; then
+              python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine --push "$PUSH" | tee dip_summary.txt || true
+            else
+              python stock_predictor.py --cli --dip-daily --dip-multi --dip-news --global-scope mine | tee dip_summary.txt || true
+            fi
+            if [ -f dip_summary.txt ]; then
+              cat dip_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+      - name: 上传指针大图与每日信号 HTML（Actions 页面可直接下载打开）
         uses: actions/upload-artifact@v4
         with:
-          name: daily-signal-html
-          path: 每日信号_*.html
+          name: daily-stock-reports
+          path: |
+            2020_2026_股价历史排位指针.html
+            每日信号_*.html
           if-no-files-found: ignore
