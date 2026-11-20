@@ -20991,6 +20991,19 @@ def format_price_pos_markdown(rep: Dict[str, Any]) -> str:
         items = "、".join(f"{it['name']}({it['rank_pct']}%)" for it in (b.get("items") or [])) or "（无）"
         lines.append(f"- **{b['label']}**（`{b['count']}` 只）：{items}")
 
+    lines.extend([
+        "",
+        "### 📋 全部自选 2020~2026 排位完整榜单（从低到高）",
+        "| 排名 | 代码/名称 | 现价 | 排位% | 分档 | 第k/N天 | 区间% | 最低~最高 |",
+        "|---|---|---|---|---|---|---|---|",
+    ])
+    sorted_rows = sorted(rows, key=lambda x: (float(x.get("rank_pct", 0.0)), float(x.get("range_pct", 0.0))))
+    for idx, r in enumerate(sorted_rows, 1):
+        lines.append(
+            f"| #{idx} | {r['code']} {r['name']} | {r['current_price']} | **{r['rank_pct']:.1f}%** | "
+            f"{r.get('bucket', '')} | {r['rank_day']}/{r['n_days']} | {r['range_pct']:.1f}% | {r['min_price']}~{r['max_price']} |"
+        )
+
     lines.extend(["", f"> ⚠ {rep.get('disclaimer', '')}"])
     return "\n".join(lines)
 

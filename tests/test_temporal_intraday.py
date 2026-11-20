@@ -1220,6 +1220,8 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
     assert rep["rows"][0]["code"] == "000001"  # 默认按排位升序排列
     md = s.format_price_pos_markdown(rep)
     assert "<10%" in md and "0%~5%" in md and "15%~20%" in md and "90%~100%" in md
+    assert "从低到高" in md and "#1" in md and "#2" in md
+    assert md.index("000001") < md.index("000002")
 
     svc = s.AutoAnalysisService(codes=["000001", "000002"], interval_sec=60.0)
     srv = s.MobileWebServer(svc, host="127.0.0.1", port=0)

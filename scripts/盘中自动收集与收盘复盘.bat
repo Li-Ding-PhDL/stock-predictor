@@ -14,13 +14,21 @@ if "%MODE%"=="" set "MODE=collect"
 set "PUSH="
 
 if /I "%MODE%"=="eval" (
-    echo [1/2] 正在严格因果回放今日及历史买手/卖手盘口快照...
+    echo [1/4] 正在更新 40 只自选最新日线...
+    python stock_predictor.py --update-data --global-scope mine
+    echo [2/4] 正在生成 2020~2026 股价历史排位(从低到高)...
+    if "%PUSH%"=="" (
+        python stock_predictor.py --price-pos --global-scope mine --price-md monitor_log\price_pos_latest.md
+    ) else (
+        python stock_predictor.py --price-pos --global-scope mine --price-md monitor_log\price_pos_latest.md --push "%PUSH%"
+    )
+    echo [3/4] 正在严格因果回放今日及历史买手/卖手盘口快照...
     if "%PUSH%"=="" (
         python stock_predictor.py --eval-orderbook --eval-horizon 60 --json monitor_log\orderbook_eval_latest.json
     ) else (
         python stock_predictor.py --eval-orderbook --eval-horizon 60 --json monitor_log\orderbook_eval_latest.json --push "%PUSH%"
     )
-    echo [2/2] 正在验证到期历史预测...
+    echo [4/4] 正在验证到期历史预测...
     python stock_predictor.py --verify
     pause
     exit /b 0
