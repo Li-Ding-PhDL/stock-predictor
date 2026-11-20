@@ -1207,11 +1207,16 @@ def test_watchlist_price_percentiles_and_web_pointer(tmp_path, monkeypatch):
     r1 = rows_map["000001"]
     assert r1["min_price"] == 10.0 and r1["max_price"] == 50.0
     assert r1["rank_pct"] == 15.0
+    assert r1["bucket"] == "15%~20%"
     assert r1["range_pct"] == 12.5
     assert all(b >= a for a, b in zip(r1["sorted_curve"], r1["sorted_curve"][1:]))
     # closes_b sorted = [5..14], price=14 -> left=9, right=10 -> mid=9.5 -> 95.0%
     r2 = rows_map["000002"]
-    assert r2["rank_pct"] == 95.0 and r2["range_pct"] == 100.0
+    assert r2["rank_pct"] == 95.0 and r2["bucket"] == "90%~100%" and r2["range_pct"] == 100.0
+    assert len(rep["summary"]["buckets"]) == 12
+    assert rep["summary"]["buckets"][0]["label"] == "0%~5%"
+    assert rep["summary"]["buckets"][4]["label"] == "20%~30%"
+    assert rep["summary"]["lt10_count"] == 0
     assert rep["rows"][0]["code"] == "000001"  # 默认按排位升序排列
 
     svc = s.AutoAnalysisService(codes=["000001", "000002"], interval_sec=60.0)

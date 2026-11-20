@@ -9285,23 +9285,35 @@ function pricePointerSvg(item) {{
     `</svg>`;
 }}
 window._ppData = null;
+window._ppBucket = '';
+function setPpBucket(b) {{
+  window._ppBucket = (window._ppBucket === b) ? '' : b;
+  renderPricePos();
+}}
 function renderPricePos() {{
   const box = document.getElementById('pricePosBox');
   if (!box || !window._ppData) return;
   const d = window._ppData, s = d.summary || {{}};
   const mode = (document.getElementById('ppSort') || {{value:'asc'}}).value;
-  const rows = (d.rows || []).slice().sort((a,b) => mode==='desc' ? b.rank_pct-a.rank_pct : (mode==='range' ? a.range_pct-b.range_pct : a.rank_pct-b.rank_pct));
+  let rows = (d.rows || []).slice();
+  if (window._ppBucket) rows = rows.filter(x => x.bucket === window._ppBucket);
+  rows.sort((a,b) => mode==='desc' ? b.rank_pct-a.rank_pct : (mode==='range' ? a.range_pct-b.range_pct : a.rank_pct-b.rank_pct));
+  const bChips = `<button class="chip ${{!window._ppBucket?'active':''}}" style="padding:2px 8px" onclick="setPpBucket('')">全部(${{(d.rows||[]).length}})</button>` +
+    (s.buckets || []).map(b =>
+      `<button class="chip ${{window._ppBucket===b.label?'active':''}}" style="padding:2px 8px" onclick="setPpBucket('${{b.label}}')">${{b.label}} (${{b.count}})</button>`
+    ).join('');
   const trs = rows.map(x => {{
     const pcls = (x.pct_chg || 0) >= 0 ? 'up' : 'dn';
     const rcol = x.rank_pct <= 20 ? '#22c55e' : (x.rank_pct <= 40 ? '#38bdf8' : (x.rank_pct <= 70 ? '#f59e0b' : '#ef4444'));
     return `<tr><td><button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name}}</button><div class="muted" style="font-size:10px">低${{x.min_price}} ~ 高${{x.max_price}}</div></td>` +
       `<td><b class="${{pcls}}">${{x.current_price}}</b><div class="${{pcls}}" style="font-size:10px">${{x.pct_chg!=null?(x.pct_chg>=0?'+':'')+x.pct_chg+'%':''}}</div></td>` +
-      `<td><b style="color:${{rcol}}">${{x.rank_pct.toFixed(1)}}%</b><div class="muted" style="font-size:10px">第${{x.rank_day}}/${{x.n_days}}天 · 区间${{x.range_pct}}%</div></td>` +
+      `<td><b style="color:${{rcol}}">${{x.rank_pct.toFixed(1)}}%</b><div class="muted" style="font-size:10px">${{x.bucket||''}} · 第${{x.rank_day}}/${{x.n_days}}天</div></td>` +
       `<td>${{pricePointerSvg(x)}}</td></tr>`;
   }}).join('');
   box.innerHTML = `<div class="row"><span>起算 <b>${{s.start}}</b> · 截至 <b>${{s.as_of}}</b> · 实盘 <b>${{s.live_count}}/${{s.n_scored}}</b>只</span>` +
-    `<span>中位排位 <b>${{s.median_rank_pct}}%</b> ｜ 低位(≤20%) <b class="dn">${{s.low_zone_count}}</b>只 ｜ 高位(≥80%) <b class="up">${{s.high_zone_count}}</b>只</span></div>` +
-    `<div style="max-height:420px;overflow-y:auto;margin-top:6px"><table><tr><th>股票(最低~最高)</th><th>现价</th><th>2020~2026排位</th><th>升序曲线与指针</th></tr>${{trs}}</table></div>` +
+    `<span>&lt;10%极低位 <b class="dn">${{s.lt10_count ?? 0}}</b>只 ｜ 中位排位 <b>${{s.median_rank_pct}}%</b> ｜ 低位(≤20%) <b class="dn">${{s.low_zone_count}}</b>只 ｜ 高位(≥80%) <b class="up">${{s.high_zone_count}}</b>只</span></div>` +
+    `<div class="chips" style="margin-top:6px">${{bChips}}</div>` +
+    `<div style="max-height:420px;overflow-y:auto;margin-top:6px"><table><tr><th>股票(最低~最高)</th><th>现价</th><th>2020~2026排位(分档)</th><th>升序曲线与指针</th></tr>${{trs}}</table></div>` +
     `<div class="muted" style="margin-top:4px;font-size:11px">⚠ ${{d.disclaimer}}</div>`;
 }}
 async function loadPricePos(force=false) {{
@@ -20600,6 +20612,31 @@ def watchlist_health_report(codes: Optional[List[str]] = None, root: Optional[st
     }
 
 
+PRICE_POS_BUCKETS: List[Tuple[float, float, str]] = [
+    (0.0, 5.0, "0%~5%"),
+    (5.0, 10.0, "5%~10%"),
+    (10.0, 15.0, "10%~15%"),
+    (15.0, 20.0, "15%~20%"),
+    (20.0, 30.0, "20%~30%"),
+    (30.0, 40.0, "30%~40%"),
+    (40.0, 50.0, "40%~50%"),
+    (50.0, 60.0, "50%~60%"),
+    (60.0, 70.0, "60%~70%"),
+    (70.0, 80.0, "70%~80%"),
+    (80.0, 90.0, "80%~90%"),
+    (90.0, 100.1, "90%~100%"),
+]
+
+
+def _price_pos_bucket(rank_pct: float) -> str:
+    """按 0~20% 每隔 5%、20~100% 每隔 10% 返回所属排位区间标签。"""
+    rp = max(0.0, min(100.0, float(rank_pct)))
+    for lo, hi, lbl in PRICE_POS_BUCKETS:
+        if lo <= rp < hi:
+            return lbl
+    return PRICE_POS_BUCKETS[-1][2]
+
+
 def _compute_single_price_percentile(df: pd.DataFrame, code: str, name: str = "",
                                      start: str = "20200101", end: Optional[str] = None,
                                      live_quote: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -20681,6 +20718,7 @@ def _compute_single_price_percentile(df: pd.DataFrame, code: str, name: str = ""
     else:
         zone = "高位区(≥80%)"
 
+    bucket = _price_pos_bucket(rank_pct)
     nm = STOCK_NAME_OVERRIDES.get(str(code), name or str(code))
     return {
         "code": str(code),
@@ -20701,6 +20739,7 @@ def _compute_single_price_percentile(df: pd.DataFrame, code: str, name: str = ""
         "max_price": round(max_price, 3),
         "max_date": max_date,
         "zone": zone,
+        "bucket": bucket,
         "sorted_curve": sorted_curve,
     }
 
@@ -20749,6 +20788,17 @@ def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = 
     rows.sort(key=lambda x: (x["rank_pct"], x["range_pct"]))
     pcts = np.array([r["rank_pct"] for r in rows], dtype=float) if rows else np.array([], dtype=float)
     hist_dates = [r["last_hist_date"] for r in rows if r.get("last_hist_date")]
+    buckets = []
+    for lo, hi, lbl in PRICE_POS_BUCKETS:
+        hits = [r for r in rows if r.get("bucket") == lbl]
+        buckets.append({
+            "label": lbl,
+            "lo": lo,
+            "hi": min(100.0, hi),
+            "count": len(hits),
+            "items": [{"code": x["code"], "name": x["name"], "current_price": x["current_price"],
+                       "rank_pct": x["rank_pct"]} for x in hits],
+        })
     summary = {
         "n_total": len(pool),
         "n_scored": len(rows),
@@ -20756,8 +20806,10 @@ def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = 
         "as_of": max(hist_dates) if hist_dates else None,
         "live_count": int(sum(1 for r in rows if r.get("is_live"))),
         "median_rank_pct": round(float(np.median(pcts)), 1) if len(pcts) else None,
+        "lt10_count": int((pcts < 10.0).sum()) if len(pcts) else 0,
         "low_zone_count": int((pcts <= 20.0).sum()) if len(pcts) else 0,
         "high_zone_count": int((pcts >= 80.0).sum()) if len(pcts) else 0,
+        "buckets": buckets,
     }
     return {
         "summary": summary,
@@ -20820,14 +20872,14 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
         pstr = f"{pct:+.2f}%" if pct is not None else ""
         cards.append(
             f'<div class="stk" data-code="{_html.escape(item["code"])}" data-name="{_html.escape(item["name"])}" '
-            f'data-rank="{rp}" data-range="{item["range_pct"]}">'
+            f'data-rank="{rp}" data-range="{item["range_pct"]}" data-bucket="{_html.escape(item.get("bucket",""))}">'
             f'<div class="top"><div><b>{_html.escape(item["code"])} {_html.escape(item["name"])}</b> '
             f'<span class="mu">{_html.escape(item["price_source"])}</span></div>'
             f'<div><b class="{pcls}" style="font-size:16px">{item["current_price"]}</b> '
             f'<span class="{pcls}" style="font-size:12px">{pstr}</span></div></div>'
             f'<div class="top" style="margin:4px 0 6px">'
-            f'<span class="badge" style="background:{badge_bg}">▼ 排位 {rp:.1f}%（第{item["rank_day"]}/{item["n_days"]}天）</span>'
-            f'<span class="mu">价格区间 {item["range_pct"]:.1f}% ｜ {_html.escape(item["zone"])}</span></div>'
+            f'<span class="badge" style="background:{badge_bg}">▼ 排位 {rp:.1f}%（{_html.escape(item.get("bucket",""))} · 第{item["rank_day"]}/{item["n_days"]}天）</span>'
+            f'<span class="mu">区间 {item["range_pct"]:.1f}%</span></div>'
             f'{_svg_gauge(item)}'
             f'<div class="top mu" style="margin-top:4px;font-size:11px">'
             f'<span>最低 {item["min_price"]} ({item["min_date"]})</span>'
@@ -20835,6 +20887,13 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
             f'<span>最高 {item["max_price"]} ({item["max_date"]})</span></div></div>'
         )
     cards_html = "\n".join(cards)
+    bucket_chips = ['<button class="bchip active" onclick="filterBucket(\'\', this)">全部(' + str(len(rows)) + ')</button>']
+    for b in (summ.get("buckets") or []):
+        bucket_chips.append(
+            f'<button class="bchip" onclick="filterBucket(\'{_html.escape(b["label"])}\', this)">'
+            f'{_html.escape(b["label"])} <b>({b["count"]})</b></button>'
+        )
+    buckets_html = "".join(bucket_chips)
     disc = _html.escape(rep.get("disclaimer", ""))
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -20851,13 +20910,16 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
   .badge {{ color:#fff; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }}
   button {{ background:#2563eb; color:#fff; border:none; border-radius:8px; padding:5px 10px; cursor:pointer; font-size:12px; }}
   button.sec {{ background:#334155; }}
+  .bchips {{ display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }}
+  .bchip {{ background:#0f172a; color:#cbd5e1; border:1px solid #334155; border-radius:999px; padding:3px 9px; font-size:12px; cursor:pointer; }}
+  .bchip.active {{ background:#2563eb; color:#fff; border-color:#60a5fa; }}
   input {{ background:#0f172a; color:#fff; border:1px solid #475569; border-radius:8px; padding:5px 8px; font-size:12px; }}
 </style></head><body><div class="wrap">
 <div class="hdr">
   <div class="top"><b style="font-size:17px">📍 2020~2026 自选股价历史排位指针（每日收盘价从低到高排序）</b>
     <span class="mu">起算 {summ.get("start","-")} · 历史截至 {summ.get("as_of","-")} · 实盘报价 {summ.get("live_count",0)}/{summ.get("n_scored",0)} 只</span></div>
   <div class="top" style="margin-top:8px">
-    <span>中位排位 <b>{summ.get("median_rank_pct","-")}%</b> ｜ 低位(≤20%) <b class="dn">{summ.get("low_zone_count",0)}</b> 只 ｜ 高位(≥80%) <b class="up">{summ.get("high_zone_count",0)}</b> 只</span>
+    <span>&lt;10%极低位 <b class="dn">{summ.get("lt10_count",0)}</b> 只 ｜ 中位排位 <b>{summ.get("median_rank_pct","-")}%</b> ｜ 低位(≤20%) <b class="dn">{summ.get("low_zone_count",0)}</b> 只 ｜ 高位(≥80%) <b class="up">{summ.get("high_zone_count",0)}</b> 只</span>
     <div style="display:flex;gap:6px;flex-wrap:wrap">
       <input id="q" placeholder="筛选代码/名称" oninput="filterCards()">
       <button onclick="sortCards('asc')">排位 低→高</button>
@@ -20865,12 +20927,20 @@ def price_percentile_report_html(rep: Dict[str, Any]) -> str:
       <button class="sec" onclick="sortCards('range')">区间% 低→高</button>
     </div>
   </div>
-  <div class="mu" style="margin-top:6px">📌 指针解读：蓝线把 2020 年至今每天收盘价从低到高排好序（最左 0%=最低，最右 100%=最高），▼ 指针指着<b>今天股价所处的百分位</b>。</div>
+  <div class="bchips">{buckets_html}</div>
+  <div class="mu" style="margin-top:6px">📌 分档说明：0~20% 每隔 5% 一档，20~100% 每隔 10% 一档，点击上方区间按钮可筛选对应股票。</div>
 </div>
 <div id="grid" class="grid">{cards_html}</div>
 <div class="hdr mu" style="margin-top:12px;color:#fca5a5">⚠ {disc}</div>
 </div>
 <script>
+let curBucket = '';
+function filterBucket(b, btn) {{
+  curBucket = b;
+  document.querySelectorAll('.bchip').forEach(el => el.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  filterCards();
+}}
 function sortCards(mode) {{
   const g = document.getElementById('grid');
   const arr = Array.from(g.children);
@@ -20884,8 +20954,9 @@ function sortCards(mode) {{
 function filterCards() {{
   const q = (document.getElementById('q').value || '').trim().toLowerCase();
   Array.from(document.getElementById('grid').children).forEach(el => {{
-    const hit = !q || el.dataset.code.toLowerCase().includes(q) || el.dataset.name.toLowerCase().includes(q);
-    el.style.display = hit ? '' : 'none';
+    const hitQ = !q || el.dataset.code.toLowerCase().includes(q) || el.dataset.name.toLowerCase().includes(q);
+    const hitB = !curBucket || el.dataset.bucket === curBucket;
+    el.style.display = (hitQ && hitB) ? '' : 'none';
   }});
 }}
 </script></body></html>"""
@@ -21743,16 +21814,21 @@ def main():
         summ = rep["summary"]
         print("=" * 86)
         print(f"📍 2020~2026 股价历史排位指针（起算 {summ['start']} · 截至 {summ['as_of']} · 实盘 {summ['live_count']}/{summ['n_scored']}只）")
-        print(f"   中位排位: {summ['median_rank_pct']}% | 低位(≤20%): {summ['low_zone_count']}只 | 高位(≥80%): {summ['high_zone_count']}只")
+        print(f"   <10%极低位: {summ['lt10_count']}只 | 中位排位: {summ['median_rank_pct']}% | 低位(≤20%): {summ['low_zone_count']}只 | 高位(≥80%): {summ['high_zone_count']}只")
         print("-" * 86)
-        print(f"{'代码':<8}{'名称':<8}{'现价':>8} {'指针刻度(低→高)':<24}{'排位%':>7} {'第k/N天':>11} {'区间%':>7} {'最低~最高'}")
+        print(f"{'代码':<8}{'名称':<8}{'现价':>8} {'指针刻度(低→高)':<24}{'排位%':>7} {'分档':<9} {'第k/N天':>10} {'区间%':>7} {'最低~最高'}")
         for x in rep["rows"]:
             pos = int(round(x["rank_pct"] / 100.0 * 19))
             pos = max(0, min(19, pos))
             bar = "".join("▼" if idx == pos else "─" for idx in range(20))
             k_of_n = f"{x['rank_day']}/{x['n_days']}"
             rng_s = f"{x['min_price']}~{x['max_price']}"
-            print(f"{x['code']:<8}{x['name'][:6]:<8}{x['current_price']:>8.2f} [{bar}] {x['rank_pct']:>5.1f}% {k_of_n:>11} {x['range_pct']:>6.1f}% {rng_s}")
+            print(f"{x['code']:<8}{x['name'][:6]:<8}{x['current_price']:>8.2f} [{bar}] {x['rank_pct']:>5.1f}% {x['bucket']:<9} {k_of_n:>10} {x['range_pct']:>6.1f}% {rng_s}")
+        print("-" * 86)
+        print("【分档统计（0~20% 每隔5%一档，20~100% 每隔10%一档）】")
+        for b in (summ.get("buckets") or []):
+            names = "、".join(f"{it['name']}({it['rank_pct']}%)" for it in b["items"]) if b["items"] else "(无)"
+            print(f"  {b['label']:<9} [{b['count']:>2}只]: {names}")
         print("=" * 86)
         print("⚠ " + rep["disclaimer"])
         html_out = (args.price_html or os.path.join(BASE_DIR, "2020_2026_股价历史排位指针.html")).strip()
