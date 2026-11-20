@@ -8356,6 +8356,7 @@ class AutoAnalysisService:
         self._cycle_count: int = 0
         self._last_cycle_at: str = ""
         self._health_cache: Optional[Tuple[float, bool, Dict[str, Any]]] = None
+        self._price_pos_cache: Optional[Tuple[float, str, Dict[str, Any]]] = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -8635,6 +8636,12 @@ class AutoAnalysisService:
                         "weighted_obi_pct": None, "direction": None, "updated_at": None,
                         "error": self._errors_by_code.get(c),
                     })
+            pp_item = None
+            if self._price_pos_cache is not None:
+                for _row in (self._price_pos_cache[2].get("rows") or []):
+                    if _row.get("code") == target:
+                        pp_item = _row
+                        break
             return {
                 "active_code": target,
                 "codes": list(self.codes),
@@ -8649,6 +8656,7 @@ class AutoAnalysisService:
                 "indices": list(self._indices),
                 "active": self._latest_by_code.get(target),
                 "active_error": self._errors_by_code.get(target),
+                "price_position": pp_item,
                 "daily": self._daily_by_code.get(target),
                 "daily_running": bool(self._daily_running.get(target, False)),
                 "daily_error": self._daily_errors.get(target),
@@ -8669,6 +8677,22 @@ class AutoAnalysisService:
         rep = watchlist_health_report(codes=pool, include_rank=bool(include_rank))
         with self._lock:
             self._health_cache = (time.monotonic(), bool(include_rank), rep)
+        return {**rep, "cached": False}
+
+    def get_price_positions(self, force: bool = False, start: str = "20200101") -> Dict[str, Any]:
+        """获取自选池 2020~2026 股价历史排位百分比与指针曲线（带30秒缓存，盘中实时现价联动更新）。"""
+        now_m = time.monotonic()
+        start_s = str(start or "20200101").strip()
+        with self._lock:
+            cached = self._price_pos_cache
+            pool = [c for c in self.codes if c not in USER_ETF_CODES] or list(USER_WATCHLIST_CODES)
+        if not force and cached is not None:
+            ts, c_start, data = cached
+            if (now_m - ts) < 30.0 and c_start == start_s:
+                return {**data, "cached": True}
+        rep = watchlist_price_percentiles(codes=pool, start=start_s, use_live=True)
+        with self._lock:
+            self._price_pos_cache = (time.monotonic(), start_s, rep)
         return {**rep, "cached": False}
 
     def _run_loop(self) -> None:
@@ -8768,6 +8792,7 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
       <button id="pauseBtn" class="sec" onclick="togglePause()">暂停轮询</button>
       <button class="sec" onclick="forceRefresh()">立即刷新</button>
       <a href="/widget{token_qs}" style="color:#60a5fa;font-size:12px;text-decoration:none">同花顺浮窗↗</a>
+      <a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:12px;text-decoration:none">2020~2026排位指针↗</a>
       <a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:12px;text-decoration:none">盘口回放准确率↗</a>
     </div>
     <div id="chips" class="chips" style="margin-top:8px"></div>
@@ -8785,6 +8810,22 @@ def _render_mobile_app_html(token_qs: str = "") -> str:
       </div>
     </div>
     <div id="watchBox" class="muted" style="margin-top:6px;display:none"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <b>📍 2020~2026 股价历史排位指针（每日收盘价从低到高排序）</b>
+      <div>
+        <select id="ppSort" onchange="renderPricePos()">
+          <option value="asc">排位 低→高</option>
+          <option value="desc">排位 高→低</option>
+          <option value="range">区间% 低→高</option>
+        </select>
+        <button class="sec" onclick="loadPricePos(true)">刷新指针</button>
+        <a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:12px;text-decoration:none;margin-left:4px">大图版↗</a>
+      </div>
+    </div>
+    <div id="pricePosBox" class="muted" style="margin-top:6px">正在计算 2020 年至今每日收盘价排序位置与实时指针...</div>
   </div>
 
   <div class="card">
@@ -8996,6 +9037,18 @@ function renderActive(d) {{
     `<div style="background:#0f172a;padding:6px;border-radius:8px"><div class="muted">价位指数</div><b>${{posTxt}}</b></div>` +
     `</div>` + (p.book_alert ? `<div style="margin-top:6px;padding:6px 8px;border-radius:8px;background:#451a03;color:#fde68a;font-size:12px">⚠ ${{p.book_alert}}</div>` : '');
 
+  const pp = d.price_position;
+  const ppHtml = (pp && pp.rank_pct != null)
+    ? (() => {{
+        const rp = Number(pp.rank_pct);
+        const col = rp <= 20 ? '#22c55e' : (rp <= 40 ? '#38bdf8' : (rp <= 70 ? '#f59e0b' : '#ef4444'));
+        return `<div style="margin-top:8px;padding:7px 9px;background:#0f172a;border-radius:8px;font-size:12px">` +
+          `<div class="row"><span>📍 <b>2020~2026排序位置</b>（第${{pp.rank_day}}/${{pp.n_days}}天）</span><b style="color:${{col}}">▼ ${{rp.toFixed(1)}}%</b></div>` +
+          `<div style="position:relative;height:10px;background:linear-gradient(90deg,#16a34a 0%,#38bdf8 35%,#f59e0b 70%,#dc2626 100%);border-radius:999px;margin:7px 0 4px">` +
+          `<div style="position:absolute;left:calc(${{Math.max(0,Math.min(100,rp))}}% - 6px);top:-5px;width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:8px solid #fff"></div>` +
+          `<div style="position:absolute;left:${{Math.max(0,Math.min(100,rp))}}%;top:-1px;bottom:-1px;width:2px;background:#fff"></div></div>` +
+          `<div class="row muted" style="font-size:11px"><span>最低 ${{pp.min_price}} (${{pp.min_date}})</span><span>区间 ${{pp.range_pct}}%</span><span>最高 ${{pp.max_price}} (${{pp.max_date}})</span></div></div>`;
+      }})() : '';
   const edgeWarn = (bf && bf.available && Number(bf.oos_excess_da_pct || 0) <= 0)
     ? `<div style="margin-top:6px;padding:6px 8px;border-radius:8px;background:#451a03;color:#fde68a;font-size:12px">🛑 <b>短线风控提醒</b>：分钟级ML样本外(${{bf.oos_da_pct}}%)未跑赢多数基准(${{bf.majority_baseline_pct}}%)，请勿因盘中微弱波动频繁买卖损耗手续费。</div>`
     : '';
@@ -9020,6 +9073,7 @@ function renderActive(d) {{
       <span class="muted">微价 ${{p.micro_price ?? '-'}} | 失衡 ${{p.weighted_obi_pct ?? '-'}}%</span>
       <b class="dn">P(跌) ${{p.p_down_pct}}%</b>
     </div>
+    ${{ppHtml}}
     ${{bookMetricsHtml}}
     ${{traceHtml}}
     ${{bfHtml}}
@@ -9211,7 +9265,58 @@ async function loadHealth(includeRank=false, force=false) {{
     box.textContent = '体检加载失败: ' + e;
   }}
 }}
+function pricePointerSvg(item) {{
+  const curve = item.sorted_curve || [];
+  const rp = Number(item.rank_pct || 50);
+  const w = 180, h = 44, px0 = 6, ty = 13, by = 36, uw = w - 2 * px0, uh = by - ty;
+  let poly = '';
+  if (curve.length >= 2) {{
+    const lo = Math.min(...curve), hi = Math.max(...curve), sp = hi > lo ? (hi - lo) : 1;
+    const pts = curve.map((v, i) => `${{(px0 + (i / (curve.length - 1)) * uw).toFixed(1)}},${{(by - ((v - lo) / sp) * uh).toFixed(1)}}`).join(' ');
+    poly = `<polyline fill="none" stroke="#60a5fa" stroke-width="1.6" points="${{pts}}"/>`;
+  }}
+  const px = px0 + (Math.max(0, Math.min(100, rp)) / 100) * uw;
+  const col = rp <= 20 ? '#22c55e' : (rp <= 40 ? '#38bdf8' : (rp <= 70 ? '#f59e0b' : '#ef4444'));
+  return `<svg viewBox="0 0 ${{w}} ${{h}}" style="width:170px;height:42px;background:#0f172a;border-radius:6px;display:block">` +
+    `<line x1="${{px0}}" y1="${{by}}" x2="${{w-px0}}" y2="${{by}}" stroke="#334155" stroke-width="1"/>${{poly}}` +
+    `<line x1="${{px.toFixed(1)}}" y1="${{ty-2}}" x2="${{px.toFixed(1)}}" y2="${{by}}" stroke="${{col}}" stroke-width="1.8" stroke-dasharray="2,2"/>` +
+    `<polygon points="${{px.toFixed(1)}},${{ty-1}} ${{(px-4).toFixed(1)}},${{ty-7}} ${{(px+4).toFixed(1)}},${{ty-7}}" fill="${{col}}"/>` +
+    `<text x="${{Math.max(24,Math.min(w-24,px)).toFixed(1)}}" y="8" text-anchor="middle" fill="${{col}}" font-size="9" font-weight="700">${{rp.toFixed(1)}}%</text>` +
+    `</svg>`;
+}}
+window._ppData = null;
+function renderPricePos() {{
+  const box = document.getElementById('pricePosBox');
+  if (!box || !window._ppData) return;
+  const d = window._ppData, s = d.summary || {{}};
+  const mode = (document.getElementById('ppSort') || {{value:'asc'}}).value;
+  const rows = (d.rows || []).slice().sort((a,b) => mode==='desc' ? b.rank_pct-a.rank_pct : (mode==='range' ? a.range_pct-b.range_pct : a.rank_pct-b.rank_pct));
+  const trs = rows.map(x => {{
+    const pcls = (x.pct_chg || 0) >= 0 ? 'up' : 'dn';
+    const rcol = x.rank_pct <= 20 ? '#22c55e' : (x.rank_pct <= 40 ? '#38bdf8' : (x.rank_pct <= 70 ? '#f59e0b' : '#ef4444'));
+    return `<tr><td><button class="chip" style="padding:2px 6px" onclick="pickCode('${{x.code}}')">${{x.code}} ${{x.name}}</button><div class="muted" style="font-size:10px">低${{x.min_price}} ~ 高${{x.max_price}}</div></td>` +
+      `<td><b class="${{pcls}}">${{x.current_price}}</b><div class="${{pcls}}" style="font-size:10px">${{x.pct_chg!=null?(x.pct_chg>=0?'+':'')+x.pct_chg+'%':''}}</div></td>` +
+      `<td><b style="color:${{rcol}}">${{x.rank_pct.toFixed(1)}}%</b><div class="muted" style="font-size:10px">第${{x.rank_day}}/${{x.n_days}}天 · 区间${{x.range_pct}}%</div></td>` +
+      `<td>${{pricePointerSvg(x)}}</td></tr>`;
+  }}).join('');
+  box.innerHTML = `<div class="row"><span>起算 <b>${{s.start}}</b> · 截至 <b>${{s.as_of}}</b> · 实盘 <b>${{s.live_count}}/${{s.n_scored}}</b>只</span>` +
+    `<span>中位排位 <b>${{s.median_rank_pct}}%</b> ｜ 低位(≤20%) <b class="dn">${{s.low_zone_count}}</b>只 ｜ 高位(≥80%) <b class="up">${{s.high_zone_count}}</b>只</span></div>` +
+    `<div style="max-height:420px;overflow-y:auto;margin-top:6px"><table><tr><th>股票(最低~最高)</th><th>现价</th><th>2020~2026排位</th><th>升序曲线与指针</th></tr>${{trs}}</table></div>` +
+    `<div class="muted" style="margin-top:4px;font-size:11px">⚠ ${{d.disclaimer}}</div>`;
+}}
+async function loadPricePos(force=false) {{
+  const box = document.getElementById('pricePosBox');
+  if (!box) return;
+  try {{
+    const r = await fetch(apiUrl('/api/price_positions', force ? 'force=1' : ''));
+    window._ppData = await r.json();
+    renderPricePos();
+  }} catch (e) {{
+    box.textContent = '股价排位加载失败: ' + e;
+  }}
+}}
 refresh();
+setTimeout(() => loadPricePos(false), 600);
 setTimeout(loadEval, 900);
 setTimeout(loadMood, 1100);
 setTimeout(() => loadHealth(false, false), 1400);
@@ -9258,8 +9363,9 @@ def _render_mobile_widget_html(token_qs: str = "") -> str:
   <div class="top" id="sub"><span class="mu">等待实时数据...</span></div>
   <div class="top" style="margin-top:3px">
     <div class="mu" id="foot">仅供参考·非买卖信号</div>
-    <div><a href="/{token_qs}" style="color:#60a5fa;font-size:11px;text-decoration:none;margin-right:6px">看板↗</a><a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:11px;text-decoration:none">实测↗</a></div>
+    <div><a href="/{token_qs}" style="color:#60a5fa;font-size:11px;text-decoration:none;margin-right:6px">看板↗</a><a href="/price_pos{token_qs}" style="color:#f59e0b;font-size:11px;text-decoration:none;margin-right:6px">排位↗</a><a href="/orderbook_eval{token_qs}" style="color:#38bdf8;font-size:11px;text-decoration:none">实测↗</a></div>
   </div>
+  <div id="wpp" class="mu" style="margin-top:3px;display:none"></div>
 </div>
 <div class="box" id="bookWrap" style="display:none">
   <div class="top"><b style="font-size:12px">五档买手 / 卖手实时盘口（单位：手）</b><span class="mu" id="vwapInfo"></span></div>
@@ -9315,6 +9421,12 @@ async function tick() {{
     const obi = p.weighted_obi_pct != null ? ` | 五档:${{p.weighted_obi_pct>=0?'+':''}}${{p.weighted_obi_pct}}%` : '';
     const hit = v.verified_n > 0 ? ` | 命中${{v.hit_rate_pct}}%` : '';
     document.getElementById('foot').textContent = `${{ml}}${{obi}} | 微价:${{p.micro_price ?? '-'}}${{hit}}`;
+    const wpp = document.getElementById('wpp');
+    if (wpp && d.price_position && d.price_position.rank_pct != null) {{
+      const pp = d.price_position;
+      wpp.style.display = 'block';
+      wpp.innerHTML = `📍 2020~2026排序: <b>▼ ${{Number(pp.rank_pct).toFixed(1)}}%</b> (第${{pp.rank_day}}/${{pp.n_days}}天 · 低${{pp.min_price}}~高${{pp.max_price}})`;
+    }} else if (wpp) {{ wpp.style.display = 'none'; }}
 
     const bids = (q.bids || []).slice(0, 5), asks = (q.asks || []).slice(0, 5);
     const fmtAmt = (pr, h) => {{
@@ -9444,6 +9556,16 @@ class MobileWebServer:
                     health = parent.service.get_watchlist_health(force=frc, include_rank=inc_rk)
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(health, ensure_ascii=False).encode("utf-8"))
+                elif parsed.path in ("/api/price_positions", "/price_pos"):
+                    frc = (qs.get("force") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+                    st = (qs.get("start") or ["20200101"])[0].strip() or "20200101"
+                    rep = parent.service.get_price_positions(force=frc, start=st)
+                    if parsed.path == "/price_pos":
+                        self._send(200, "text/html; charset=utf-8",
+                                   price_percentile_report_html(rep).encode("utf-8"))
+                    else:
+                        self._send(200, "application/json; charset=utf-8",
+                                   json.dumps(rep, ensure_ascii=False).encode("utf-8"))
                 elif parsed.path in ("/api/orderbook_eval", "/orderbook_eval"):
                     raw_code = (qs.get("code") or [""])[0].strip()
                     try:
@@ -20478,6 +20600,297 @@ def watchlist_health_report(codes: Optional[List[str]] = None, root: Optional[st
     }
 
 
+def _compute_single_price_percentile(df: pd.DataFrame, code: str, name: str = "",
+                                     start: str = "20200101", end: Optional[str] = None,
+                                     live_quote: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """把单只股票 start~最新 每天收盘价从低到高排序，定位今日股价处于第几百分位与指针刻度。"""
+    if df is None or len(df) == 0 or "close" not in df.columns:
+        return None
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d = d.dropna(subset=["date", "close"]).sort_values("date")
+    s_dt = pd.to_datetime(str(start), format="%Y%m%d", errors="coerce")
+    e_dt = pd.to_datetime(str(end), format="%Y%m%d", errors="coerce") if end else None
+    if pd.notna(s_dt):
+        d = d[d["date"] >= s_dt]
+    if pd.notna(e_dt):
+        d = d[d["date"] <= e_dt]
+    d = d.reset_index(drop=True)
+    if len(d) < 5:
+        return None
+
+    hist_closes = d["close"].to_numpy(dtype=float)
+    hist_dates = d["date"]
+    last_hist_date = str(hist_dates.iloc[-1].date())
+    last_hist_close = float(hist_closes[-1])
+
+    live_price = None
+    pct_chg = None
+    is_live = False
+    price_time = last_hist_date
+    if isinstance(live_quote, dict):
+        try:
+            lp = float(live_quote.get("price"))
+            if np.isfinite(lp) and lp > 0:
+                live_price = lp
+                is_live = True
+                pct_chg = live_quote.get("pct")
+                price_time = str(live_quote.get("received_at") or dt.datetime.now().strftime("%Y-%m-%d %H:%M"))[:16]
+                if live_quote.get("name"):
+                    name = str(live_quote["name"])
+        except Exception:
+            pass
+    if live_price is None:
+        live_price = last_hist_close
+        if len(hist_closes) >= 2 and hist_closes[-2] > 0:
+            pct_chg = round((last_hist_close / float(hist_closes[-2]) - 1.0) * 100.0, 2)
+
+    sorted_closes = np.sort(hist_closes)
+    n_days = int(len(sorted_closes))
+    left = int(np.searchsorted(sorted_closes, live_price, side="left"))
+    right = int(np.searchsorted(sorted_closes, live_price, side="right"))
+    rank_mid = 0.5 * (left + right)
+    rank_pct = round(float(np.clip(rank_mid / max(1, n_days) * 100.0, 0.0, 100.0)), 1)
+    rank_day = int(max(1, min(n_days, round(rank_mid))))
+
+    min_idx = int(np.argmin(hist_closes))
+    max_idx = int(np.argmax(hist_closes))
+    min_price = float(hist_closes[min_idx])
+    max_price = float(hist_closes[max_idx])
+    min_date = str(hist_dates.iloc[min_idx].date())
+    max_date = str(hist_dates.iloc[max_idx].date())
+    med_price = float(np.median(sorted_closes))
+    if max_price > min_price:
+        range_pct = round(float(np.clip((live_price - min_price) / (max_price - min_price) * 100.0, 0.0, 100.0)), 1)
+    else:
+        range_pct = 50.0
+
+    # 抽样 41 个升序分位点供前端与 HTML 画出真实"从低到高排序"价格分布曲线 + 指针
+    idx_curve = np.linspace(0, n_days - 1, min(41, n_days)).astype(int)
+    sorted_curve = [round(float(sorted_closes[i]), 3) for i in idx_curve]
+
+    if rank_pct <= 20.0:
+        zone = "低位区(≤20%)"
+    elif rank_pct <= 40.0:
+        zone = "偏低区(20%~40%)"
+    elif rank_pct <= 60.0:
+        zone = "中位区(40%~60%)"
+    elif rank_pct <= 80.0:
+        zone = "偏高区(60%~80%)"
+    else:
+        zone = "高位区(≥80%)"
+
+    nm = STOCK_NAME_OVERRIDES.get(str(code), name or str(code))
+    return {
+        "code": str(code),
+        "name": nm,
+        "current_price": round(live_price, 3),
+        "pct_chg": round(float(pct_chg), 2) if pct_chg is not None and np.isfinite(float(pct_chg)) else None,
+        "is_live": is_live,
+        "price_source": "盘中实时" if is_live else "最新收盘",
+        "price_time": price_time,
+        "last_hist_date": last_hist_date,
+        "n_days": n_days,
+        "rank_day": rank_day,
+        "rank_pct": rank_pct,
+        "range_pct": range_pct,
+        "min_price": round(min_price, 3),
+        "min_date": min_date,
+        "median_price": round(med_price, 3),
+        "max_price": round(max_price, 3),
+        "max_date": max_date,
+        "zone": zone,
+        "sorted_curve": sorted_curve,
+    }
+
+
+def watchlist_price_percentiles(codes: Optional[List[str]] = None, start: str = "20200101",
+                                end: Optional[str] = None, root: Optional[str] = None,
+                                use_live: bool = True,
+                                progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """统计自选池每只股票在 start~最新 每天收盘价从低到高排序后，今日股价所处的排位百分比与指针坐标。"""
+    log = progress_cb or (lambda m: None)
+    pool = [str(c).strip() for c in (codes or USER_WATCHLIST_CODES) if str(c).strip()]
+    root = root or StockDataFetcher._resolve_local_root()
+
+    live_quotes: Dict[str, Dict[str, Any]] = {}
+    if use_live and end is None and pool:
+        try:
+            batch = StockDataFetcher.fetch_realtime_batch(pool, include_indices=False)
+            live_quotes = batch.get("quotes") or {}
+        except Exception:
+            live_quotes = {}
+
+    rows: List[Dict[str, Any]] = []
+    fetcher = StockDataFetcher()
+    end_str = end or dt.date.today().strftime("%Y%m%d")
+    for idx, code in enumerate(pool, 1):
+        try:
+            df = None
+            nm = STOCK_NAME_OVERRIDES.get(code, code)
+            if root:
+                d_loc, _ = _mh_load_local_rich(code, root)
+                if d_loc is not None and len(d_loc) >= 5:
+                    df = d_loc
+                    if "name" in d_loc.columns and len(d_loc):
+                        nm = str(d_loc["name"].iloc[-1])
+            if df is None:
+                df = fetcher.fetch(code, start, end_str)
+            item = _compute_single_price_percentile(
+                df, code=code, name=nm, start=start, end=end, live_quote=live_quotes.get(code)
+            )
+            if item is not None:
+                rows.append(item)
+                log(f"[{idx}/{len(pool)}] {code} {item['name']}: 现价={item['current_price']} 排位={item['rank_pct']}% ({item['rank_day']}/{item['n_days']})")
+        except Exception as exc:
+            log(f"[{idx}/{len(pool)}] {code} 跳过: {str(exc)[:60]}")
+
+    rows.sort(key=lambda x: (x["rank_pct"], x["range_pct"]))
+    pcts = np.array([r["rank_pct"] for r in rows], dtype=float) if rows else np.array([], dtype=float)
+    hist_dates = [r["last_hist_date"] for r in rows if r.get("last_hist_date")]
+    summary = {
+        "n_total": len(pool),
+        "n_scored": len(rows),
+        "start": f"{start[0:4]}-{start[4:6]}-{start[6:8]}" if len(start) == 8 else str(start),
+        "as_of": max(hist_dates) if hist_dates else None,
+        "live_count": int(sum(1 for r in rows if r.get("is_live"))),
+        "median_rank_pct": round(float(np.median(pcts)), 1) if len(pcts) else None,
+        "low_zone_count": int((pcts <= 20.0).sum()) if len(pcts) else 0,
+        "high_zone_count": int((pcts >= 80.0).sum()) if len(pcts) else 0,
+    }
+    return {
+        "summary": summary,
+        "rows": rows,
+        "disclaimer": "历史价格排位仅反映当前股价在2020年至今每日收盘价排序中的客观位置，低位≠必涨、高位≠必跌，不构成买卖建议、盈亏自负。",
+    }
+
+
+def price_percentile_report_html(rep: Dict[str, Any]) -> str:
+    """生成带升序分布曲线 + 实时指针箭头的 2020~2026 股价排位百分比独立 HTML 页面。"""
+    import html as _html
+    summ = rep.get("summary") or {}
+    rows = rep.get("rows") or []
+
+    def _svg_gauge(item: Dict[str, Any]) -> str:
+        curve = item.get("sorted_curve") or []
+        rp = float(item.get("rank_pct", 50.0))
+        w, h, pad_x, top_y, bot_y = 300, 74, 10, 18, 58
+        uw = w - 2 * pad_x
+        uh = bot_y - top_y
+        poly = ""
+        if len(curve) >= 2:
+            lo = min(curve)
+            hi = max(curve)
+            span = (hi - lo) if hi > lo else 1.0
+            pts = []
+            for idx, val in enumerate(curve):
+                x = pad_x + (idx / max(1, len(curve) - 1)) * uw
+                y = bot_y - ((val - lo) / span) * uh
+                pts.append(f"{x:.1f},{y:.1f}")
+            poly_pts = " ".join(pts)
+            area_pts = f"{pad_x:.1f},{bot_y:.1f} {poly_pts} {pad_x + uw:.1f},{bot_y:.1f}"
+            poly = (
+                f'<polygon points="{area_pts}" fill="rgba(59,130,246,0.16)"/>'
+                f'<polyline fill="none" stroke="#60a5fa" stroke-width="2" points="{poly_pts}"/>'
+            )
+        px = pad_x + (max(0.0, min(100.0, rp)) / 100.0) * uw
+        col = "#22c55e" if rp <= 20 else ("#38bdf8" if rp <= 40 else ("#f59e0b" if rp <= 70 else "#ef4444"))
+        py = bot_y - (float(item.get("range_pct", rp)) / 100.0) * uh
+        tx = max(32.0, min(w - 32.0, px))
+        return (
+            f'<svg viewBox="0 0 {w} {h}" style="width:100%;height:74px;background:#0f172a;border-radius:8px;display:block">'
+            f'<line x1="{pad_x}" y1="{bot_y}" x2="{w-pad_x}" y2="{bot_y}" stroke="#334155" stroke-width="1"/>'
+            f'{poly}'
+            f'<line x1="{px:.1f}" y1="{top_y-4}" x2="{px:.1f}" y2="{bot_y}" stroke="{col}" stroke-width="2" stroke-dasharray="3,2"/>'
+            f'<polygon points="{px:.1f},{top_y-3} {px-5:.1f},{top_y-11} {px+5:.1f},{top_y-11}" fill="{col}"/>'
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="{col}" stroke="#fff" stroke-width="1.2"/>'
+            f'<text x="{tx:.1f}" y="11" text-anchor="middle" fill="{col}" font-size="10.5" font-weight="700">{rp:.1f}%</text>'
+            f'<text x="{pad_x}" y="{h-3}" fill="#94a3b8" font-size="9.5">低 {item["min_price"]}</text>'
+            f'<text x="{w-pad_x}" y="{h-3}" text-anchor="end" fill="#94a3b8" font-size="9.5">高 {item["max_price"]}</text>'
+            f'</svg>'
+        )
+
+    cards = []
+    for item in rows:
+        rp = float(item["rank_pct"])
+        badge_bg = "#14532d" if rp <= 20 else ("#164e63" if rp <= 40 else ("#422006" if rp <= 70 else "#7f1d1d"))
+        pct = item.get("pct_chg")
+        pcls = "up" if (pct or 0) >= 0 else "dn"
+        pstr = f"{pct:+.2f}%" if pct is not None else ""
+        cards.append(
+            f'<div class="stk" data-code="{_html.escape(item["code"])}" data-name="{_html.escape(item["name"])}" '
+            f'data-rank="{rp}" data-range="{item["range_pct"]}">'
+            f'<div class="top"><div><b>{_html.escape(item["code"])} {_html.escape(item["name"])}</b> '
+            f'<span class="mu">{_html.escape(item["price_source"])}</span></div>'
+            f'<div><b class="{pcls}" style="font-size:16px">{item["current_price"]}</b> '
+            f'<span class="{pcls}" style="font-size:12px">{pstr}</span></div></div>'
+            f'<div class="top" style="margin:4px 0 6px">'
+            f'<span class="badge" style="background:{badge_bg}">▼ 排位 {rp:.1f}%（第{item["rank_day"]}/{item["n_days"]}天）</span>'
+            f'<span class="mu">价格区间 {item["range_pct"]:.1f}% ｜ {_html.escape(item["zone"])}</span></div>'
+            f'{_svg_gauge(item)}'
+            f'<div class="top mu" style="margin-top:4px;font-size:11px">'
+            f'<span>最低 {item["min_price"]} ({item["min_date"]})</span>'
+            f'<span>中位 {item["median_price"]}</span>'
+            f'<span>最高 {item["max_price"]} ({item["max_date"]})</span></div></div>'
+        )
+    cards_html = "\n".join(cards)
+    disc = _html.escape(rep.get("disclaimer", ""))
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2020~2026 自选股价历史排位指针</title>
+<style>
+  body {{ margin:0; padding:12px; background:#0b1220; color:#f1f5f9; font-family:-apple-system,"Microsoft YaHei",sans-serif; font-size:13px; }}
+  .wrap {{ max-width:1100px; margin:0 auto; }}
+  .hdr {{ background:#162033; border:1px solid #2b3b55; border-radius:12px; padding:12px 14px; margin-bottom:12px; }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:10px; }}
+  .stk {{ background:#162033; border:1px solid #26354d; border-radius:10px; padding:10px 12px; }}
+  .top {{ display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }}
+  .mu {{ color:#94a3b8; font-size:12px; }} .up {{ color:#ff6b6b; }} .dn {{ color:#2ecc71; }}
+  .badge {{ color:#fff; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }}
+  button {{ background:#2563eb; color:#fff; border:none; border-radius:8px; padding:5px 10px; cursor:pointer; font-size:12px; }}
+  button.sec {{ background:#334155; }}
+  input {{ background:#0f172a; color:#fff; border:1px solid #475569; border-radius:8px; padding:5px 8px; font-size:12px; }}
+</style></head><body><div class="wrap">
+<div class="hdr">
+  <div class="top"><b style="font-size:17px">📍 2020~2026 自选股价历史排位指针（每日收盘价从低到高排序）</b>
+    <span class="mu">起算 {summ.get("start","-")} · 历史截至 {summ.get("as_of","-")} · 实盘报价 {summ.get("live_count",0)}/{summ.get("n_scored",0)} 只</span></div>
+  <div class="top" style="margin-top:8px">
+    <span>中位排位 <b>{summ.get("median_rank_pct","-")}%</b> ｜ 低位(≤20%) <b class="dn">{summ.get("low_zone_count",0)}</b> 只 ｜ 高位(≥80%) <b class="up">{summ.get("high_zone_count",0)}</b> 只</span>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <input id="q" placeholder="筛选代码/名称" oninput="filterCards()">
+      <button onclick="sortCards('asc')">排位 低→高</button>
+      <button class="sec" onclick="sortCards('desc')">排位 高→低</button>
+      <button class="sec" onclick="sortCards('range')">区间% 低→高</button>
+    </div>
+  </div>
+  <div class="mu" style="margin-top:6px">📌 指针解读：蓝线把 2020 年至今每天收盘价从低到高排好序（最左 0%=最低，最右 100%=最高），▼ 指针指着<b>今天股价所处的百分位</b>。</div>
+</div>
+<div id="grid" class="grid">{cards_html}</div>
+<div class="hdr mu" style="margin-top:12px;color:#fca5a5">⚠ {disc}</div>
+</div>
+<script>
+function sortCards(mode) {{
+  const g = document.getElementById('grid');
+  const arr = Array.from(g.children);
+  arr.sort((a,b) => {{
+    if (mode === 'desc') return Number(b.dataset.rank) - Number(a.dataset.rank);
+    if (mode === 'range') return Number(a.dataset.range) - Number(b.dataset.range);
+    return Number(a.dataset.rank) - Number(b.dataset.rank);
+  }});
+  arr.forEach(el => g.appendChild(el));
+}}
+function filterCards() {{
+  const q = (document.getElementById('q').value || '').trim().toLowerCase();
+  Array.from(document.getElementById('grid').children).forEach(el => {{
+    const hit = !q || el.dataset.code.toLowerCase().includes(q) || el.dataset.name.toLowerCase().includes(q);
+    el.style.display = hit ? '' : 'none';
+  }});
+}}
+</script></body></html>"""
+
+
 # 多模型投票默认用的一批"快模型"(核方法/惰性/符号回归太慢，投票统计不必全上)
 VOTE_DEFAULT_ALGOS: List[str] = ["Lasso", "RidgeReg", "ElasticNet", "PLSR", "ELM", "KNN",
                                  "RF", "ExtraTrees", "Bagging", "GBRT", "XGBoost", "LightGBM"]
@@ -20929,6 +21342,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="只构建并导出『多期限×多目标』池化数据集到该 CSV 路径(utf-8-sig)，不训练")
     p.add_argument("--predict-frozen", default=None,
                    help="用已冻结的全局模型预测某股票(传股票代码)，只加载不训练；配合 --global-algos 里第一个模型")
+    p.add_argument("--price-pos", action="store_true",
+                   help="计算自选股在 2020~2026 每日收盘价从低到高排序中的今日指针位置与百分比，并导出可视化 HTML")
+    p.add_argument("--price-start", default="20200101",
+                   help="配合 --price-pos 的起始日期 YYYYMMDD(默认 20200101)")
+    p.add_argument("--price-html", default="",
+                   help="配合 --price-pos 的可视化 HTML 输出路径(默认生成在项目根目录)")
     return p
 
 
@@ -21312,6 +21731,39 @@ def main():
         r = update_daily_dataset(codes, progress_cb=print)
         print(f"完成：更新 {r['updated']} / 跳过 {r['skipped']}。数据在: {r['out_root']}")
         print("提示：把 STOCK_LOCAL_DATA_ROOT 指向该目录，或设 LOCAL_DATA_ROOT，即用最新数据跑选股/预测。")
+        return
+
+    # --price-pos：2020~2026 每日收盘价从低到高排序与今日指针位置%
+    if getattr(args, "price_pos", False):
+        codes = ([c.strip() for c in args.global_codes.split(",") if c.strip()]
+                 if args.global_codes else
+                 (USER_WATCHLIST_CODES if args.global_scope == "mine"
+                  else GLOBAL_SUBSET_CODES if args.global_scope == "subset" else list(USER_WATCHLIST_CODES)))
+        rep = watchlist_price_percentiles(codes=codes, start=args.price_start, use_live=True, progress_cb=lambda m: None)
+        summ = rep["summary"]
+        print("=" * 86)
+        print(f"📍 2020~2026 股价历史排位指针（起算 {summ['start']} · 截至 {summ['as_of']} · 实盘 {summ['live_count']}/{summ['n_scored']}只）")
+        print(f"   中位排位: {summ['median_rank_pct']}% | 低位(≤20%): {summ['low_zone_count']}只 | 高位(≥80%): {summ['high_zone_count']}只")
+        print("-" * 86)
+        print(f"{'代码':<8}{'名称':<8}{'现价':>8} {'指针刻度(低→高)':<24}{'排位%':>7} {'第k/N天':>11} {'区间%':>7} {'最低~最高'}")
+        for x in rep["rows"]:
+            pos = int(round(x["rank_pct"] / 100.0 * 19))
+            pos = max(0, min(19, pos))
+            bar = "".join("▼" if idx == pos else "─" for idx in range(20))
+            k_of_n = f"{x['rank_day']}/{x['n_days']}"
+            rng_s = f"{x['min_price']}~{x['max_price']}"
+            print(f"{x['code']:<8}{x['name'][:6]:<8}{x['current_price']:>8.2f} [{bar}] {x['rank_pct']:>5.1f}% {k_of_n:>11} {x['range_pct']:>6.1f}% {rng_s}")
+        print("=" * 86)
+        print("⚠ " + rep["disclaimer"])
+        html_out = (args.price_html or os.path.join(BASE_DIR, "2020_2026_股价历史排位指针.html")).strip()
+        if html_out:
+            with open(html_out, "w", encoding="utf-8") as fh:
+                fh.write(price_percentile_report_html(rep))
+            print(f"可视化指针网页已写入: {html_out}")
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, ensure_ascii=False, indent=2)
+            print(f"JSON 已写入: {args.json}")
         return
 
     # --vote-backtest：回测"多数说涨买/说跌卖"策略
